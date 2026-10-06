@@ -1,0 +1,28 @@
+# Build products
+/build/
+/.build/
+/Assets/GoogleService-Info.plist
+*.app/
+*.zip
+.DS_Store
+
+# Credentials and signing material
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+.env
+.env.*
+.signing-identity
+
+# Personal clipboard data
+history.json
+before-*.json
+device-*.json
+blobs/
+
+# Python and editor artifacts
+__pycache__/
+*.pyc
+.vscode/
+.idea/
