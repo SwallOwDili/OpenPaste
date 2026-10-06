@@ -20,7 +20,7 @@ for raw in subprocess.check_output(['git','ls-files','--cached','--others','--ex
 PYSEC
 gitleaks dir "$scan_dir" --redact --no-banner --exit-code 1
 # Also detect newly committed secrets that were removed again before the final tree.
-base="${SECURITY_BASE:-$(git rev-parse HEAD^ 2>/dev/null || true)}"
+base="${SECURITY_BASE:-$(git rev-parse --verify HEAD^ 2>/dev/null || true)}"
 if [[ -n "$base" && "$base" != "0000000000000000000000000000000000000000" ]]; then
     [[ "$base" =~ '^[0-9a-f]{40}$' ]] || { print -u2 "Invalid security scan base"; exit 1; }
     git cat-file -e "${base}^{commit}"
