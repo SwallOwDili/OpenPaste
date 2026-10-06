@@ -1,0 +1,7 @@
+included:
+  - Sources
+only_rules:
+  - duplicate_imports
+  - legacy_cggeometry_functions
+  - legacy_constant
+  - return_arrow_whitespace

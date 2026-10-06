@@ -1,0 +1,32 @@
+name: Test and security
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test-security:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Unit and integration tests
+        run: ./scripts/unit-tests.sh
+      - name: Install check tools
+        run: brew install gitleaks swiftlint actionlint
+      - name: Code standards
+        run: ./scripts/lint.sh
+      - name: Dependency vulnerability scan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/dependency-scan.py
+      - name: Security tests and secret scan
+        env:
+          SECURITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: ./scripts/security-check.sh

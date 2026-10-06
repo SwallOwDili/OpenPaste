@@ -1,0 +1,124 @@
+name: Build release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag, for example v0.6.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      OPENPASTE_ARCH: universal
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate version and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPENPASTE_VERSION: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          VERSION="$(python3 scripts/version.py)"
+          {
+            echo "OPENPASTE_VERSION=$VERSION"
+            echo "ASSET_NAME=OpenPaste-$VERSION-macos-universal"
+          } >> "$GITHUB_ENV"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | @json" > "$RUNNER_TEMP/releases.jsonl"
+          python3 - "$RUNNER_TEMP/releases.jsonl" <<'PY'
+          import json, os, sys
+          with open(sys.argv[1]) as stream:
+              release = next((item for line in stream if (item := json.loads(line))['tag_name'] == os.environ['RELEASE_TAG']), None)
+          if release is None:
+              sys.exit('Create the release or draft before starting the build.')
+          if release.get('immutable', False):
+              sys.exit('Release is immutable. Upload assets to a draft release using workflow_dispatch before publishing.')
+          PY
+
+      - name: Unit tests
+        run: ./scripts/unit-tests.sh
+
+      - name: Install check tools
+        run: brew install gitleaks swiftlint actionlint
+
+      - name: Code standards
+        run: ./scripts/lint.sh
+
+      - name: Dependency vulnerability scan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/dependency-scan.py
+
+      - name: Security tests and secret scan
+        run: ./scripts/security-check.sh
+
+      - name: Inject Firebase configuration
+        env:
+          OPENPASTE_FIREBASE_CONFIG_B64: ${{ secrets.OPENPASTE_FIREBASE_CONFIG_B64 }}
+        run: python3 scripts/inject_firebase_config.py
+
+      - name: Build universal application
+        run: ./build.sh
+
+      - name: Verify analytics bundle
+        run: python3 Tests/analytics-config-test.py
+
+      - name: Verify embedded version and architecture
+        run: |
+          python3 - <<'PY'
+          import os, plistlib
+          with open('build/OpenPaste.app/Contents/Info.plist', 'rb') as stream:
+              info = plistlib.load(stream)
+          assert info['OpenPasteReleaseVersion'] == os.environ['OPENPASTE_VERSION']
+          assert info['CFBundleShortVersionString'] == os.environ['OPENPASTE_VERSION'].split('-')[0]
+          assert info['CFBundleVersion'] == os.environ['GITHUB_RUN_NUMBER']
+          PY
+          lipo build/OpenPaste.app/Contents/MacOS/OpenPaste -verify_arch arm64 x86_64
+          codesign --verify --deep --strict build/OpenPaste.app
+
+      - name: Package and checksum
+        run: |
+          mkdir -p build/release
+          ditto -c -k --sequesterRsrc --keepParent build/OpenPaste.app "build/release/$ASSET_NAME.zip"
+          (cd build/release && shasum -a 256 "$ASSET_NAME.zip" > "$ASSET_NAME.sha256")
+
+      - name: Keep workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: build/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Keep debug symbols in Actions only
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_NAME }}-debug-symbols
+          path: build/OpenPaste.app.dSYM
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" "build/release/$ASSET_NAME.zip" "build/release/$ASSET_NAME.sha256" --repo "$GITHUB_REPOSITORY" --clobber
