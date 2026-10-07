@@ -56,8 +56,9 @@ async function check({github, context, core, number, signing = false}) {
   const body = `${marker}\n${missing.length ? `CLA 签署待完成：${missing.map(n => '@' + n).join(', ')}。\n请阅读 [CLA v1.0](https://github.com/${repo.owner}/${repo.repo}/blob/main/CLA.md)（[中文](https://github.com/${repo.owner}/${repo.repo}/blob/main/CLA.zh-CN.md)），并使用自己的账号回复：\n\n> ${phrase}` : '所有贡献者已签署 CLA v1.0。✅'}`;
   if (previous) await github.rest.issues.updateComment({...repo, comment_id: previous.id, body});
   else await github.rest.issues.createComment({...repo, issue_number: number, body});
-  if (missing.length) throw new Error('CLA signature required');
-  return pr;
+  // The required CLA status blocks merging. Missing signatures are an expected
+  // state, not a failed workflow that remains red after comment-based acceptance.
+  return {...pr, claAccepted: missing.length === 0};
 }
 async function hasAcceptedStatus(github, repo, sha) {
   const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {...repo, ref: sha, per_page: 100});
