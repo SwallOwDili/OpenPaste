@@ -29,9 +29,8 @@ jobs:
           script: |
             const {check} = require('./.github/scripts/cla.cjs');
             const number = context.payload.pull_request?.number || context.payload.issue.number;
-            await check({github, context, core, number, signing: context.eventName === 'issue_comment'});
-            if (context.eventName === 'issue_comment') {
-              const {data: pr} = await github.rest.pulls.get({...context.repo, pull_number: number});
+            const pr = await check({github, context, core, number, signing: context.eventName === 'issue_comment'});
+            if (context.eventName === 'issue_comment' && pr.claAccepted) {
               const runs = await github.rest.actions.listWorkflowRuns({...context.repo, workflow_id:'ci.yml', head_sha:pr.head.sha, status:'success', per_page:10});
               const run = runs.data.workflow_runs.find(r=>r.event === 'pull_request');
               if (run) await github.rest.actions.createWorkflowDispatch({...context.repo, workflow_id:'package.yml', ref:context.payload.repository.default_branch, inputs:{run_id:String(run.id)}});
