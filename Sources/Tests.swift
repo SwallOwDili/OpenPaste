@@ -54,6 +54,23 @@ func runTests() {
     var rich = clip("plain text")
     rich.parts[0].append(ClipPart(type: "public.rtf", data: Data("{\\rtf1 styled}".utf8)))
     check(isolated.restore(rich, plain: true, pasteboard: pb) && pb.types?.contains(.rtf) == false && pb.string(forType: .string) == "plain text", "plain text strips rich formats")
+    let recencyRoot = root.appendingPathComponent("recency")
+    let recency = Store(root: recencyRoot)
+    var older = clip("older content"); older.created = Date().addingTimeInterval(-120); older.title = "Saved name"; older.userLabel = "Saved name"; older.boards = [b]
+    var middle = clip("middle content"); middle.created = Date().addingTimeInterval(-60)
+    let newest = clip("newest content")
+    recency.archive.clips = [newest, middle, older]
+    check(recency.restore(older, plain: false, pasteboard: pb) && recency.archive.clips.map(\.id) == [older.id, newest.id, middle.id], "using old record moves it to history front")
+    check(recency.archive.clips[0].userLabel == older.userLabel && recency.archive.clips[0].boards == older.boards && recency.archive.clips[0].parts == older.parts && pb.string(forType: .string) == older.text, "reuse retains name favorites and original bytes")
+    recency.flush()
+    check(Store(root: recencyRoot).archive.clips.first?.id == older.id, "reused order survives reload")
+    check(recency.restoreMany([middle, newest], plain: true, pasteboard: pb) && recency.archive.clips.map(\.id) == [middle.id, newest.id, older.id] && pb.string(forType: .string) == "middle content\nnewest content", "batch reuse promotes records in pasted order")
+    let orderBeforeFailure = recency.archive.clips.map(\.id)
+    var unsupported = older; unsupported.kind = "图片"
+    check(!recency.restore(unsupported, plain: true, pasteboard: pb) && recency.archive.clips.map(\.id) == orderBeforeFailure, "failed restore does not reorder history")
+    let transient = clip("not saved")
+    check(recency.restore(transient, plain: false, pasteboard: pb) && recency.archive.clips.map(\.id) == orderBeforeFailure, "transient paste does not insert history record")
+    recency.flush()
     pb.clearContents(); pb.writeObjects([URL(fileURLWithPath: "/tmp/openpaste-test.txt") as NSURL])
     isolated.captureContents(pb, source: "Finder", sourceID: "com.apple.finder")
     check(isolated.archive.clips[0].kind == "文件", "file reference classification")
@@ -99,9 +116,22 @@ func runTests() {
     let styledSample = NSAttributedString(string: "Styled", attributes: [.font: NSFont.boldSystemFont(ofSize: 18), .foregroundColor: NSColor.red])
     let richData = try! styledSample.data(from: NSRange(location: 0, length: styledSample.length), documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
     var richClip = clip("Styled"); richClip.parts[0].append(ClipPart(type: "public.rtf", data: richData))
-    features.archive.clips = [richClip]; var renamed = richClip; renamed.title = "Label"; features.replace(renamed, label: "重命名")
+    features.archive.clips = [richClip]; var renamed = richClip; renamed.title = "Label"; renamed.userLabel = "Label"; features.replace(renamed, label: "重命名")
     check(features.archive.clips[0].parts == richClip.parts && features.archive.clips[0].attributedText.attribute(.font, at: 0, effectiveRange: nil) as? NSFont != nil, "rename preserves original rich clipboard bytes")
-    features.undoItemChange(); check(features.archive.clips[0].title == richClip.title, "undo restores item metadata")
+    check(features.archive.clips[0].cardTitle == "Label" && features.archive.clips[0].text == "Styled", "renamed card shows label without changing original text")
+    let decodedRename = try! JSONDecoder().decode(Clip.self, from: JSONEncoder().encode(features.archive.clips[0]))
+    check(decodedRename.cardTitle == "Label", "saved rename survives serialization")
+    features.query = "Label"; check(features.filtered.count == 1, "renamed label is searchable"); features.query = ""
+    features.ingest(richClip)
+    check(features.archive.clips.count == 1 && features.archive.clips[0].cardTitle == "Label" && features.archive.clips[0].title == "Label", "repeat capture retains custom name")
+    check(features.restore(features.archive.clips[0], plain: true, pasteboard: pb) && pb.string(forType: .string) == "Styled", "renamed record pastes original content")
+    for kind in ["文字", "图片", "链接", "文件", "颜色"] {
+        var named = renamed; named.kind = kind
+        check(named.cardTitle == "Label", "custom name displayed for \(kind) card")
+    }
+    var unnamed = richClip; unnamed.userLabel = "   "
+    check(unnamed.cardTitle == "文字", "empty rename falls back to content type")
+    features.undoItemChange(); check(features.archive.clips[0].title == richClip.title && features.archive.clips[0].userLabel == nil, "undo restores item metadata")
     var screenshot = fixtureImage(); screenshot.ocrText = "识别结果 OCR needle"; features.archive.clips = [screenshot]; features.query = "needle"; check(features.filtered.count == 1, "search indexes recognized image text")
     check(!LinkPreviewCache.allowed(URL(string: "http://127.0.0.1/private")!) && !LinkPreviewCache.allowed(URL(string: "https://example.com/?token=secret")!) && LinkPreviewCache.allowed(URL(string: "https://www.apple.com/mac/")!), "preview policy rejects local and credential URLs")
     let rotatedPart = ImageTools.rotated(fixtureImage())!

@@ -57,6 +57,13 @@ struct Clip: Codable, Identifiable {
     var userLabel: String?
     var linkTitle: String?
     var cachedDigest: String?
+    var cardTitle: String {
+        if let label = userLabel?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty { return label }
+        if MapLink.parse(text) != nil { return "地图" }
+        if source == "快速翻译" { return "翻译" }
+        if kind == "文字", CodeSyntax.language(text) != nil { return "代码" }
+        return kind
+    }
     var byteCount: Int { parts.flatMap { $0 }.reduce(0) { $0 + $1.data.count } }
     var fingerprint: String {
         if let cachedDigest = cachedDigest { return cachedDigest }
@@ -364,6 +371,8 @@ final class Store: ObservableObject {
         if let i = items.firstIndex(where: { $0.fingerprint == new.fingerprint }) {
             if preserveExisting || items[i].created > new.created { return items[i].id }
             let old = items.remove(at: i); new.id = old.id; new.boards = old.boards
+            new.userLabel = old.userLabel
+            if let label = old.userLabel, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { new.title = old.title }
         }
         items.append(new); items.sort { $0.created > $1.created }; archive.clips = items; prune(); save()
         if new.kind == "链接", networkPreviews, !ephemeral { enrichLink(new) }
@@ -406,7 +415,25 @@ final class Store: ObservableObject {
         }
         pb.clearContents(); let ok = pb.writeObjects(objects); change = pb.changeCount
         currentClipID = ok && archive.clips.contains(where: { $0.id == clip.id }) ? clip.id : nil
+        if ok { recordUse([clip]) }
         return ok
+    }
+    func recordUse(_ clips: [Clip]) {
+        var seen = Set<UUID>()
+        let ids = clips.map(\.id).filter { seen.insert($0).inserted }
+        var items = archive.clips
+        let latest = items.map(\.created).max() ?? .distantPast
+        let timestamp = max(Date(), latest.addingTimeInterval(0.001))
+        var changed = false
+        for (offset, id) in ids.enumerated() {
+            guard let index = items.firstIndex(where: { $0.id == id }) else { continue }
+            items[index].created = timestamp.addingTimeInterval(Double(ids.count - offset) * 0.001)
+            changed = true
+        }
+        guard changed else { return }
+        items.sort { $0.created > $1.created }
+        archive.clips = items
+        save()
     }
     func demo() {
         let board = Board(name: "常用内容"); archive.boards = [board, Board(name: "项目灵感")]
