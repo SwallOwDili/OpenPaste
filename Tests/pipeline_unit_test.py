@@ -27,13 +27,24 @@ const pr={state:'open',user:{login:'alice'},head:{sha:'a'.repeat(40)},commits:1,
 const github={rest:{pulls:{get:async()=>({data:pr}),listCommits:'commits'},issues:{listComments:'comments',createComment:async()=>{comments++},updateComment:async()=>{}},repos:{getContent:async()=>({data:{content:Buffer.from(JSON.stringify(records)).toString('base64'),sha:'existing'}}),createCommitStatus:async o=>{lastState=o.state},createOrUpdateFileContents:async o=>{saved=JSON.parse(Buffer.from(o.content,'base64').toString());records=saved}},git:{getRef:async()=>({})}},paginate:async method=>method==='commits' ? [{author:{login:'alice',id:7}}] : []};
 const context={repo:{owner:'fixture',repo:'fixture'},payload:{comment:{body:phrase,user:{login:'mallory',id:9,type:'User'},html_url:'https://github.com/fixture/fixture/pull/1#comment',created_at:'2026-10-06T00:00:00Z'}}};
 (async()=>{
- await assert.rejects(check({github,context,number:1,signing:true}),/CLA signature/);
+ assert.equal((await check({github,context,number:1,signing:true})).claAccepted,false);
  assert.equal(saved,undefined);assert.equal(lastState,'failure');
  context.payload.comment.user={login:'alice',id:7,type:'User'};
- await check({github,context,number:1,signing:true});
+ assert.equal((await check({github,context,number:1,signing:true})).claAccepted,true);
  assert.equal(saved[0].login,'alice');assert.equal(saved[0].version,'1.0');assert.equal(lastState,'success');
  await check({github,context,number:1});
  assert.equal(lastState,'success');assert.ok(comments>=2);
+ // A new contributor must sign too; one acceptance cannot unblock the PR.
+ pr.commits=2;
+ github.paginate=async method=>method==='commits' ? [{author:{login:'alice',id:7}},{author:{login:'bob',id:8}}] : [];
+ assert.equal((await check({github,context,number:1})).claAccepted,false);
+ assert.equal(lastState,'failure');
+ context.payload.comment.user={login:'bob',id:8,type:'User'};
+ assert.equal((await check({github,context,number:1,signing:true})).claAccepted,true);
+ assert.equal(lastState,'success');assert.equal(records.length,2);
+ // Actual API failures must still fail the workflow.
+ github.rest.repos.createCommitStatus=async()=>{throw new Error('API unavailable')};
+ await assert.rejects(check({github,context,number:1}),/API unavailable/);
 })().catch(e=>{console.error(e.message);process.exitCode=1});
 '''],cwd=ROOT,check=True)
 
