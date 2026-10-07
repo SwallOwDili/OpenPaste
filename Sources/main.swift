@@ -61,6 +61,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var editorWindow: NSWindow?
     var pauseTimer: Timer?
     var settingsWindow: NSWindow?
+    var settingsRequest = 0
     var activationObserver: NSObjectProtocol?
     var lastExternalApp: NSRunningApplication?
     var toast: NSPanel?
@@ -104,7 +105,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if store.directPasteAuthorized != allowed { store.directPasteAuthorized = allowed }
         if store.permissionStatus != status { store.permissionStatus = status }
     }
-    func applicationDidBecomeActive(_ notification: Notification) { refreshPermission() }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        refreshPermission()
+        if store.settings, let window = settingsWindow, window.isVisible { window.makeKeyAndOrderFront(nil) }
+    }
     var directPasteAllowed: Bool {
         if CommandLine.arguments.contains("--ui-test"), CommandLine.arguments.contains("--force-manual") { return false }
         return AXIsProcessTrusted() && CGPreflightPostEventAccess()
@@ -130,7 +134,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         NSApp.setActivationPolicy(.accessory)
         let main = NSMenu(); let appMenu = NSMenu(); let top = NSMenuItem(); top.submenu = appMenu; main.addItem(top)
-        let settingsItem = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ","); settingsItem.target = self; appMenu.addItem(settingsItem); appMenu.addItem(.separator())
+        let settingsItem = NSMenuItem(title: "设置…", action: #selector(openSettingsFromMenu), keyEquivalent: ","); settingsItem.target = self; appMenu.addItem(settingsItem); appMenu.addItem(.separator())
         let quitItem = NSMenuItem(title: "退出 OpenPaste", action: #selector(quit), keyEquivalent: "q"); quitItem.target = self; appMenu.addItem(quitItem); let editMenu = NSMenu(title: "编辑")
         let editItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: ""); editItem.submenu = editMenu; main.addItem(editItem)
         for (title, action, key) in [("撤销", "undo:", "z"), ("剪切", "cut:", "x"), ("复制", "copy:", "c"), ("粘贴", "paste:", "v"), ("全选", "selectAll:", "a")] {
@@ -174,7 +178,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "打开剪贴板  \(shortcut.label)", action: #selector(show), keyEquivalent: "")
         menu.addItem(withTitle: "暂停 / 继续记录", action: #selector(togglePause), keyEquivalent: "")
-        menu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: "")
+        menu.addItem(withTitle: "设置…", action: #selector(openSettingsFromMenu), keyEquivalent: "")
         menu.addItem(.separator())
         let updateItem = NSMenuItem(title: UpdateChecker.shared.menuTitle, action: #selector(checkUpdatesFromMenu), keyEquivalent: "")
         menu.addItem(updateItem); updateMenuItem = updateItem
@@ -277,12 +281,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let before = panel.frame
             guard let shelfScreen = panel.screen, before.minY == shelfScreen.frame.minY, before.minX == shelfScreen.frame.minX, before.width == shelfScreen.frame.width else { print("FAIL: shelf not flush with screen edges"); exit(1) }
             print("PASS: shelf fills screen width and touches physical bottom")
-            openSettings()
+            openSettingsFromMenu()
+            RunLoop.main.run(mode: .eventTracking, before: Date().addingTimeInterval(0.02))
+            dismissShelfForExternalInteraction()
+            guard panel.isVisible, settingsWindow == nil else { print("FAIL: menu transition hid shelf before settings was ready"); exit(1) }
+            print("PASS: settings waits for menu tracking to finish and keeps shelf visible")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 guard self.panel.frame == before, !self.panel.isVisible else { print("FAIL: settings did not hide shelf or changed geometry"); exit(1) }
                 guard let settings = self.settingsWindow, settings.level == .normal else { print("FAIL: settings remains always on top"); exit(1) }
                 guard let closeButton = self.settingsWindow?.standardWindowButton(.closeButton), !closeButton.isHidden, closeButton.isEnabled else { print("FAIL: settings close button unavailable"); exit(1) }
                 guard let window = self.settingsWindow, window.isVisible, let screen = window.screen, screen.visibleFrame.contains(window.frame) else { print("FAIL: settings outside visible screen"); exit(1) }
+                if NSApp.isActive {
+                    guard window.isKeyWindow else { print("FAIL: first settings opening did not receive focus"); exit(1) }
+                    print("PASS: first menu settings request creates a visible focused window")
+                } else { print("SKIP: focus assertion requires foreground user activation; visibility verified") }
                 let ordinary = NSWindow(contentRect: window.frame.insetBy(dx: 80, dy: 80), styleMask: [.titled, .closable], backing: .buffered, defer: false)
                 ordinary.title = "Window ordering test"; ordinary.isReleasedWhenClosed = false
                 ordinary.makeKeyAndOrderFront(nil)
@@ -295,6 +307,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 print("PASS: confirmation alert above settings and shelf")
                 self.closeSettings()
                 guard !self.store.settings, self.panel.frame == before else { print("FAIL: close settings changed shelf"); exit(1) }
+                self.openSettingsFromMenu()
+                self.closeSettings()
+                guard !self.store.settings, !window.isVisible else { print("FAIL: canceled menu request reopened settings"); exit(1) }
                 self.openSettings()
                 guard self.settingsWindow === window, window.level == .normal, self.panel.frame == before else { print("FAIL: reopening settings"); exit(1) }
                 self.showShelf()
@@ -311,6 +326,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.hideShelf()
                 guard !self.panel.isVisible else { print("FAIL: reopened shelf cannot close"); exit(1) }
                 print("PASS: opening settings hides shelf; reopening shelf closes settings; reopened shelf closes normally")
+                runSettingsPageCacheTests(store: self.store)
                 NSApp.terminate(nil)
             }
         } else if preview { show(); if CommandLine.arguments.contains("--settings") { openSettings() }; if CommandLine.arguments.contains("--translation-ui-test") { translateSelection("Hello\n    world") } } else if !UserDefaults.standard.bool(forKey: "recordingAccepted") { onboarding() } else { store.start(); if CommandLine.arguments.contains("--settings") { openSettings() } }
@@ -362,9 +378,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !store.paused { store.capture(force: true) }
     }
     @objc func openSettings() {
+        settingsRequest += 1
+        store.settings = true
         cancelTranslation()
         store.reverseHistory = false
-        panel.orderOut(nil)
         refreshPermission()
         if settingsWindow == nil {
             let screen = panel.screen ?? NSScreen.main!
@@ -383,9 +400,25 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.setFrameOrigin(NSPoint(x: visible.midX - window.frame.width / 2, y: visible.midY - window.frame.height / 2))
             settingsWindow = window
         }
-        store.settings = true
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate()
+        panel.orderOut(nil)
+        let request = settingsRequest
+        RunLoop.main.perform(inModes: [.default]) { [weak self] in
+            guard let self, self.settingsRequest == request, self.store.settings,
+                  let window = self.settingsWindow, window.isVisible else { return }
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+    @objc func openSettingsFromMenu() {
+        settingsRequest += 1
+        let request = settingsRequest
+        store.settings = true
+        // Menu tracking must finish before creating and activating a normal window.
+        RunLoop.main.perform(inModes: [.default]) { [weak self] in
+            guard let self, self.settingsRequest == request, self.store.settings else { return }
+            self.openSettings()
+        }
     }
     @objc func checkUpdatesFromMenu() {
         guard !modalShowing else { return }
@@ -415,7 +448,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
             else if response == .alertThirdButtonReturn { UpdateChecker.shared.skip() }
         }
     }
-    func closeSettings() { cancelShortcutRecording(); settingsWindow?.close() }
+    func closeSettings() { settingsRequest += 1; store.settings = false; cancelShortcutRecording(); settingsWindow?.close() }
     func beginShortcutRecording() {
         if store.recordingShortcut { cancelShortcutRecording(); return }
         if let hotkey = hotkey { UnregisterEventHotKey(hotkey); self.hotkey = nil }
@@ -712,7 +745,7 @@ struct ShelfView: View {
                     Button("粘贴队列下一条 · ⌘↵") { Controller.shared.pasteNext() }.disabled(store.pasteQueue.isEmpty)
                     Button("新建文字 · ⌘N") { Controller.shared.createText() }
                     Button("撤销 · ⌘Z") { store.undoItemChange() }.disabled(store.undoItems.isEmpty)
-                    Button("设置…") { Controller.shared.openSettings() }
+                    Button("设置…") { Controller.shared.openSettingsFromMenu() }
                     Button(store.paused ? "继续记录" : "暂停记录… · ⌘T") { if store.paused { Controller.shared.togglePause() } else { Controller.shared.pauseMenu() } }
                     Divider()
                     Text("← → 选择 · ↵ 粘贴 · ⌘1–9 快速粘贴")
@@ -809,7 +842,7 @@ struct ClipCard: View, Equatable {
     let current: Bool
     @ObservedObject var store: Store
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.clip.id == rhs.clip.id && lhs.index == rhs.index && lhs.selected == rhs.selected && lhs.current == rhs.current && lhs.clip.title == rhs.clip.title && lhs.clip.text == rhs.clip.text && lhs.clip.kind == rhs.clip.kind && lhs.clip.boards == rhs.clip.boards && lhs.clip.created == rhs.clip.created && lhs.clip.source == rhs.clip.source && lhs.clip.ocrText == rhs.clip.ocrText && lhs.clip.linkTitle == rhs.clip.linkTitle
+        lhs.clip.id == rhs.clip.id && lhs.index == rhs.index && lhs.selected == rhs.selected && lhs.current == rhs.current && lhs.clip.title == rhs.clip.title && lhs.clip.userLabel == rhs.clip.userLabel && lhs.clip.text == rhs.clip.text && lhs.clip.kind == rhs.clip.kind && lhs.clip.boards == rhs.clip.boards && lhs.clip.created == rhs.clip.created && lhs.clip.source == rhs.clip.source && lhs.clip.ocrText == rhs.clip.ocrText && lhs.clip.linkTitle == rhs.clip.linkTitle
     }
     var color: Color { if clip.kind == "文字", CodeSyntax.language(clip.text) != nil { return .purple }; switch clip.kind { case "链接": return .blue; case "图片": return .purple; case "文件": return .orange; default: return .teal } }
     var icon: String { switch clip.kind { case "链接": return "link"; case "图片": return "photo"; case "文件": return "folder"; default: return "text.alignleft" } }
@@ -817,7 +850,7 @@ struct ClipCard: View, Equatable {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 5) { Text(MapLink.parse(clip.text) != nil ? "地图" : (clip.source == "快速翻译" ? "翻译" : (clip.kind == "文字" && CodeSyntax.language(clip.text) != nil ? "代码" : clip.kind))).font(.system(size: 12, weight: .medium)); if current { Text("当前").font(.system(size: 9)).opacity(0.75) }; if !clip.boards.isEmpty { Image(systemName: "pin.fill").font(.system(size: 9)) } }
+                    HStack(spacing: 5) { Text(clip.cardTitle).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.tail).help(clip.cardTitle); if current { Text("当前").font(.system(size: 9)).opacity(0.75) }; if !clip.boards.isEmpty { Image(systemName: "pin.fill").font(.system(size: 9)) } }
                     if !store.compact { TimelineView(.periodic(from: .now, by: 60)) { context in Text(ageLabel(clip.created, now: context.date)).font(.system(size: 10)).opacity(0.8) } }
                 }
                 Spacer()
