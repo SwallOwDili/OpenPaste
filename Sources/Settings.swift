@@ -1,26 +1,31 @@
 import SwiftUI
 import AppKit
 
-private enum SettingsPage: String, CaseIterable {
+enum SettingsPage: String, CaseIterable {
     case general = "通用", translation = "快速翻译", privacy = "隐私与权限", data = "数据管理", about = "关于"
     var icon: String { switch self { case .general: return "slider.horizontal.3"; case .translation: return "character.bubble"; case .privacy: return "hand.raised"; case .data: return "externaldrive"; case .about: return "info.circle" } }
     var subtitle: String { switch self { case .general: return "调整呼出方式、历史记录与内容预览"; case .translation: return "连接你自己的翻译服务，选中即译"; case .privacy: return "控制记录范围与直接粘贴权限"; case .data: return "管理本机历史，或从 Paste 迁移内容"; case .about: return "应用信息与使用授权" } }
 }
-struct SettingsView: View {
-    @ObservedObject var store: Store
-    @ObservedObject private var updates = UpdateChecker.shared
-    @ObservedObject private var analytics = UsageAnalytics.shared
-    @State private var page: SettingsPage = CommandLine.arguments.contains("--about") ? .about : .general
-    @State private var translationKey = ""
-    private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 14, content: content).padding(18).frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.06), lineWidth: 1))
+final class SettingsDirectoryInfo: ObservableObject {
+    @Published private(set) var isCloud = false
+    private var root: URL?
+    func refresh(_ root: URL) {
+        guard self.root != root else { return }
+        self.root = root
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let cloud = DataDirectory.isCloud(root)
+            DispatchQueue.main.async {
+                guard let self, self.root == root else { return }
+                self.isCloud = cloud
+            }
         }
     }
-    private func note(_ text: String) -> some View { Text(text).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+}
+struct SettingsView: View {
+    static let privacyNotification = Notification.Name("OpenPasteShowPrivacy")
+    @ObservedObject var store: Store
+    @StateObject private var directory = SettingsDirectoryInfo()
+    @State private var page: SettingsPage = CommandLine.arguments.contains("--about") ? .about : .general
     var body: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 24) {
@@ -34,13 +39,91 @@ struct SettingsView: View {
                     }
                 }
                 Spacer()
-                VStack(alignment: .leading, spacing: 7) { Label(DataDirectory.isCloud(store.root) ? "iCloud Drive 同步" : "本机数据目录", systemImage: DataDirectory.isCloud(store.root) ? "icloud" : "internaldrive"); Text("版本 \(Bundle.main.object(forInfoDictionaryKey: "OpenPasteReleaseVersion") as? String ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")") }.font(.system(size: 11)).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 7) { Label(directory.isCloud ? "iCloud Drive 同步" : "本机数据目录", systemImage: directory.isCloud ? "icloud" : "internaldrive"); Text("版本 \(Bundle.main.object(forInfoDictionaryKey: "OpenPasteReleaseVersion") as? String ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")") }.font(.system(size: 11)).foregroundStyle(.secondary)
                 Button { Controller.shared.quit() } label: {
                     Label("退出 OpenPaste", systemImage: "power").frame(maxWidth: .infinity, alignment: .leading)
                 }.buttonStyle(.bordered).controlSize(.small).help("退出程序并保存历史记录")
             }.padding(16).frame(width: 170).background(.regularMaterial)
             Divider()
-            VStack(spacing: 0) {
+            SettingsPages(page: page, store: store, directory: directory)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear { directory.refresh(store.root) }
+        .onChange(of: store.root) { _, root in directory.refresh(root) }
+        .onReceive(NotificationCenter.default.publisher(for: UpdateChecker.aboutNotification)) { _ in page = .about }
+        .onReceive(NotificationCenter.default.publisher(for: Self.privacyNotification)) { _ in page = .privacy }
+    }
+}
+
+func runSettingsPageCacheTests(store: Store) {
+    let coordinator = SettingsPages.Coordinator()
+    let directory = SettingsDirectoryInfo()
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: 570, height: 620))
+    let passes = store.filterPasses
+    for page in SettingsPage.allCases { coordinator.show(page, in: container, store: store, directory: directory) }
+    let original = coordinator.hosts
+    for _ in 0..<3 {
+        for page in SettingsPage.allCases {
+            coordinator.show(page, in: container, store: store, directory: directory)
+            guard coordinator.hosts[page] === original[page], container.subviews.count == 1 else { print("FAIL: settings page was rebuilt or left duplicate views"); exit(1) }
+        }
+    }
+    guard coordinator.hosts.count == 5, store.filterPasses == passes else { print("FAIL: settings switch rebuilt history results"); exit(1) }
+    print("PASS: all five settings pages reuse their hosts without refiltering history")
+}
+
+struct SettingsPages: NSViewRepresentable {
+    let page: SettingsPage
+    let store: Store
+    let directory: SettingsDirectoryInfo
+    final class Coordinator {
+        private(set) var hosts: [SettingsPage: NSHostingView<SettingsPageView>] = [:]
+        private var current: SettingsPage?
+        func show(_ page: SettingsPage, in container: NSView, store: Store, directory: SettingsDirectoryInfo) {
+            guard current != page else { return }
+            if let current { hosts[current]?.removeFromSuperview() }
+            let host: NSHostingView<SettingsPageView>
+            if let cached = hosts[page] { host = cached }
+            else {
+                host = NSHostingView(rootView: SettingsPageView(store: store, directory: directory, page: page))
+                host.sizingOptions = []
+                host.autoresizingMask = [.width, .height]
+                hosts[page] = host
+            }
+            host.frame = container.bounds
+            container.addSubview(host)
+            current = page
+        }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSView {
+        let container = NSView()
+        context.coordinator.show(page, in: container, store: store, directory: directory)
+        return container
+    }
+    func updateNSView(_ container: NSView, context: Context) {
+        context.coordinator.show(page, in: container, store: store, directory: directory)
+    }
+}
+
+struct SettingsPageView: View {
+    @ObservedObject var store: Store
+    @ObservedObject var directory: SettingsDirectoryInfo
+    let page: SettingsPage
+    @ObservedObject private var updates = UpdateChecker.shared
+    @ObservedObject private var analytics = UsageAnalytics.shared
+    @State private var translationKey = ""
+    private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 14, content: content).padding(18).frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.06), lineWidth: 1))
+        }
+    }
+    private func note(_ text: String) -> some View { Text(text).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+    var body: some View {
+        VStack(spacing: 0) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 6) { Text(page == .about ? "关于 OpenPaste" : page.rawValue).font(.system(size: 23, weight: .semibold)); Text(page.subtitle).font(.system(size: 12)).foregroundStyle(.secondary) }
                     Spacer()
@@ -58,8 +141,7 @@ struct SettingsView: View {
                         }
                     }.padding(.horizontal, 24).padding(.bottom, 24).frame(maxWidth: .infinity, alignment: .leading)
                 }.disabled(store.importingPaste || store.changingDataDirectory)
-            }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Color(nsColor: .windowBackgroundColor))
-        }.onReceive(NotificationCenter.default.publisher(for: UpdateChecker.aboutNotification)) { _ in page = .about }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Color(nsColor: .windowBackgroundColor))
     }
     private var about: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -101,7 +183,7 @@ struct SettingsView: View {
                 if analytics.available {
                     note("官方构建默认开启。OpenPaste 向 Google Firebase Analytics 记录首次启动、粘贴取用和翻译成功三项次数；首次启动用于估算安装量。Firebase SDK 还会处理应用实例标识、设备与应用版本等基础信息。")
                     note("不发送剪贴板内容、所选文字、网址、文件路径或翻译 API Key。可在「隐私与权限」关闭，关闭后停止收集并清除本机统计标识。")
-                    Button("管理使用统计…") { page = .privacy }.buttonStyle(.link)
+                    Button("管理使用统计…") { NotificationCenter.default.post(name: SettingsView.privacyNotification, object: nil) }.buttonStyle(.link)
                 } else {
                     note("此构建未配置 Firebase，不会发送使用统计。")
                 }
@@ -173,7 +255,7 @@ struct SettingsView: View {
     private var data: some View {
         VStack(alignment: .leading, spacing: 22) {
             group("数据保存目录") {
-                HStack { Label(DataDirectory.isCloud(store.root) ? "iCloud Drive" : (store.root.standardizedFileURL == DataDirectory.defaultRoot.standardizedFileURL ? "本机默认目录" : "自定义目录"), systemImage: DataDirectory.isCloud(store.root) ? "icloud" : "folder"); Spacer(); Button("打开目录") { Controller.shared.openExternal(store.root) } }
+                HStack { Label(directory.isCloud ? "iCloud Drive" : (store.root.standardizedFileURL == DataDirectory.defaultRoot.standardizedFileURL ? "本机默认目录" : "自定义目录"), systemImage: directory.isCloud ? "icloud" : "folder"); Spacer(); Button("打开目录") { Controller.shared.openExternal(store.root) } }
                 Text(store.root.path).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).foregroundStyle(.secondary)
                 HStack { Button("更改目录…") { store.chooseDataDirectory() }.buttonStyle(.borderedProminent); if store.root.standardizedFileURL != DataDirectory.defaultRoot.standardizedFileURL { Button("恢复默认目录") { store.changeDataDirectory(to: DataDirectory.defaultRoot) } } }
                 note("历史、收藏和图片附件一起迁移，目标已有历史会合并，原目录保留为备份。选择 iCloud Drive 中的专用文件夹后，由系统同步数据；其他 Mac 选择同一文件夹即可读取历史。")

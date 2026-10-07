@@ -61,10 +61,10 @@ extension Store {
                 for (index, clip) in clips.enumerated() { if index > 0 { rich.append(NSAttributedString(string: "\n")) }; rich.append(clip.attributedText) }
                 if let rtf = try? rich.data(from: NSRange(location: 0, length: rich.length), documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) { item.setData(rtf, forType: .rtf) }
             }
-            change = pasteboard.clearContents(); let ok = pasteboard.writeObjects([item]); change = pasteboard.changeCount; return ok
+            change = pasteboard.clearContents(); let ok = pasteboard.writeObjects([item]); change = pasteboard.changeCount; if ok { recordUse(clips) }; return ok
         }
         let items = clips.flatMap(\.parts).map { parts -> NSPasteboardItem in let item = NSPasteboardItem(); for part in parts { item.setData(part.data, forType: NSPasteboard.PasteboardType(part.type)) }; return item }
-        pasteboard.clearContents(); let ok = pasteboard.writeObjects(items); change = pasteboard.changeCount; return ok
+        pasteboard.clearContents(); let ok = pasteboard.writeObjects(items); change = pasteboard.changeCount; if ok { recordUse(clips) }; return ok
     }
     func indexImages() {
         guard !indexingImages else { return }
