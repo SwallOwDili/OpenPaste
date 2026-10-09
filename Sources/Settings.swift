@@ -116,6 +116,7 @@ struct SettingsPageView: View {
     @ObservedObject var directory: SettingsDirectoryInfo
     let page: SettingsPage
     @ObservedObject private var updates = UpdateChecker.shared
+    @ObservedObject private var installer = UpdateInstaller.shared
     @ObservedObject private var analytics = UsageAnalytics.shared
     @State private var translationKey = ""
     private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -158,7 +159,9 @@ struct SettingsPageView: View {
             }.padding(.vertical, 24).frame(maxWidth: .infinity).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             group("软件更新") {
                 Toggle("自动检查更新", isOn: $updates.automatic).toggleStyle(.switch)
-                note("开启后每天检查一次 GitHub 正式 Release，仅查询公开版本信息，不上传剪贴板内容。")
+                note("开启后每天检查一次 GitHub Release，仅查询公开版本信息，不上传剪贴板内容。")
+                Toggle("包含预发布版本", isOn: $updates.includePrerelease).toggleStyle(.switch)
+                note("默认只发现正式版。开启后也会发现 rc 等预发布版本，它们可能不稳定。")
                 HStack {
                     Text(updates.message).font(.system(size: 12)).foregroundStyle(updates.available == nil ? Color.secondary : Color.accentColor)
                     Spacer()
@@ -166,8 +169,18 @@ struct SettingsPageView: View {
                 }
                 if let release = updates.available {
                     HStack {
-                        Button("查看新版 \(release.version)…") { Controller.shared.showUpdateDetails() }.buttonStyle(.borderedProminent)
-                        Button("跳过此版本") { updates.skip() }
+                        Button("查看新版 \(release.version)…") { Controller.shared.showUpdateDetails() }.buttonStyle(.borderedProminent).disabled(installer.busy)
+                        Button("跳过此版本") { updates.skip() }.disabled(installer.busy)
+                    }
+                }
+                if installer.phase != .idle || !installer.message.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(installer.message).font(.system(size: 12)).foregroundStyle(installer.phase == .idle ? Color.red : Color.secondary)
+                        if case .downloading(let fraction) = installer.phase { ProgressView(value: fraction) }
+                        HStack {
+                            if installer.phase == .ready { Button("重启并安装") { Controller.shared.promptInstallReady() }.buttonStyle(.borderedProminent) }
+                            if installer.busy || installer.phase == .ready { Button("取消更新") { installer.cancel() }.disabled(installer.phase == .installing) }
+                        }
                     }
                 }
             }

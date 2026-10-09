@@ -41,13 +41,31 @@ struct GitHubRelease: Codable {
               url.path == "/SwallOwDili/OpenPaste/releases/tag/\(tag_name)" else { return nil }
         return url
     }
-    func isNewer(than current: String) -> Bool {
-        guard !draft, !prerelease, let latest = ReleaseVersion(tag_name), latest.suffix.isEmpty,
-              pageURL != nil else { return false }
+    /// A release the checker may offer: published, from this repository, and a stable version unless prereleases were chosen.
+    func isEligible(includePrerelease: Bool) -> Bool {
+        guard !draft, pageURL != nil, let parsed = ReleaseVersion(tag_name) else { return false }
+        return includePrerelease || (!prerelease && parsed.suffix.isEmpty)
+    }
+    func isNewer(than current: String, includePrerelease: Bool = false) -> Bool {
+        guard isEligible(includePrerelease: includePrerelease), let latest = ReleaseVersion(tag_name) else { return false }
         if let installed = ReleaseVersion(current) { return installed < latest }
         return current == "draft" || current.range(of: #"^.+-[0-9a-f]{8}$"#, options: .regularExpression) != nil
     }
-    var hasInstaller: Bool { assets.contains { $0.state == "uploaded" && $0.name.hasPrefix("OpenPaste-") && $0.name.hasSuffix(".zip") } }
+    var hasInstaller: Bool { installerName != nil }
+    /// The installer ZIP and its checksum are addressed by name under this tag; no URL from the API response is trusted.
+    var installerName: String? {
+        let name = "OpenPaste-\(version)-macos-universal.zip"
+        return assets.contains { $0.state == "uploaded" && $0.name == name } ? name : nil
+    }
+    var checksumName: String? {
+        let name = "OpenPaste-\(version)-macos-universal.sha256"
+        return assets.contains { $0.state == "uploaded" && $0.name == name } ? name : nil
+    }
+    func assetURL(_ name: String) -> URL? {
+        guard name.range(of: #"^OpenPaste-[0-9A-Za-z.-]+-macos-universal\.(zip|sha256)$"#, options: .regularExpression) != nil,
+              ReleaseVersion(tag_name) != nil else { return nil }
+        return URL(string: "https://github.com/SwallOwDili/OpenPaste/releases/download/\(tag_name)/\(name)")
+    }
 }
 final class UpdateChecker: ObservableObject {
     static let shared = UpdateChecker()
@@ -55,6 +73,16 @@ final class UpdateChecker: ObservableObject {
     @Published var automatic: Bool { didSet {
         defaults.set(automatic, forKey: "automaticUpdateChecks")
         if automatic { checkIfDue() }
+    } }
+    @Published var includePrerelease: Bool { didSet {
+        guard includePrerelease != oldValue else { return }
+        defaults.set(includePrerelease, forKey: "updateIncludePrerelease")
+        release = nil
+        defaults.removeObject(forKey: "cachedGitHubRelease")
+        defaults.removeObject(forKey: "skippedUpdateVersion")
+        message = "尚未检查更新"
+        onChange?()
+        check(manual: true)
     } }
     @Published private(set) var checking = false
     @Published private(set) var release: GitHubRelease?
@@ -72,6 +100,7 @@ final class UpdateChecker: ObservableObject {
         self.defaults = defaults
         self.current = current ?? Bundle.main.object(forInfoDictionaryKey: "OpenPasteReleaseVersion") as? String ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
         automatic = defaults.bool(forKey: "automaticUpdateChecks")
+        includePrerelease = defaults.bool(forKey: "updateIncludePrerelease")
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 20
         config.timeoutIntervalForResource = 30
@@ -79,7 +108,7 @@ final class UpdateChecker: ObservableObject {
         config.urlCredentialStorage = nil
         self.session = session ?? URLSession(configuration: config)
         lastAttempt = defaults.object(forKey: "updateLastAttempt") as? Date
-        if let data = defaults.data(forKey: "cachedGitHubRelease"), let cached = try? JSONDecoder().decode(GitHubRelease.self, from: data), cached.isNewer(than: self.current), cached.hasInstaller {
+        if let data = defaults.data(forKey: "cachedGitHubRelease"), let cached = try? JSONDecoder().decode(GitHubRelease.self, from: data), cached.isNewer(than: self.current, includePrerelease: self.includePrerelease), cached.hasInstaller {
             release = cached
             message = "发现新版 \(cached.version)"
         }
@@ -99,6 +128,13 @@ final class UpdateChecker: ObservableObject {
         message = "已跳过 \(release.version)，可手动检查重新查看"
         onChange?()
     }
+    /// `/releases/latest` returns one object; the list endpoint returns an array. The newest eligible release wins.
+    static func newest(in data: Data, includePrerelease: Bool) -> GitHubRelease? {
+        let decoder = JSONDecoder()
+        let candidates = includePrerelease ? (try? decoder.decode([GitHubRelease].self, from: data)) ?? [] : (try? decoder.decode(GitHubRelease.self, from: data)).map { [$0] } ?? []
+        return candidates.filter { $0.isEligible(includePrerelease: includePrerelease) }
+            .max { (ReleaseVersion($0.tag_name) ?? ReleaseVersion("0.0.0")!) < (ReleaseVersion($1.tag_name) ?? ReleaseVersion("0.0.0")!) }
+    }
     func check(manual: Bool = true) {
         manualPending = manualPending || manual
         guard !checking else { return }
@@ -107,7 +143,9 @@ final class UpdateChecker: ObservableObject {
         onChange?()
         lastAttempt = Date()
         defaults.set(lastAttempt, forKey: "updateLastAttempt")
-        var request = URLRequest(url: URL(string: "https://api.github.com/repos/SwallOwDili/OpenPaste/releases/latest")!)
+        let includePrerelease = self.includePrerelease
+        let endpoint = includePrerelease ? "releases?per_page=30" : "releases/latest"
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/SwallOwDili/OpenPaste/\(endpoint)")!)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("OpenPaste-UpdateChecker", forHTTPHeaderField: "User-Agent")
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -121,8 +159,8 @@ final class UpdateChecker: ObservableObject {
                 guard error == nil, let http = response as? HTTPURLResponse else { if manual { self.message = "检查失败，请检查网络后重试" }; return }
                 if http.statusCode == 404 { self.release = nil; self.defaults.removeObject(forKey: "cachedGitHubRelease"); self.message = "暂未发布正式版本"; return }
                 guard http.statusCode == 200 else { if manual { self.message = http.statusCode == 403 || http.statusCode == 429 ? "GitHub 请求受限，请稍后重试" : "检查失败（HTTP \(http.statusCode)）" }; return }
-                guard let data = data, data.count <= 2_000_000, let latest = try? JSONDecoder().decode(GitHubRelease.self, from: data), ReleaseVersion(latest.tag_name) != nil, latest.pageURL != nil, !latest.draft, !latest.prerelease else { if manual { self.message = "无法识别版本信息，请稍后重试" }; return }
-                if latest.isNewer(than: self.current) {
+                guard let data = data, data.count <= 2_000_000, let latest = Self.newest(in: data, includePrerelease: includePrerelease) else { if manual { self.message = "无法识别版本信息，请稍后重试" }; return }
+                if latest.isNewer(than: self.current, includePrerelease: includePrerelease) {
                     guard latest.hasInstaller else { self.message = "新版安装包仍在构建，请稍后检查"; return }
                     self.release = latest
                     self.defaults.set(try? JSONEncoder().encode(latest), forKey: "cachedGitHubRelease")
@@ -131,7 +169,7 @@ final class UpdateChecker: ObservableObject {
                 } else {
                     self.release = nil
                     self.defaults.removeObject(forKey: "cachedGitHubRelease")
-                    self.message = "已是最新正式版本"
+                    self.message = includePrerelease ? "已是最新版本" : "已是最新正式版本"
                 }
             }
         }.resume()

@@ -221,7 +221,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let updateItem = NSMenuItem(title: UpdateChecker.shared.menuTitle, action: #selector(checkUpdatesFromMenu), keyEquivalent: "")
         menu.addItem(updateItem); updateMenuItem = updateItem
         UpdateChecker.shared.onChange = { [weak self] in self?.updateMenuItem?.title = UpdateChecker.shared.menuTitle }
-        if !preview { UpdateChecker.shared.start() }
+        if !preview {
+            UpdateChecker.shared.start(); UpdateInstaller.shared.sweepStaleStaging()
+            // Let the menu bar and windows settle before telling the user how the last update went.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.showUpdateResultIfNeeded() }
+        }
         menu.addItem(withTitle: "退出 OpenPaste", action: #selector(quit), keyEquivalent: "q")
         for item in menu.items { item.target = self }; status.menu = menu
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -601,21 +605,62 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard !modalShowing, let release = UpdateChecker.shared.available, let url = release.pageURL else { return }
         openSettings()
         NotificationCenter.default.post(name: UpdateChecker.aboutNotification, object: nil)
+        let installer = UpdateInstaller.shared
+        let blocked = installer.blockingReason()
         let alert = NSAlert()
         alert.messageText = "OpenPaste \(release.version) 已发布"
-        alert.informativeText = "下载后退出 OpenPaste，将新版替换到应用程序目录；历史保留。当前版本未公证，更新后可能需要重新授予辅助功能权限。"
+        alert.informativeText = blocked == nil
+            ? "选择“下载并更新”后，应用会下载并校验新版，确认后才会重启安装；历史保留，辅助功能授权不变。"
+            : "\(blocked?.localizedDescription ?? "")。"
         let notes = NSTextView(frame: NSRect(x: 0, y: 0, width: 430, height: 180))
         notes.string = String((release.body ?? "该版本没有提供更新说明。").prefix(12000))
         notes.isEditable = false
         notes.font = .systemFont(ofSize: 12)
         let scroll = NSScrollView(frame: notes.frame); scroll.hasVerticalScroller = true; scroll.documentView = notes
         alert.accessoryView = scroll
-        alert.addButton(withTitle: "前往下载")
+        alert.addButton(withTitle: blocked == nil ? "下载并更新" : "前往下载")
         alert.addButton(withTitle: "稍后")
         alert.addButton(withTitle: "跳过此版本")
         presentAlert(alert) { [weak self] response in
-            if response == .alertFirstButtonReturn { self?.openExternal(url) }
+            if response == .alertFirstButtonReturn {
+                if blocked == nil {
+                    installer.onReady = { [weak self] in self?.promptInstallReady() }
+                    installer.prepare(release)
+                } else { self?.openExternal(url) }
+            }
             else if response == .alertThirdButtonReturn { UpdateChecker.shared.skip() }
+        }
+    }
+    func showUpdateResultIfNeeded() {
+        guard let notice = UpdateNotice.consumePending() else { return }
+        guard !modalShowing else { return }
+        openSettings()
+        NotificationCenter.default.post(name: UpdateChecker.aboutNotification, object: nil)
+        let alert = NSAlert()
+        if notice.succeeded {
+            alert.messageText = "OpenPaste 已更新到 \(notice.to)"
+            alert.informativeText = "上一个版本是 \(notice.from)。历史与设置保持不变。"
+        } else {
+            alert.messageText = "更新未完成"
+            alert.informativeText = "仍在使用 \(notice.from)，已保留当前版本。可以在「设置 → 关于」重新尝试，或前往 GitHub 手动下载。"
+        }
+        alert.addButton(withTitle: "好")
+        presentAlert(alert) { _ in }
+    }
+    func promptInstallReady() {
+        let installer = UpdateInstaller.shared
+        guard installer.phase == .ready, let release = installer.preparedRelease, !modalShowing else { return }
+        openSettings()
+        NotificationCenter.default.post(name: UpdateChecker.aboutNotification, object: nil)
+        let alert = NSAlert()
+        alert.messageText = "OpenPaste \(release.version) 已准备好"
+        alert.informativeText = "新版已下载，SHA-256 与签名均已验证。现在重启并安装？重启后会自动重新打开，历史数据保留。"
+        alert.addButton(withTitle: "重启并安装")
+        alert.addButton(withTitle: "稍后")
+        presentAlert(alert) { response in
+            if response == .alertFirstButtonReturn {
+                if installer.installAndRelaunch() { NSApp.terminate(nil) }
+            }
         }
     }
     func closeSettings() { settingsRequest += 1; store.settings = false; cancelShortcutRecording(); settingsWindow?.close() }
