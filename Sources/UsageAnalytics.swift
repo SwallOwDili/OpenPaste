@@ -12,9 +12,9 @@ enum UsageEvent: String {
 final class UsageAnalytics: ObservableObject {
     static let shared = UsageAnalytics()
 
-    @Published var enabled = (Bundle.main.url(forResource: "GoogleService-Info", withExtension: "plist") != nil) && ((UserDefaults.standard.object(forKey: "usageAnalyticsEnabled") as? Bool) ?? true) {
+    @Published var enabled = AppEnvironment.current.allowAnalytics && (Bundle.main.url(forResource: "GoogleService-Info", withExtension: "plist") != nil) && ((AppEnvironment.current.defaults.object(forKey: "usageAnalyticsEnabled") as? Bool) ?? true) {
         didSet {
-            UserDefaults.standard.set(enabled, forKey: "usageAnalyticsEnabled")
+            AppEnvironment.current.defaults.set(enabled, forKey: "usageAnalyticsEnabled")
             if enabled && !configured { start(); return }
             guard configured else { return }
             Analytics.setAnalyticsCollectionEnabled(enabled)
@@ -27,10 +27,10 @@ final class UsageAnalytics: ObservableObject {
     }
 
     private var configured = false
-    var available: Bool { Bundle.main.url(forResource: "GoogleService-Info", withExtension: "plist") != nil }
+    var available: Bool { AppEnvironment.current.allowAnalytics && Bundle.main.url(forResource: "GoogleService-Info", withExtension: "plist") != nil }
 
     func start() {
-        guard enabled, !configured, available else { return }
+        guard AppEnvironment.current.allowAnalytics, enabled, !configured, available else { return }
         FirebaseApp.configure()
         configured = true
         Analytics.setAnalyticsCollectionEnabled(enabled)
@@ -38,9 +38,9 @@ final class UsageAnalytics: ObservableObject {
     }
 
     private func recordFirstLaunch() {
-        if !UserDefaults.standard.bool(forKey: "usageAnalyticsFirstLaunchRecorded") {
+        if !AppEnvironment.current.defaults.bool(forKey: "usageAnalyticsFirstLaunchRecorded") {
             record(.firstLaunch)
-            UserDefaults.standard.set(true, forKey: "usageAnalyticsFirstLaunchRecorded")
+            AppEnvironment.current.defaults.set(true, forKey: "usageAnalyticsFirstLaunchRecorded")
         }
     }
 
