@@ -5,11 +5,12 @@ python3 Tests/version-test.py
 python3 -m unittest discover -s Tests -p '*_unit_test.py'
 # Compile the test executable without assembling, signing, or packaging an App.
 arch="$(uname -m)"
-scratch="build/swiftpm-${arch}"
-swift build -c release --triple "${arch}-apple-macosx14.0" --scratch-path "$scratch" --product OpenPaste
-bin_dir="$(swift build -c release --triple "${arch}-apple-macosx14.0" --scratch-path "$scratch" --show-bin-path)"
+scratch="build/swiftpm-tests-${arch}"
+scripts/prepare-test-scratch.sh "$arch"
+OPENPASTE_TESTING=1 swift build --manifest-cache none -c release --triple "${arch}-apple-macosx14.0" --scratch-path "$scratch" --product OpenPaste
+bin_dir="$(OPENPASTE_TESTING=1 swift build --manifest-cache none -c release --triple "${arch}-apple-macosx14.0" --scratch-path "$scratch" --show-bin-path)"
 app="$bin_dir/OpenPaste"
-for check in --maintenance-test --update-test --self-test --code-style-test --data-directory-test --paste-import-unit-test --shortcut-model-test; do
+for check in --maintenance-test --update-test --self-test --code-style-test --data-directory-test --paste-import-unit-test --shortcut-model-test --recording-pause-test --storage-recovery-test --permission-monitor-test --interaction-policy-test --content-editing-test --capture-boundary-test --filter-test --paste-queue-test --clipboard-write-test --current-clipboard-test --preview-cache-test --navigation-test --drag-provider-test --translation-config-test; do
     "$app" "$check"
 done
 # Translation checks use fake credentials and a localhost fixture, never your API.

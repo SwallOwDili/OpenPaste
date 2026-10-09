@@ -2,6 +2,9 @@ included:
   - Sources
 only_rules:
   - duplicate_imports
+  - invalid_swiftlint_command
   - legacy_cggeometry_functions
   - legacy_constant
+  - legacy_nsgeometry_functions
+  - legacy_random
   - return_arrow_whitespace
