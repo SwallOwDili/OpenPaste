@@ -32,6 +32,7 @@ struct PasteImportResult {
 enum PasteImport {
     static let maxBytes = 200 * 1024 * 1024
     static var candidates: [URL] {
+        guard AppEnvironment.current.allowPasteDiscovery else { return [] }
         let home = FileManager.default.homeDirectoryForCurrentUser
         return ["Library/Application Support/Paste/db.sqlite", "Library/Application Support/com.wiheads.paste/Paste.db", "Library/Containers/com.wiheads.paste/Data/Library/Application Support/Paste/db.sqlite", "Library/Containers/com.wiheads.paste/Data/Library/Application Support/com.wiheads.paste/Paste.db"].map { home.appendingPathComponent($0) }.filter { FileManager.default.fileExists(atPath: $0.path) }
     }
@@ -233,7 +234,9 @@ enum PasteImport {
 
 }
 extension PasteImport {
-    static func commit(_ result: PasteImportResult, snapshot: Archive, root: URL, progress: ((ImportProgress) -> Void)? = nil) throws -> (Archive, Int) {
+    static func commit(_ result: PasteImportResult, snapshot: Archive, root: URL,
+                       syncBaseline: SyncSnapshot? = nil, syncDevice: String? = nil,
+                       progress: ((ImportProgress) -> Void)? = nil) throws -> (Archive, Int, SyncSnapshot?) {
         let backup = root.appendingPathComponent("before-paste-import-\(UUID().uuidString).json")
         // Immutable content files are shared by the current manifest and backups.
         try HistoryStorage.write(snapshot, to: backup, phase: "备份原有历史", progress: progress)
@@ -259,8 +262,22 @@ extension PasteImport {
         try HistoryStorage.write(merged, to: manifest, phase: "导入内容", progress: progress)
         // Map immutable files rather than retaining every imported image in memory.
         merged = try HistoryStorage.read(from: manifest)
+        var synchronized: SyncSnapshot?
+        let manifestFiles = try DataDirectory.manifests(root)
+        let shared = DataDirectory.isCloud(root) || !manifestFiles.isEmpty
+        if shared {
+            guard let syncBaseline, let syncDevice else { throw failure("同步目录导入缺少设备状态") }
+            let local = DataDirectory.changes(merged, from: syncBaseline)
+            let published = DataDirectory.merge(try DataDirectory.load(root), local)
+            // Cache first so a failed device-manifest write is still recoverable on
+            // restart. Success is reported only after both durable writes complete.
+            try DataDirectory.cache(published, root: root)
+            try DataDirectory.write(published, root: root, device: syncDevice, progress: progress)
+            synchronized = published
+            merged = published.archive
+        }
         progress?(ImportProgress(phase: "导入完成", completed: merged.clips.count, total: merged.clips.count, bytes: result.storageBytes))
-        return (merged, added)
+        return (merged, added, synchronized)
     }
 }
 extension Store {
@@ -269,14 +286,17 @@ extension Store {
         defer { applyingImport = false }
         let bytes = merged.clips.reduce(0) { $0 + $1.byteCount }
         storageLimitMB = max(storageLimitMB, (bytes + 64 * 1024 * 1024 + 1048575) / 1048576)
-        if usePreferences { UserDefaults.standard.set(storageLimitMB, forKey: "storageLimitMB") }
+        persistStorageLimitPreference()
         if limit != 0 { limit = max(limit, merged.clips.filter { $0.boards.isEmpty }.count) }
         archive = merged
         if DataDirectory.usesSync(root) { save() }
     }
     @discardableResult func applyPasteImport(_ result: PasteImportResult) throws -> Int {
+        guard canModifyHistory else { throw PasteImport.failure(historyModificationNotice) }
         flush()
-        let (merged, added) = try PasteImport.commit(result, snapshot: archive, root: root)
+        let (merged, added, synchronized) = try PasteImport.commit(result, snapshot: archive, root: root,
+                                                                    syncBaseline: syncBaseline, syncDevice: deviceIDForPersistence())
+        if let synchronized { syncBaseline = synchronized }
         installImportedArchive(merged)
         return added
     }

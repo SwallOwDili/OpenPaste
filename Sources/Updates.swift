@@ -68,7 +68,7 @@ final class UpdateChecker: ObservableObject {
     private var manualPending = false
     var available: GitHubRelease? { release?.version == defaults.string(forKey: "skippedUpdateVersion") ? nil : release }
     var menuTitle: String { checking ? "正在检查更新…" : available.map { "发现新版 \($0.version)…" } ?? "检查更新…" }
-    init(defaults: UserDefaults = .standard, current: String? = nil, session: URLSession? = nil) {
+    init(defaults: UserDefaults = AppEnvironment.current.defaults, current: String? = nil, session: URLSession? = nil) {
         self.defaults = defaults
         self.current = current ?? Bundle.main.object(forInfoDictionaryKey: "OpenPasteReleaseVersion") as? String ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
         automatic = defaults.bool(forKey: "automaticUpdateChecks")

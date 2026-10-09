@@ -90,6 +90,7 @@ extension Clip {
         return result
     }
 }
+#if OPENPASTE_TESTING
 func runCodeStyleTests() {
     let text = #"Text(store.shortcutNotice.isEmpty ? "使用组合键" : store.shortcutNotice).font(.caption).foregroundStyle(.secondary)"#
     precondition(CodeSyntax.language(text) == "Swift")
@@ -116,3 +117,5 @@ func runCodeStyleTests() {
     pb.releaseGlobally()
     print("PASS: SwiftUI fragment detection, rich RTF/HTML code export, original rich bytes retained, original text unchanged, plain paste excludes styling")
 }
+
+#endif
