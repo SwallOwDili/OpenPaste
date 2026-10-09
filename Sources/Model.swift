@@ -19,8 +19,8 @@ struct GlobalShortcut: Codable, Equatable {
     }
     var valid: Bool {
         let allowed = UInt32(cmdKey | shiftKey | optionKey | controlKey)
-        let hasStrongModifier = modifiers & UInt32(controlKey | optionKey) != 0 || modifiers & UInt32(cmdKey | shiftKey) == UInt32(cmdKey | shiftKey)
-        return keyCode < 128 && ![53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(keyCode) && modifiers & ~allowed == 0 && hasStrongModifier && !keyName.isEmpty
+        let hasRequiredModifier = modifiers & UInt32(cmdKey | controlKey | optionKey) != 0
+        return keyCode < 128 && ![53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(keyCode) && modifiers & ~allowed == 0 && hasRequiredModifier && !keyName.isEmpty
     }
     static func from(_ event: NSEvent) -> GlobalShortcut {
         var mods: UInt32 = 0
@@ -32,11 +32,11 @@ struct GlobalShortcut: Codable, Equatable {
         let name = specials[event.keyCode] ?? event.charactersIgnoringModifiers?.uppercased() ?? "键\(event.keyCode)"
         return GlobalShortcut(keyCode: UInt32(event.keyCode), modifiers: mods, keyName: name)
     }
-    static func load(from defaults: UserDefaults = .standard) -> GlobalShortcut {
+    static func load(from defaults: UserDefaults = AppEnvironment.current.defaults) -> GlobalShortcut {
         if let data = defaults.data(forKey: "globalShortcut"), let shortcut = try? JSONDecoder().decode(GlobalShortcut.self, from: data), shortcut.valid { return shortcut }
         return .standard
     }
-    func save(to defaults: UserDefaults = .standard) { if let data = try? JSONEncoder().encode(self) { defaults.set(data, forKey: "globalShortcut") } }
+    func save(to defaults: UserDefaults = AppEnvironment.current.defaults) { if let data = try? JSONEncoder().encode(self) { defaults.set(data, forKey: "globalShortcut") } }
 }
 
 struct ClipPart: Codable, Equatable {
@@ -64,12 +64,12 @@ struct Clip: Codable, Identifiable {
         if kind == "文字", CodeSyntax.language(text) != nil { return "代码" }
         return kind
     }
-    var byteCount: Int { parts.flatMap { $0 }.reduce(0) { $0 + $1.data.count } }
+    var byteCount: Int { parts.reduce(0) { total, item in item.reduce(total) { $0 + $1.data.count } } }
     var fingerprint: String {
         if let cachedDigest = cachedDigest { return cachedDigest }
         var bytes = Data()
         for item in parts { bytes.append(0); for part in item.sorted(by: { $0.type < $1.type }) { bytes.append(Data(part.type.utf8)); bytes.append(0); bytes.append(part.data) } }
-        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        return HistoryStorage.hex(SHA256.hash(data: bytes))
     }
     var image: NSImage? {
         for item in parts { for part in item where ["public.png", "public.tiff", "public.jpeg"].contains(part.type) { if let image = NSImage(data: part.data) { return image } } }
@@ -78,6 +78,10 @@ struct Clip: Codable, Identifiable {
 }
 struct Board: Codable, Identifiable { var id = UUID(); var name: String; var color: String? = nil }
 struct Archive: Codable { var clips: [Clip] = []; var boards: [Board] = [] }
+struct ClipboardCaptureSource: Equatable {
+    let name: String
+    let bundleID: String
+}
 private final class PendingImageCapture {
     var clip: Clip?
     let preserveExisting: Bool
@@ -91,33 +95,46 @@ private final class SaveGeneration {
     func isCurrent(_ generation: Int) -> Bool { lock.lock(); defer { lock.unlock() }; return generation == value }
 }
 final class Store: ObservableObject {
-    @Published var archive = Archive() { didSet { refreshResults() } }
+    @Published var archive = Archive() { didSet { rebuildSources(); refreshResults() } }
     @Published var paused = false
+    private var pauseReasons = RecordingPauseReasons()
+    var userPaused: Bool { pauseReasons.userPaused }
+    var recordingSafetyPaused: Bool { pauseReasons.hasStorageFailure }
+    var recordingNeedsConsent: Bool { !pauseReasons.recordingAccepted }
+    var historyModificationNotice: String { initialLoading ? "正在读取历史，请稍后再试" : (hasHistoryLoadFailure ? "请先恢复历史读取，再修改内容" : "正在处理数据，请稍后再试") }
+    var hasHistoryLoadFailure: Bool { pauseReasons.loadFailure != nil }
+    var canModifyHistory: Bool { !initialLoading && !hasHistoryLoadFailure && !changingDataDirectory && !importingPaste }
+    var recordingPauseControl: RecordingPauseControl { pauseReasons.control }
     @Published var translating = false
     @Published var translationStatus = ""
+    @Published var translationSelectionAuthorized = false
     var selectionCaptureActive = false
     @Published var message = "所有内容仅保存在这台 Mac"
-    @Published var query = "" { didSet { refreshResults() } }
-    @Published var board: UUID? { didSet { refreshResults() } }
-    @Published var kind = "全部" { didSet { refreshResults() } }
-    @Published var sourceFilter = "全部来源" { didSet { refreshResults() } }
+    @Published var query = "" { didSet { if query != oldValue { filterValueChanged() } } }
+    @Published var board: UUID? { didSet { if board != oldValue { filterValueChanged() } } }
+    @Published var kind = "全部" { didSet { if kind != oldValue { filterValueChanged() } } }
+    @Published var sourceFilter = "全部来源" { didSet { if sourceFilter != oldValue { filterValueChanged() } } }
     @Published var filtersExpanded = false
-    @Published var dateRangeEnabled = false { didSet { refreshResults() } }
-    @Published var startDate = Date().addingTimeInterval(-7 * 86400) { didSet { refreshResults() } }
-    @Published var endDate = Date() { didSet { refreshResults() } }
-    @Published var todayOnly = false { didSet { refreshResults() } }
-    @Published var reverseHistory = false { didSet { if reverseHistory != oldValue { selection.removeAll(); selectionAnchor = nil; refreshResults(); if reverseHistory { selected = filtered.first?.id } } } }
+    @Published var dateRangeEnabled = false { didSet { if dateRangeEnabled != oldValue { filterValueChanged() } } }
+    @Published var startDate = Date().addingTimeInterval(-7 * 86400) { didSet { if startDate != oldValue { filterValueChanged() } } }
+    @Published var endDate = Date() { didSet { if endDate != oldValue { filterValueChanged() } } }
+    @Published var todayOnly = false { didSet { if todayOnly != oldValue { filterValueChanged() } } }
+    @Published var reverseHistory = false { didSet { if reverseHistory != oldValue { selection.removeAll(); selectionAnchor = nil; filterValueChanged(); if reverseHistory { selected = filtered.first?.id } } } }
     private(set) var visibleClips: [Clip] = []
+    private var visibleIndexByID: [UUID: Int] = [:]
     private(set) var sourceNames: [String] = []
     private(set) var filterPasses = 0
+    private(set) var sourcePasses = 0
+    private var batchingFilterChanges = false
+    private var filterRefreshPending = false
     @Published var selected: UUID?
-    var storageLimitMB = max(200, UserDefaults.standard.integer(forKey: "storageLimitMB"))
+    var storageLimitMB: Int
     var maxArchiveBytes: Int { storageLimitMB * 1024 * 1024 }
     @Published var importProgress = ImportProgress(phase: "", completed: 0, total: 0)
     var applyingImport = false
     @Published var importingPaste = false
     @Published var settings = false
-    @Published var shortcutLabel = GlobalShortcut.load().label
+    @Published var shortcutLabel: String
     @Published var recordingShortcut = false
     @Published var shortcutNotice = ""
     @Published var directPasteAuthorized = false
@@ -127,7 +144,7 @@ final class Store: ObservableObject {
     @Published var pasteQueue: [UUID] = []
     @Published var selection = Set<UUID>()
     @Published var compact = false
-    @Published var networkPreviews = UserDefaults.standard.object(forKey: "networkPreviews") as? Bool ?? true { didSet { if usePreferences { UserDefaults.standard.set(networkPreviews, forKey: "networkPreviews") }; LinkPreviewCache.shared.enabled = networkPreviews } }
+    @Published var networkPreviews: Bool { didSet { if usePreferences { configurationDefaults?.set(networkPreviews, forKey: "networkPreviews") }; LinkPreviewCache.shared.enabled = networkPreviews } }
     @Published var indexingImages = false
     @Published var ocrProgress = ""
     var draggingIDs: [UUID] = []
@@ -135,62 +152,194 @@ final class Store: ObservableObject {
     var selectionAnchor: UUID?
     var undoItems: [ItemUndo] = []
     let ocrQueue = DispatchQueue(label: "openpaste.ocr", qos: .utility)
-    @Published var retentionDays = UserDefaults.standard.integer(forKey: "retentionDays") { didSet { if usePreferences { UserDefaults.standard.set(retentionDays, forKey: "retentionDays") }; prune(); save() } }
+    @Published var retentionDays: Int { didSet { if usePreferences { configurationDefaults?.set(retentionDays, forKey: "retentionDays") }; prune(); save() } }
     @Published var currentClipID: UUID?
     @Published var captureNotice = ""
     private let saveGeneration = SaveGeneration()
+    private(set) var storageCallbackGeneration = 0
     let persistenceQueue = DispatchQueue(label: "openpaste.persistence", qos: .utility)
     let captureQueue = DispatchQueue(label: "openpaste.image-capture", qos: .userInitiated)
     private var captureGeneration = 0
     private var pendingImages: [Int: PendingImageCapture] = [:]
+    var pauseBoundaryPasteboard: () -> NSPasteboard = { .general }
+    private var resumeBoundary: (name: NSPasteboard.Name, change: Int)?
+    private var persistedPauseExpiryPending = false
+    private var freezeInitialResume = false
     @Published var root: URL
+    @Published var initialLoading = false
     @Published var changingDataDirectory = false
     @Published var directoryStatus = ""
     @Published var directoryProgress = ImportProgress(phase: "", completed: 0, total: 0)
     var syncBaseline = DataDirectory.baseline(Archive())
     var syncStamp = ""
     var initialDirectoryLoadFailed = false
+    private var storageRetryInFlight = false
     var syncChecking = false
     var directoryMutation = 0
     var syncTimer: Timer?
-    var limit: Int { didSet { if usePreferences { UserDefaults.standard.set(limit, forKey: "historyLimit") }; if !applyingImport { prune(); save() } } }
-    var ignored: String { didSet { if usePreferences { UserDefaults.standard.set(ignored, forKey: "ignoredApps") } } }
+    var limit: Int { didSet { if usePreferences { configurationDefaults?.set(limit, forKey: "historyLimit") }; if !applyingImport { prune(); save() } } }
+    var ignored: String { didSet { if usePreferences { configurationDefaults?.set(ignored, forKey: "ignoredApps") } } }
     var timer: Timer?
     var deletedCurrentChange: Int?
     var deletedCurrentID: UUID?
     var change = NSPasteboard.general.changeCount
+    private var observedCaptureSources: [NSPasteboard.Name: [Int: ClipboardCaptureSource]] = [:]
     let ephemeral: Bool
     let usePreferences: Bool
-    init(root: URL? = nil, ephemeral: Bool = false) {
+    private let configurationDefaults: UserDefaults?
+    private let injectedDeviceID: String?
+    private var deferredInitialStart: (source: ClipboardCaptureSource?, changeCount: Int?)?
+    init(root: URL? = nil, ephemeral: Bool = false, defaults: UserDefaults? = nil, deviceID: String? = nil,
+         loadHistoryAsynchronously: Bool = false,
+         initialHistoryLoader: ((URL) throws -> SyncSnapshot)? = nil) {
+        let persistsPreferences = root == nil && !ephemeral
         self.ephemeral = ephemeral
-        self.usePreferences = root == nil && !ephemeral
-        self.root = root ?? (ephemeral ? DataDirectory.defaultRoot : UserDefaults.standard.string(forKey: "dataDirectory").map { URL(fileURLWithPath: $0, isDirectory: true) } ?? DataDirectory.defaultRoot)
-        limit = UserDefaults.standard.object(forKey: "historyLimit") as? Int ?? 1000
-        ignored = UserDefaults.standard.string(forKey: "ignoredApps") ?? "com.1password.1password\ncom.agilebits.onepassword7\ncom.bitwarden.desktop\ncom.apple.Passwords"
+        self.usePreferences = persistsPreferences
+        let configurationDefaults = defaults ?? (persistsPreferences ? AppEnvironment.current.defaults : nil)
+        self.configurationDefaults = configurationDefaults
+        self.injectedDeviceID = deviceID ?? (persistsPreferences ? nil : UUID().uuidString)
+        storageLimitMB = max(200, configurationDefaults?.integer(forKey: "storageLimitMB") ?? 0)
+        shortcutLabel = (configurationDefaults.map { GlobalShortcut.load(from: $0) } ?? .standard).label
+        networkPreviews = configurationDefaults?.object(forKey: "networkPreviews") as? Bool ?? true
+        retentionDays = configurationDefaults?.integer(forKey: "retentionDays") ?? 0
+        limit = configurationDefaults?.object(forKey: "historyLimit") as? Int ?? 1000
+        ignored = configurationDefaults?.string(forKey: "ignoredApps") ?? "com.1password.1password\ncom.agilebits.onepassword7\ncom.bitwarden.desktop\ncom.apple.Passwords"
+        let selectedRoot = root ?? (ephemeral ? DataDirectory.defaultRoot : configurationDefaults?.string(forKey: "dataDirectory").map { URL(fileURLWithPath: $0, isDirectory: true) } ?? DataDirectory.defaultRoot)
+        do { self.root = try AppEnvironment.current.validateDataRoot(selectedRoot) }
+        catch { fatalError("OpenPaste data directory error: \(error.localizedDescription)") }
+        if usePreferences, let configurationDefaults {
+            pauseReasons.setRecordingAccepted(configurationDefaults.bool(forKey: "recordingAccepted"))
+            pauseReasons.setUserPaused(RecordingPausePersistence(defaults: configurationDefaults).restore().isPaused)
+            paused = pauseReasons.isPaused
+        }
+        let asynchronousInitialLoad = !ephemeral && loadHistoryAsynchronously
         if !ephemeral {
             do {
                 try FileManager.default.createDirectory(at: self.root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-                let file = self.root.appendingPathComponent("history.json")
-                if DataDirectory.usesSync(self.root) || FileManager.default.fileExists(atPath: file.path) {
-                    syncBaseline = try DataDirectory.load(self.root)
-                    if DataDirectory.usesSync(self.root), let cached = try DataDirectory.cached(self.root) { syncBaseline = DataDirectory.merge(syncBaseline, cached) }
-                    archive = syncBaseline.archive
-                    // A successful migration must survive a crash before preference updates.
-                    storageLimitMB = max(storageLimitMB, (archive.clips.reduce(0) { $0 + $1.byteCount } + 1048575) / 1048576)
-                    if limit != 0 { limit = max(limit, archive.clips.filter { $0.boards.isEmpty }.count) }
-                    prune() }
+                _ = try AppEnvironment.current.validateDataRoot(self.root)
+                if asynchronousInitialLoad {
+                    initialLoading = true
+                    changingDataDirectory = true
+                    directoryStatus = "正在读取历史…"
+                    directoryProgress = ImportProgress(phase: "正在读取历史", completed: 0, total: 0)
+                    pauseReasons.beginTemporaryPause()
+                    paused = pauseReasons.isPaused
+                } else {
+                    let file = self.root.appendingPathComponent("history.json")
+                    if DataDirectory.usesSync(self.root) || FileManager.default.fileExists(atPath: file.path) {
+                        syncBaseline = try Self.loadInitialHistory(from: self.root)
+                        archive = syncBaseline.archive
+                        // A successful migration must survive a crash before preference updates.
+                        storageLimitMB = max(storageLimitMB, (archive.clips.reduce(0) { $0 + $1.byteCount } + 1048575) / 1048576)
+                        if limit != 0 { limit = max(limit, archive.clips.filter { $0.boards.isEmpty }.count) }
+                        prune()
+                    }
+                }
             } catch {
-                message = "历史加载失败：\(error.localizedDescription)。请勿继续录制，先检查数据。"; paused = true
+                setRecordingLoadFailure(error.localizedDescription)
                 if DataDirectory.isCloud(self.root) {
                     directoryStatus = "等待同步：\(error.localizedDescription)"; initialDirectoryLoadFailed = true
                     if let cached = try? DataDirectory.cached(self.root) { syncBaseline = cached; archive = cached.archive }
                 }
             }
         }
+        rebuildSources()
         refreshResults()
+        if asynchronousInitialLoad, initialLoading {
+            beginInitialHistoryLoad(using: initialHistoryLoader ?? Self.loadInitialHistory)
+        }
+    }
+    private static func loadInitialHistory(from root: URL) throws -> SyncSnapshot {
+        var snapshot = try DataDirectory.load(root)
+        if DataDirectory.usesSync(root), let cached = try DataDirectory.cached(root) { snapshot = DataDirectory.merge(snapshot, cached) }
+        return snapshot
+    }
+    private func beginInitialHistoryLoad(using loader: @escaping (URL) throws -> SyncSnapshot) {
+        let folder = root
+        let generation = directoryMutation
+        persistenceQueue.async { [weak self] in
+            let finishLoad = AcceptanceMetrics.begin("history.initial-load.background")
+            let result = Result { try loader(folder) }
+            let cached: SyncSnapshot?
+            if case .failure = result, DataDirectory.isCloud(folder) { cached = try? DataDirectory.cached(folder) }
+            else { cached = nil }
+            finishLoad()
+            DispatchQueue.main.async {
+                guard let self, self.initialLoading, self.root.standardizedFileURL == folder.standardizedFileURL,
+                      self.directoryMutation == generation else { return }
+                let finishInstall = AcceptanceMetrics.begin("history.initial-install")
+                defer { finishInstall() }
+                var loaded = false
+                switch result {
+                case .success(let snapshot):
+                    self.syncBaseline = snapshot
+                    self.installLoadedArchive(snapshot.archive)
+                    self.initialDirectoryLoadFailed = false
+                    self.directoryStatus = DataDirectory.usesSync(folder) ? "已读取 iCloud 历史；上传与下载由系统完成。" : ""
+                    loaded = true
+                case .failure(let error):
+                    if let cached {
+                        self.syncBaseline = cached
+                        self.installLoadedArchive(cached.archive)
+                    }
+                    self.setRecordingLoadFailure(error.localizedDescription)
+                    self.directoryStatus = ""
+                    if DataDirectory.isCloud(folder) {
+                        self.directoryStatus = "等待同步：\(error.localizedDescription)"
+                        self.initialDirectoryLoadFailed = true
+                    }
+                }
+                self.initialLoading = false
+                self.changingDataDirectory = false
+                self.directoryProgress = ImportProgress(phase: "", completed: 0, total: 0)
+                self.pauseReasons.endTemporaryPause()
+                let freezeOnResume = self.freezeInitialResume || self.persistedPauseExpiryPending
+                self.freezeInitialResume = false
+                self.refreshPauseState(freezeOnResume: freezeOnResume)
+                if loaded { self.resumeDeferredInitialStart() }
+                else if self.initialDirectoryLoadFailed, self.deferredInitialStart != nil { self.ensureSyncTimer() }
+            }
+        }
+    }
+    func resumeDeferredInitialStart() {
+        guard !initialLoading, !changingDataDirectory, !hasHistoryLoadFailure,
+              let deferred = deferredInitialStart else { return }
+        deferredInitialStart = nil
+        start(initialSource: deferred.source, initialChangeCount: deferred.changeCount)
+    }
+    func deviceIDForPersistence() -> String {
+        if let injectedDeviceID { return injectedDeviceID }
+        guard let configurationDefaults else { return UUID().uuidString }
+        return DataDirectory.deviceID(defaults: configurationDefaults)
+    }
+    func persistSelectedDataRoot() {
+        if usePreferences { configurationDefaults?.set(root.path, forKey: "dataDirectory") }
     }
     var filtered: [Clip] { visibleClips }
+    func visibleIndex(of id: UUID) -> Int? { visibleIndexByID[id] }
     var sources: [String] { sourceNames }
+    private func filterValueChanged() {
+        if batchingFilterChanges { filterRefreshPending = true }
+        else { refreshResults() }
+    }
+    private func rebuildSources() {
+        sourcePasses += 1
+        sourceNames = Array(Set(archive.clips.map(\.source))).sorted()
+    }
+    /// Clears query, kind, source and today filters in one refresh. Board and the
+    /// enabled date range are also cleared unless their preserve flags are set;
+    /// stored start/end dates remain available for the next time the range is enabled.
+    func resetFilters(preserveBoard: Bool = false, preserveDateRange: Bool = false) {
+        batchingFilterChanges = true
+        if !query.isEmpty { query = "" }
+        if !preserveBoard, board != nil { board = nil }
+        if kind != "全部" { kind = "全部" }
+        if sourceFilter != "全部来源" { sourceFilter = "全部来源" }
+        if todayOnly { todayOnly = false }
+        if !preserveDateRange, dateRangeEnabled { dateRangeEnabled = false }
+        batchingFilterChanges = false
+        if filterRefreshPending { filterRefreshPending = false; refreshResults() }
+    }
     private func refreshResults() {
         filterPasses += 1
         visibleClips = archive.clips.filter { c in
@@ -199,24 +348,43 @@ final class Store: ObservableObject {
             (query.isEmpty || [c.title, c.text, c.source, c.ocrText ?? "", c.linkTitle ?? ""].joined(separator: " ").localizedCaseInsensitiveContains(query))
         }
         if reverseHistory { visibleClips.reverse() }
-        selection.formIntersection(Set(visibleClips.map(\.id)))
-        sourceNames = Array(Set(archive.clips.map(\.source))).sorted()
-        if !visibleClips.contains(where: { $0.id == selected }) { selected = visibleClips.first?.id }
+        visibleIndexByID.removeAll(keepingCapacity: true)
+        for (index, clip) in visibleClips.enumerated() where visibleIndexByID[clip.id] == nil { visibleIndexByID[clip.id] = index }
+        selection.formIntersection(Set(visibleIndexByID.keys))
+        if selected.flatMap({ visibleIndexByID[$0] }) == nil { selected = visibleClips.first?.id }
     }
     func moveSelection(_ delta: Int) {
         guard !visibleClips.isEmpty else { return }
-        let index = visibleClips.firstIndex(where: { $0.id == selected }) ?? 0
+        let index = selected.flatMap { visibleIndexByID[$0] } ?? 0
         selection.removeAll()
         selected = visibleClips[max(0, min(visibleClips.count - 1, index + delta))].id; selectionAnchor = selected
     }
     func prune() {
+        guard canModifyHistory else { return }
+        pruneLoadedArchive()
+    }
+    private func prunedArchive(_ source: Archive) -> Archive {
+        var result = source
+        let cutoff = retentionDays > 0 ? Date().addingTimeInterval(-Double(retentionDays * 86400)) : nil
         var count = 0
-        if retentionDays > 0 { let cutoff = Date().addingTimeInterval(-Double(retentionDays * 86400)); archive.clips.removeAll { $0.boards.isEmpty && $0.created < cutoff } }
-        var bytes = archive.clips.filter { !$0.boards.isEmpty }.reduce(0) { $0 + $1.byteCount }
-        archive.clips = archive.clips.filter { c in if !c.boards.isEmpty { return true }; count += 1; bytes += c.byteCount; return (limit == 0 || count <= limit) && bytes <= maxArchiveBytes }
+        var bytes = result.clips.filter { !$0.boards.isEmpty }.reduce(0) { $0 + $1.byteCount }
+        result.clips = result.clips.filter { clip in
+            if !clip.boards.isEmpty { return true }
+            if let cutoff, clip.created < cutoff { return false }
+            count += 1
+            bytes += clip.byteCount
+            return (limit == 0 || count <= limit) && bytes <= maxArchiveBytes
+        }
+        return result
+    }
+    private func pruneLoadedArchive() {
+        // Assigning archive publishes and re-filters all history; do it only if something was removed.
+        let pruned = prunedArchive(archive)
+        if pruned.clips.count != archive.clips.count { archive = pruned }
+        discardMissingQueueItems()
     }
     func save() {
-        guard !ephemeral, !changingDataDirectory else { return }
+        guard !ephemeral, !initialLoading, !changingDataDirectory, !importingPaste, pauseReasons.loadFailure == nil else { return }
         directoryMutation += 1
         let snapshot = archive
         let undoClips = undoItems.flatMap(\.clips)
@@ -224,23 +392,20 @@ final class Store: ObservableObject {
         let cloud = DataDirectory.usesSync(folder)
         if cloud { syncBaseline = DataDirectory.changes(snapshot, from: syncBaseline) }
         let baseline = syncBaseline
-        let device = DataDirectory.deviceID
+        let device = cloud ? deviceIDForPersistence() : ""
         let mutation = directoryMutation
         let generation = saveGeneration.next()
         let gate = saveGeneration
         let url = root.appendingPathComponent("history.json")
         persistenceQueue.async { [weak self] in
             guard gate.isCurrent(generation) else { return }
+            var savedBaseline: SyncSnapshot?
             do {
                 if cloud {
                     try DataDirectory.cache(baseline, root: folder)
                     let merged = DataDirectory.merge(try DataDirectory.load(folder), DataDirectory.changes(snapshot, from: baseline))
                     try DataDirectory.write(merged, root: folder, device: device)
-                    DispatchQueue.main.async {
-                        guard let self, self.root == folder, self.directoryMutation == mutation, !self.changingDataDirectory else { return }
-                        self.syncBaseline = merged; self.archive = merged.archive
-                        self.directoryStatus = "已保存到 iCloud 目录；上传与下载由系统完成。"
-                    }
+                    savedBaseline = merged
                 } else {
                     try DataDirectory.coordinated(url, writing: true) { path in try HistoryStorage.write(snapshot, to: path) }
                 }
@@ -252,11 +417,24 @@ final class Store: ObservableObject {
                         try HistoryStorage.collectUnused(at: path, preserving: undoClips)
                     }
                 }
+                DispatchQueue.main.async {
+                    guard let self, gate.isCurrent(generation), self.root == folder, self.directoryMutation == mutation, !self.changingDataDirectory else { return }
+                    if let savedBaseline {
+                        self.syncBaseline = savedBaseline; self.archive = savedBaseline.archive
+                        self.directoryStatus = "已保存到 iCloud 目录；上传与下载由系统完成。"
+                    }
+                    self.storageRetryInFlight = false
+                    let recovered = self.pauseReasons.saveFailure != nil
+                    self.setRecordingSaveFailure(nil)
+                    if recovered { self.message = self.storageDescription }
+                }
             } catch {
                 let detail = error.localizedDescription
                 DispatchQueue.main.async {
-                    if cloud { self?.directoryStatus = "等待同步：\(detail)" }
-                    else { self?.message = "保存失败：\(detail)"; self?.paused = true }
+                    guard let self, gate.isCurrent(generation), self.root == folder, self.directoryMutation == mutation, !self.changingDataDirectory else { return }
+                    self.storageRetryInFlight = false
+                    if cloud { self.directoryStatus = "等待同步：\(detail)" }
+                    self.setRecordingSaveFailure(detail)
                 }
             }
         }
@@ -267,29 +445,179 @@ final class Store: ObservableObject {
     func flush() {
         captureQueue.sync {}
         for generation in pendingImages.keys.sorted() { finishPendingImage(generation) }
-        persistenceQueue.sync {}
+        // Initial loading only reads history, while every mutation and save path is
+        // gated. A termination flush therefore has no pending write to wait for.
+        if !initialLoading { persistenceQueue.sync {} }
     }
-    func start() {
+    func start(initialSource: ClipboardCaptureSource? = nil, initialChangeCount: Int? = nil) {
         guard !ephemeral else { return }
-        capture(force: true)
-        if syncTimer == nil {
-            syncTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.pollDirectory() }
-            if let syncTimer { RunLoop.main.add(syncTimer, forMode: .common) }
+        if initialLoading {
+            deferredInitialStart = (initialSource, initialChangeCount)
+            return
         }
+        if hasHistoryLoadFailure {
+            deferredInitialStart = (initialSource, initialChangeCount)
+            if initialDirectoryLoadFailed { ensureSyncTimer() }
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        let source = initialChangeCount == pasteboard.changeCount ? initialSource : nil
+        capture(force: true, pasteboard: pasteboard, sourceOverride: source)
+        ensureSyncTimer()
         guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in self?.capture() }
         if let timer = timer { RunLoop.main.add(timer, forMode: .common) }
     }
-    func capture(force: Bool = false, pasteboard pb: NSPasteboard = .general) {
-        guard !selectionCaptureActive, !paused, force || pb.changeCount != change else { return }
-        if deletedCurrentChange == pb.changeCount { return }
+    private func ensureSyncTimer() {
+        guard syncTimer == nil else { return }
+        syncTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.runSyncTimerAction() }
+        if let syncTimer { RunLoop.main.add(syncTimer, forMode: .common) }
+    }
+    func runSyncTimerAction() {
+        if hasHistoryLoadFailure {
+            if initialDirectoryLoadFailed { retryRecordingStorage() }
+            return
+        }
+        pollDirectory()
+    }
+    func setUserPaused(_ value: Bool) {
+        if initialLoading, pauseReasons.userPaused, !value { freezeInitialResume = true }
+        pauseReasons.setUserPaused(value)
+        refreshPauseState()
+    }
+    func setRecordingAccepted(_ value: Bool) {
+        pauseReasons.setRecordingAccepted(value)
+        if usePreferences { configurationDefaults?.set(value, forKey: "recordingAccepted") }
+        // First-time consent intentionally captures the current clipboard.
+        refreshPauseState(freezeOnResume: false)
+    }
+    func setRecordingLoadFailure(_ detail: String?) {
+        pauseReasons.setLoadFailure(detail)
+        if let detail { message = "历史读取失败：\(detail)。修复数据后重试读取。" }
+        refreshPauseState()
+    }
+    func setRecordingSaveFailure(_ detail: String?) {
+        pauseReasons.setSaveFailure(detail)
+        if let detail { message = "历史保存失败：\(detail)。内存中的更改仍保留，请修复后重试保存。" }
+        refreshPauseState()
+    }
+    func retryRecordingStorage() {
+        guard !ephemeral, !storageRetryInFlight, !changingDataDirectory, !importingPaste else { return }
+        if pauseReasons.loadFailure != nil {
+            storageRetryInFlight = true
+            let folder = root, mutation = directoryMutation
+            persistenceQueue.async { [weak self] in
+                let result = Result { () throws -> SyncSnapshot in
+                    var snapshot = try DataDirectory.load(folder)
+                    if DataDirectory.usesSync(folder), let cached = try DataDirectory.cached(folder) { snapshot = DataDirectory.merge(snapshot, cached) }
+                    return snapshot
+                }
+                DispatchQueue.main.async {
+                    guard let self, self.root == folder, self.directoryMutation == mutation, !self.changingDataDirectory else { return }
+                    self.storageRetryInFlight = false
+                    switch result {
+                    case .success(let snapshot):
+                        self.syncBaseline = snapshot
+                        self.installLoadedArchive(snapshot.archive)
+                        self.initialDirectoryLoadFailed = false
+                        self.setRecordingLoadFailure(nil)
+                        self.message = self.storageDescription
+                        self.directoryStatus = DataDirectory.usesSync(folder) ? "已读取 iCloud 历史；上传与下载由系统完成。" : ""
+                        self.resumeDeferredInitialStart()
+                    case .failure(let error): self.setRecordingLoadFailure(error.localizedDescription)
+                    }
+                }
+            }
+        } else if pauseReasons.saveFailure != nil {
+            storageRetryInFlight = true
+            save()
+        }
+    }
+    func installLoadedArchive(_ loaded: Archive) {
+        applyingImport = true
+        defer { applyingImport = false }
+        undoItems.removeAll()
+        currentClipID = nil
+        deletedCurrentChange = nil
+        deletedCurrentID = nil
+        storageLimitMB = max(storageLimitMB, (loaded.clips.reduce(0) { $0 + $1.byteCount } + 1048575) / 1048576)
+        if limit != 0 { limit = max(limit, loaded.clips.filter { $0.boards.isEmpty }.count) }
+        archive = prunedArchive(loaded)
+        discardMissingQueueItems()
+    }
+    func persistStorageLimitPreference() {
+        if usePreferences { configurationDefaults?.set(storageLimitMB, forKey: "storageLimitMB") }
+    }
+    func invalidatePendingStorageCallbacks() {
+        directoryMutation += 1
+        storageCallbackGeneration += 1
+        _ = saveGeneration.next()
+        storageRetryInFlight = false
+    }
+    func beginTemporaryPause() {
+        pauseReasons.beginTemporaryPause()
+        refreshPauseState()
+    }
+    func endTemporaryPause() {
+        pauseReasons.endTemporaryPause()
+        refreshPauseState()
+    }
+    func freezeCurrentPasteboardRevision(_ pasteboard: NSPasteboard? = nil) {
+        let pasteboard = pasteboard ?? pauseBoundaryPasteboard()
+        change = pasteboard.changeCount
+        resumeBoundary = (pasteboard.name, change)
+        persistedPauseExpiryPending = false
+        currentClipID = nil
+        deletedCurrentChange = nil
+        deletedCurrentID = nil
+    }
+    func notePersistedPauseExpired() {
+        persistedPauseExpiryPending = true
+        if !paused { freezeCurrentPasteboardRevision() }
+    }
+    private func refreshPauseState(freezeOnResume: Bool = true) {
+        let wasPaused = paused
+        paused = pauseReasons.isPaused
+        if freezeOnResume, !paused, wasPaused || persistedPauseExpiryPending { freezeCurrentPasteboardRevision() }
+    }
+    func capture(force: Bool = false, pasteboard pb: NSPasteboard = .general, sourceOverride: ClipboardCaptureSource? = nil) {
+        guard !selectionCaptureActive else { return }
+        let observedChange = pb.changeCount
+        let changed = observedChange != change
+        guard !paused, force || changed else { return }
+        if let boundary = resumeBoundary, boundary.name == pb.name {
+            if boundary.change == observedChange { return }
+            resumeBoundary = nil
+        }
+        let source = captureSource(for: pb, changeCount: observedChange, changed: changed, override: sourceOverride)
+        if deletedCurrentChange == observedChange { return }
         if deletedCurrentChange != nil { deletedCurrentChange = nil; deletedCurrentID = nil }
-        if force, pb.changeCount == change, pendingImages[captureGeneration] != nil { return }
-        if force, pb.changeCount == change, let id = currentClipID, archive.clips.contains(where: { $0.id == id }) { return }
-        let changed = pb.changeCount != change
-        change = pb.changeCount
+        if force, observedChange == change, pendingImages[captureGeneration] != nil { return }
+        if force, observedChange == change, let id = currentClipID, archive.clips.contains(where: { $0.id == id }) { return }
+        change = observedChange
+        captureContents(pb, source: source.name, sourceID: source.bundleID, backgroundImages: true, preserveExisting: force)
+    }
+    private func captureSource(for pasteboard: NSPasteboard, changeCount: Int, changed: Bool, override: ClipboardCaptureSource?) -> ClipboardCaptureSource {
+        if let source = observedCaptureSources[pasteboard.name]?[changeCount] { return source }
         let app = NSWorkspace.shared.frontmostApplication
-        captureContents(pb, source: changed ? app?.localizedName ?? "未知应用" : "当前剪贴板", sourceID: app?.bundleIdentifier ?? "", backgroundImages: true, preserveExisting: force)
+        let source = override ?? ClipboardCaptureSource(name: changed ? app?.localizedName ?? "未知应用" : "当前剪贴板", bundleID: app?.bundleIdentifier ?? "")
+        rememberCaptureSource(source, for: pasteboard, changeCount: changeCount)
+        return source
+    }
+    private func rememberCaptureSource(_ source: ClipboardCaptureSource, for pasteboard: NSPasteboard, changeCount: Int) {
+        var sources = observedCaptureSources[pasteboard.name] ?? [:]
+        sources[changeCount] = source
+        if sources.count > 64 {
+            for key in sources.keys.sorted().prefix(sources.count - 64) { sources.removeValue(forKey: key) }
+        }
+        observedCaptureSources[pasteboard.name] = sources
+    }
+    func recordRestoredClipboardChange(from originalChangeCount: Int, pasteboard: NSPasteboard = .general) {
+        let restoredChangeCount = pasteboard.changeCount
+        if let source = observedCaptureSources[pasteboard.name]?[originalChangeCount] {
+            rememberCaptureSource(source, for: pasteboard, changeCount: restoredChangeCount)
+        }
+        change = restoredChangeCount
     }
     func captureContents(_ pb: NSPasteboard, source: String, sourceID: String, backgroundImages: Bool = false, preserveExisting: Bool = false) {
         guard !paused else { return }
@@ -362,6 +690,7 @@ final class Store: ObservableObject {
         if generation == captureGeneration { currentClipID = id; captureNotice = id == nil ? "历史容量已满，未保存当前内容" : "" }
     }
     @discardableResult func ingest(_ clip: Clip, preserveExisting: Bool = false) -> UUID? {
+        guard canModifyHistory else { return nil }
         var new = clip
         new.cachedDigest = new.fingerprint
         var items = archive.clips
@@ -374,11 +703,15 @@ final class Store: ObservableObject {
             new.userLabel = old.userLabel
             if let label = old.userLabel, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { new.title = old.title }
         }
-        items.append(new); items.sort { $0.created > $1.created }; archive.clips = items; prune(); save()
+        items.append(new); items.sort { $0.created > $1.created }
+        // One assignment: prune before publishing instead of publishing, then pruning and publishing again.
+        archive = prunedArchive(Archive(clips: items, boards: archive.boards))
+        discardMissingQueueItems(); save()
         if new.kind == "链接", networkPreviews, !ephemeral { enrichLink(new) }
         return new.id
     }
     func delete(_ id: UUID, recordUndo: Bool = true) {
+        guard canModifyHistory else { return }
         if recordUndo, let clip = archive.clips.first(where: { $0.id == id }) { remember([clip], label: "删除") }
         if currentClipID == id {
             deletedCurrentChange = change
@@ -389,21 +722,23 @@ final class Store: ObservableObject {
         let index = before.firstIndex(where: { $0.id == id })
         let wasSelected = selected == id
         archive.clips.removeAll { $0.id == id }
+        pasteQueue.removeAll { $0 == id }
         if wasSelected, let index = index { let remaining = filtered; selected = remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)].id }
         save()
     }
     func pin(_ clip: Clip, to board: UUID) {
-        guard let i = archive.clips.firstIndex(where: { $0.id == clip.id }) else { return }
+        guard canModifyHistory, let i = archive.clips.firstIndex(where: { $0.id == clip.id }) else { return }
         if archive.clips[i].boards.contains(board) { archive.clips[i].boards.removeAll { $0 == board } } else { archive.clips[i].boards.append(board) }; save()
     }
-    func addBoard(_ name: String) { let name = name.trimmingCharacters(in: .whitespacesAndNewlines); guard !name.isEmpty else { return }; archive.boards.append(Board(name: name)); save() }
-    func setBoardColor(_ id: UUID, color: String) { guard let i = archive.boards.firstIndex(where: { $0.id == id }) else { return }; archive.boards[i].color = color; save() }
-    func removeBoard(_ id: UUID) { archive.boards.removeAll { $0.id == id }; for i in archive.clips.indices { archive.clips[i].boards.removeAll { $0 == id } }; if board == id { board = nil }; prune(); save() }
+    func addBoard(_ name: String) { let name = name.trimmingCharacters(in: .whitespacesAndNewlines); guard canModifyHistory, !name.isEmpty else { return }; archive.boards.append(Board(name: name)); save() }
+    func setBoardColor(_ id: UUID, color: String) { guard canModifyHistory, let i = archive.boards.firstIndex(where: { $0.id == id }) else { return }; archive.boards[i].color = color; save() }
+    func removeBoard(_ id: UUID) { guard canModifyHistory else { return }; archive.boards.removeAll { $0.id == id }; for i in archive.clips.indices { archive.clips[i].boards.removeAll { $0 == id } }; if board == id { board = nil }; prune(); save() }
     func clearHistory() {
+        guard canModifyHistory else { return }
         if let id = currentClipID, archive.clips.contains(where: { $0.id == id && $0.boards.isEmpty }) {
             deletedCurrentChange = change; deletedCurrentID = id; currentClipID = nil
         }
-        archive.clips.removeAll { $0.boards.isEmpty }; save()
+        archive.clips.removeAll { $0.boards.isEmpty }; discardMissingQueueItems(); save()
     }
     func restore(_ clip: Clip, plain: Bool, pasteboard pb: NSPasteboard = .general) -> Bool {
         let objects: [NSPasteboardItem]
@@ -413,12 +748,17 @@ final class Store: ObservableObject {
         } else {
             objects = clip.exportParts().map { parts in let p = NSPasteboardItem(); for part in parts { p.setData(part.data, forType: NSPasteboard.PasteboardType(part.type)) }; return p }
         }
-        pb.clearContents(); let ok = pb.writeObjects(objects); change = pb.changeCount
+        let originalChangeCount = pb.changeCount
+        let outcome = ClipboardWrite.attempt(objects, to: pb)
+        let ok = outcome.succeeded
+        if outcome == .restoredPrevious { recordRestoredClipboardChange(from: originalChangeCount, pasteboard: pb) }
+        else if outcome != .superseded { change = pb.changeCount }
         currentClipID = ok && archive.clips.contains(where: { $0.id == clip.id }) ? clip.id : nil
         if ok { recordUse([clip]) }
         return ok
     }
     func recordUse(_ clips: [Clip]) {
+        guard canModifyHistory else { return }
         var seen = Set<UUID>()
         let ids = clips.map(\.id).filter { seen.insert($0).inserted }
         var items = archive.clips
@@ -436,6 +776,7 @@ final class Store: ObservableObject {
         save()
     }
     func demo() {
+        guard canModifyHistory else { return }
         let board = Board(name: "常用内容"); archive.boards = [board, Board(name: "项目灵感")]
         let samples = [("文字", "产品设计笔记", "好的工具应该让操作变得自然。\n\n历史记录、即时搜索、收藏板。\n全部保存在本机，随时取用。", "备忘录"), ("链接", "Apple Developer", "https://developer.apple.com/documentation/appkit", "Safari"), ("文字", "一段常用代码", "struct Idea {\n    let title: String\n    let created: Date\n}\n\n// Keep it local.", "Xcode"), ("文字", "每周工作总结", "本周完成\n• 交互方案\n• 核心功能开发\n\n下周计划\n• 验证实际使用体验", "Pages")]
         archive.clips = samples.enumerated().map { i, s in Clip(created: Date().addingTimeInterval(Double(-i * 420)), source: s.3, sourceID: "", kind: s.0, title: s.1, text: s.2, parts: [[ClipPart(type: NSPasteboard.PasteboardType.string.rawValue, data: Data(s.2.utf8))]], boards: i == 0 ? [board.id] : []) }

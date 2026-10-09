@@ -1,6 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
 cd "${0:A:h}/.."
+[[ "${OPENPASTE_TESTING:-0}" != "1" ]] || { print -u2 "Refusing to package an OPENPASTE_TESTING build."; exit 1; }
 python3 scripts/version.py >/dev/null
 mkdir -p build/OpenPaste.app/Contents/MacOS build/OpenPaste.app/Contents/Resources
 iconset_dir="$(mktemp -d)/OpenPaste.iconset"
@@ -16,8 +17,8 @@ build_archs=("${OPENPASTE_ARCH:-$(uname -m)}")
 if [[ "${build_archs[1]}" == "universal" ]]; then build_archs=(arm64 x86_64); fi
 for build_arch in "${build_archs[@]}"; do
     [[ "$build_arch" == "arm64" || "$build_arch" == "x86_64" ]] || { print -u2 "Unsupported architecture: $build_arch"; exit 1; }
-    swift build -c release --triple "${build_arch}-apple-macosx14.0" --scratch-path "build/swiftpm-${build_arch}" --product OpenPaste
-    bin_dir="$(swift build -c release --triple "${build_arch}-apple-macosx14.0" --scratch-path "build/swiftpm-${build_arch}" --show-bin-path)"
+    swift build --manifest-cache none -c release --triple "${build_arch}-apple-macosx14.0" --scratch-path "build/swiftpm-${build_arch}" --product OpenPaste
+    bin_dir="$(swift build --manifest-cache none -c release --triple "${build_arch}-apple-macosx14.0" --scratch-path "build/swiftpm-${build_arch}" --show-bin-path)"
     cp "$bin_dir/OpenPaste" "build/OpenPaste-${build_arch}"
 done
 if (( ${#build_archs} == 2 )); then
@@ -25,6 +26,7 @@ if (( ${#build_archs} == 2 )); then
 else
     cp "build/OpenPaste-${build_archs[1]}" build/OpenPaste.app/Contents/MacOS/OpenPaste
 fi
+python3 scripts/verify-production-binary.py build/OpenPaste.app/Contents/MacOS/OpenPaste
 dsymutil build/OpenPaste.app/Contents/MacOS/OpenPaste -o build/OpenPaste.app.dSYM
 strip -x build/OpenPaste.app/Contents/MacOS/OpenPaste
 

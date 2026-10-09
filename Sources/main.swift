@@ -46,8 +46,8 @@ final class ShelfPanel: NSWindow { override var canBecomeKey: Bool { true }; ove
 final class ShelfHost: NSHostingView<ShelfView> { override var acceptsFirstResponder: Bool { true } }
 final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     static var shared: Controller!
-    let preview = CommandLine.arguments.contains("--translation-workflow-test") || CommandLine.arguments.contains("--translation-ui-test") || CommandLine.arguments.contains("--feature-ui-test") || CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--layout-test") || CommandLine.arguments.contains("--shortcut-test") || CommandLine.arguments.contains("--ui-test")
-    lazy var store = Store(ephemeral: preview)
+    let preview = TestMode.translationWorkflow || TestMode.translationUI || TestMode.featureUI || TestMode.preview || TestMode.layout || TestMode.shortcut || TestMode.ui || TestMode.keyboard
+    lazy var store = Store(ephemeral: preview, loadHistoryAsynchronously: !preview && !TestMode.active)
     var panel: ShelfPanel!
     var status: NSStatusItem!
     var updateMenuItem: NSMenuItem?
@@ -57,9 +57,21 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var handler: EventHandlerRef?
     var keyMonitor: Any?
     var outsideClickMonitor: Any?
+    var menuObservers: [NSObjectProtocol] = []
+    var trackingMenus = Set<ObjectIdentifier>()
+    var menuTransition = 0
+    var menuFinishing = false
+    var pendingOutsideClick = false
+    var pendingApplicationSwitch = false
+    var shelfPresentation = 0
     var previewWindow: NSWindow?
+    var previewClipID: UUID?
+    var previewClip: Clip? { store.archive.clips.first { $0.id == previewClipID } }
     var editorWindow: NSWindow?
+    var pendingShelfPresentation: (() -> Void)?
     var pauseTimer: Timer?
+    var pauseTimerSchedule = RecordingPauseTimerSchedule()
+    lazy var recordingPausePersistence = RecordingPausePersistence(defaults: AppEnvironment.current.defaults)
     var settingsWindow: NSWindow?
     var settingsRequest = 0
     var activationObserver: NSObjectProtocol?
@@ -67,11 +79,22 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var toast: NSPanel?
     var toastGeneration = 0
     var pasteGeneration = 0
+    var translationConfig = TranslationConfig.shared
     var translationGeneration = 0
     var translationTask: URLSessionDataTask?
     var savedClipboard: [[ClipPart]]?
     var terminationSignals: [DispatchSourceSignal] = []
     var permissionTimer: Timer?
+    lazy var permissionMonitor = PermissionMonitor(
+        query: { PermissionState(accessibility: AXIsProcessTrusted(), eventPosting: CGPreflightPostEventAccess()) },
+        publish: { [weak self] state in
+            guard let self else { return }
+            let allowed = directPasteAllowed(accessibility: state.accessibility, eventPosting: state.eventPosting)
+            let status = allowed ? "已授权" : (state.accessibility ? "辅助功能已开，按键权限未生效" : "系统尚未识别授权")
+            if store.directPasteAuthorized != allowed { store.directPasteAuthorized = allowed }
+            if store.translationSelectionAuthorized != state.accessibility { store.translationSelectionAuthorized = state.accessibility }
+            if store.permissionStatus != status { store.permissionStatus = status }
+        })
     var modalShowing = false
     func prepareAlert(_ alert: NSAlert) {
         alert.window.level = NSWindow.Level(rawValue: max(panel.level.rawValue, settingsWindow?.level.rawValue ?? 0) + 1)
@@ -80,13 +103,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         alert.window.setFrameOrigin(NSPoint(x: frame.midX - alert.window.frame.width / 2, y: frame.midY - alert.window.frame.height / 2))
     }
     func presentAlert(_ alert: NSAlert, completion: @escaping (NSApplication.ModalResponse) -> Void) {
-        guard !modalShowing else { return }
+        guard !interactionState.hasModalInteraction else { return }
         let parent = previewWindow?.isKeyWindow == true ? previewWindow! : (store.settings && settingsWindow?.isVisible == true ? settingsWindow! : panel!)
         prepareAlert(alert)
         modalShowing = true
         alert.beginSheetModal(for: parent) { [weak self] response in
             self?.modalShowing = false
             completion(response)
+            DispatchQueue.main.async { self?.restoreWorkingWindowFocus() }
         }
         // AppKit may change sheet level during attachment; enforce it afterwards.
         alert.window.level = NSWindow.Level(rawValue: parent.level.rawValue + 1)
@@ -99,25 +123,32 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return alert.runModal()
     }
     func refreshPermission() {
-        let ax = AXIsProcessTrusted()
-        let allowed = directPasteAllowed
-        let status = allowed ? "已授权" : (ax ? "辅助功能已开，按键权限未生效" : "系统尚未识别授权")
-        if store.directPasteAuthorized != allowed { store.directPasteAuthorized = allowed }
-        if store.permissionStatus != status { store.permissionStatus = status }
+        permissionMonitor.refresh()
     }
     func applicationDidBecomeActive(_ notification: Notification) {
         refreshPermission()
-        if store.settings, let window = settingsWindow, window.isVisible { window.makeKeyAndOrderFront(nil) }
+        restoreWorkingWindowFocus()
     }
     var directPasteAllowed: Bool {
-        if CommandLine.arguments.contains("--ui-test"), CommandLine.arguments.contains("--force-manual") { return false }
-        return AXIsProcessTrusted() && CGPreflightPostEventAccess()
+        directPasteAllowed(accessibility: AXIsProcessTrusted(), eventPosting: CGPreflightPostEventAccess())
+    }
+    func directPasteAllowed(accessibility: Bool, eventPosting: Bool) -> Bool {
+        if TestMode.ui, TestMode.forceManual { return false }
+        return accessibility && eventPosting
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AcceptanceMetrics.start()
+        AppDiagnostics.record("app.launch")
         Controller.shared = self
-        if !preview && !CommandLine.arguments.contains(where: { $0.hasSuffix("-test") }) { UsageAnalytics.shared.start() }
+        let finishStoreInit = AcceptanceMetrics.begin("launch.store-init")
+        _ = store
+        finishStoreInit()
+        restoreRecordingPause()
+        if !preview && !TestMode.active && AppEnvironment.current.defaults.bool(forKey: "recordingAccepted") { UsageAnalytics.shared.start() }
         if let iconURL = Bundle.main.url(forResource: "OpenPaste-v2", withExtension: "icns"), let icon = NSImage(contentsOf: iconURL) { NSApp.applicationIconImage = icon }
+        let finishStoreSetup = AcceptanceMetrics.begin("launch.link-cache")
         LinkPreviewCache.shared.enabled = store.networkPreviews
+        finishStoreSetup()
         refreshPermission()
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             guard let self = self, self.panel?.isVisible == true || self.settingsWindow?.isVisible == true else { return }
@@ -141,9 +172,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
             editMenu.addItem(withTitle: title, action: Selector(action), keyEquivalent: key)
         }
         NSApp.mainMenu = main
-        if CommandLine.arguments.contains("--translation-workflow-test") { savedClipboard = (NSPasteboard.general.pasteboardItems ?? []).map { item in item.types.compactMap { type in item.data(forType: type).map { ClipPart(type: type.rawValue, data: $0) } } } }
+        #if OPENPASTE_TESTING
+        if TestMode.translationWorkflow || TestMode.keyboard { savedClipboard = (NSPasteboard.general.pasteboardItems ?? []).map { item in item.types.compactMap { type in item.data(forType: type).map { ClipPart(type: type.rawValue, data: $0) } } } }
         if preview { store.demo(); store.message = "演示模式 · 使用示例内容 · 不记录真实剪贴板" }
-        if CommandLine.arguments.contains("--ui-test") {
+        if TestMode.ui {
             store.archive.clips[3] = fixtureImage()
             savedClipboard = (NSPasteboard.general.pasteboardItems ?? []).map { item in item.types.compactMap { type in item.data(forType: type).map { ClipPart(type: type.rawValue, data: $0) } } }
             let text = "OpenPaste 输入验证：左右选择后按回车，再按 Command-V。"
@@ -152,25 +184,31 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
             store.archive.clips[1].kind = "文字"
             store.archive.clips[1].parts = [[ClipPart(type: NSPasteboard.PasteboardType.string.rawValue, data: Data(text.utf8))]]
         }
-        if CommandLine.arguments.contains("--feature-ui-test") {
+        if TestMode.featureUI {
             let values = ["https://maps.apple.com/?q=Blue%20Bottle%20Coffee&ll=37.7955,-122.3937", "https://www.apple.com/mac/", "#1A2B3C", "Text(store.shortcutNotice.isEmpty ? \"使用组合键\" : store.shortcutNotice).font(.caption).foregroundStyle(.secondary)"]
             store.archive.clips = values.enumerated().map { index, text in Clip(created: Date().addingTimeInterval(-Double(index * 60)), source: "测试内容", sourceID: "com.apple.Maps", kind: text.hasPrefix("http") ? "链接" : (CapturedColor.parse(text) != nil ? "颜色" : "文字"), title: text, text: text, parts: [[ClipPart(type: "public.utf8-plain-text", data: Data(text.utf8))]]) }
             store.archive.clips.append(fixtureOCRImage())
         }
-        panel = ShelfPanel(contentRect: NSRect(x: 0, y: 0, width: 1100, height: max(180, UserDefaults.standard.double(forKey: "shelfHeight") == 0 ? 300 : UserDefaults.standard.double(forKey: "shelfHeight"))), styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
+        #endif
+        let finishPanelHost = AcceptanceMetrics.begin("launch.panel-host")
+        panel = ShelfPanel(contentRect: NSRect(x: 0, y: 0, width: 1100, height: max(180, AppEnvironment.current.defaults.double(forKey: "shelfHeight") == 0 ? 300 : AppEnvironment.current.defaults.double(forKey: "shelfHeight"))), styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
         panel.delegate = self
         panel.level = .statusBar; panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
         panel.minSize = NSSize(width: 760, height: 180)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.contentView = ShelfHost(rootView: ShelfView(store: store))
+        finishPanelHost()
+        observeMenuTracking()
+        let finishApplicationSetup = AcceptanceMetrics.begin("launch.application-setup")
         lastExternalApp = NSWorkspace.shared.frontmostApplication
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
             guard let self = self, let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
             self.lastExternalApp = app
-            self.dismissShelfForExternalInteraction()
+            self.dismissShelfForExternalInteraction(reason: .activation)
         }
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
-            self?.dismissShelfForExternalInteraction()
+            guard let self, !self.panel.frame.contains(NSEvent.mouseLocation) || !self.panel.isVisible else { return }
+            self.dismissShelfForExternalInteraction(reason: .outsideClick)
         }
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = menuBarMark()
@@ -187,28 +225,33 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(withTitle: "退出 OpenPaste", action: #selector(quit), keyEquivalent: "q")
         for item in menu.items { item.target = self }; status.menu = menu
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in if Controller.shared?.modalShowing != true, Controller.shared?.store.recordingShortcut != true { Controller.shared?.toggle() }; return noErr }, 1, &spec, nil, &handler)
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in Controller.shared?.toggle(); return noErr }, 1, &spec, nil, &handler)
         _ = installShortcut(shortcut, persist: false)
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self = self else { return event }
             if event.type == .flagsChanged {
-                let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
-                self.store.reverseHistory = !self.modalShowing && self.panel.isKeyWindow && !self.store.settings && !(self.panel.firstResponder is NSTextView) && modifiers == [.command, .shift]
+                let flags = event.modifierFlags
+                self.store.reverseHistory = InteractionPolicy.reverseHistoryEnabled(
+                    for: ModifierState(command: flags.contains(.command), shift: flags.contains(.shift), option: flags.contains(.option), control: flags.contains(.control)),
+                    interaction: self.interactionState, shelfIsKey: self.panel.isKeyWindow,
+                    textInputFocused: self.panel.firstResponder is NSTextView, settingsVisible: self.store.settings)
                 return event
             }
+            guard !self.interactionState.menuTracking, !self.interactionState.hasModalInteraction else { return event }
+            self.restoreShelfKeyboardFocus()
             if self.store.recordingShortcut, self.settingsWindow?.isKeyWindow == true {
                 if event.keyCode == 53 { self.cancelShortcutRecording() }
                 else {
                     let candidate = GlobalShortcut.from(event)
                     if candidate.valid { self.store.recordingShortcut = false; if !self.installShortcut(candidate, persist: true) { _ = self.installShortcut(self.shortcut, persist: false, preserveNotice: true) } }
-                    else { self.store.shortcutNotice = "请使用 ⌃、⌥ 或 ⇧⌘ 加一个按键；Esc 取消" }
+                    else { self.store.shortcutNotice = "请使用 ⌘、⌃ 或 ⌥ 加一个按键；Esc 取消" }
                 }
                 return nil
             }
             if self.store.settings, self.settingsWindow?.attachedSheet == nil, self.settingsWindow?.isKeyWindow == true, event.keyCode == 53 || (event.keyCode == 13 && event.modifierFlags.contains(.command)) { self.closeSettings(); return nil }
             if self.previewWindow?.isKeyWindow == true, !(self.previewWindow?.firstResponder is NSTextView) {
                 if event.keyCode == 49 || event.keyCode == 53 { self.previewWindow?.close(); return nil }
-                if event.modifierFlags.contains(.command), let clip = self.store.selectedClips.first {
+                if event.modifierFlags.contains(.command), let clip = self.previewClip {
                     switch event.charactersIgnoringModifiers?.lowercased() { case "e": self.edit(clip); return nil; case "r": self.rename(clip); return nil; case "o": self.openItem(clip); return nil; default: break }
                 }
             }
@@ -216,7 +259,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if let editor = self.panel.firstResponder as? NSTextView, editor.hasMarkedText() { return event }
             if event.keyCode == 53 {
                 if self.store.searchExpanded {
-                    self.store.query = ""; self.store.kind = "全部"; self.store.sourceFilter = "全部来源"; self.store.todayOnly = false; self.store.dateRangeEnabled = false; self.store.filtersExpanded = false
+                    self.store.resetFilters(preserveBoard: true); self.store.filtersExpanded = false
                     self.store.searchFocused = false; self.store.searchExpanded = false
                     self.panel.makeFirstResponder(self.panel.contentView)
                 } else { self.hideShelf() }
@@ -231,13 +274,17 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !(self.panel.firstResponder is NSTextView) {
                 let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
                 if event.modifierFlags.contains(.command) {
-                    if event.keyCode == 36 { self.pasteNext(); return nil }
+                    if event.keyCode == 36 || event.keyCode == 76 { self.pasteNext(); return nil }
                     if key == "e", let clip = self.store.selectedClips.first { self.edit(clip); return nil }
                     if key == "r", let clip = self.store.selectedClips.first { self.rename(clip); return nil }
                     if key == "o", let clip = self.store.selectedClips.first { self.openItem(clip); return nil }
                     if key == "n" { if event.modifierFlags.contains(.shift) { self.newBoard() } else { self.createText() }; return nil }
                     if key == "z" { self.store.undoItemChange(); return nil }
-                    if key == "t" { if self.store.paused { self.togglePause() } else { self.pauseMenu() }; return nil }
+                    if key == "t" {
+                        if self.store.recordingPauseControl.action == .pause { self.pauseMenu() }
+                        else { self.togglePause() }
+                        return nil
+                    }
                 }
                 if event.keyCode == 49, let clip = self.store.selectedClips.first { self.showPreview(clip); return nil }
                 if event.keyCode == 48 { self.store.searchFocused = true; return nil }
@@ -246,27 +293,40 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } else if event.keyCode == 48 || event.keyCode == 125 { self.store.searchFocused = false; self.panel.makeFirstResponder(self.panel.contentView); return nil }
             if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" { if self.store.searchExpanded { self.store.filtersExpanded.toggle() }; self.store.searchFocused = true; return nil }
             if event.modifierFlags.contains(.command), let n = Int(event.charactersIgnoringModifiers ?? ""), n >= 1, n <= 9, self.store.filtered.count >= n { self.paste(self.store.filtered[n - 1], plain: event.modifierFlags.contains(.shift)); return nil }
-            if event.keyCode == 36, let clip = self.store.filtered.first(where: { $0.id == self.store.selected }) ?? self.store.filtered.first { self.pasteSelection(fallback: clip, plain: event.modifierFlags.contains(.shift)); return nil }
+            if event.keyCode == 36 || event.keyCode == 76, let clip = self.store.filtered.first(where: { $0.id == self.store.selected }) ?? self.store.filtered.first { self.pasteSelection(fallback: clip, plain: event.modifierFlags.contains(.shift)); return nil }
             if [123, 124].contains(event.keyCode), self.panel.firstResponder is NSTextView { return event }
             if [123, 124, 125].contains(event.keyCode), !event.modifierFlags.contains(.command) {
                 self.store.searchFocused = false
                 self.panel.makeFirstResponder(self.panel.contentView)
                 if event.keyCode != 125 {
                     let delta = event.keyCode == 124 ? 1 : -1
-                    if event.modifierFlags.contains(.shift), let index = self.store.filtered.firstIndex(where: { $0.id == self.store.selected }), !self.store.filtered.isEmpty { let id = self.store.filtered[max(0, min(self.store.filtered.count - 1, index + delta))].id; self.store.choose(id, modifiers: .shift) }
+                    if event.modifierFlags.contains(.shift), let selected = self.store.selected, let index = self.store.visibleIndex(of: selected), !self.store.filtered.isEmpty { let id = self.store.filtered[max(0, min(self.store.filtered.count - 1, index + delta))].id; self.store.choose(id, modifiers: .shift) }
                     else { self.store.moveSelection(delta) }
                 }
                 return nil
             }
             return event
         }
-        if CommandLine.arguments.contains("--shortcut-test") {
-            let first = GlobalShortcut(keyCode: 111, modifiers: UInt32(cmdKey | controlKey | optionKey | shiftKey), keyName: "F12")
+        finishApplicationSetup()
+        #if OPENPASTE_TESTING
+        if TestMode.keyboard {
+            store.networkPreviews = false
+            // Give the terminal-launched GUI test a Dock entry so macOS allows
+            // it to activate. Production still uses the accessory policy above.
+            NSApp.setActivationPolicy(.regular)
+            showShelf()
+            Task { @MainActor in await runKeyboardTests(controller: self) }
+        } else if TestMode.shortcut {
+            let first = GlobalShortcut(keyCode: 111, modifiers: UInt32(cmdKey), keyName: "F12")
             guard installShortcut(first, persist: true), shortcut == first, store.shortcutLabel == first.label, hotkey != nil else { print("FAIL: custom hotkey registration"); exit(1) }
             var occupied: EventHotKeyRef?
             let second = GlobalShortcut(keyCode: 103, modifiers: first.modifiers, keyName: "F11")
             guard RegisterEventHotKey(second.keyCode, second.modifiers, EventHotKeyID(signature: 0x54455354, id: 2), GetApplicationEventTarget(), 0, &occupied) == noErr else { print("FAIL: prepare conflict test"); exit(1) }
             guard !installShortcut(second, persist: true), shortcut == first, hotkey != nil else { print("FAIL: conflict lost original hotkey"); exit(1) }
+            beginShortcutRecording()
+            guard hotkey == nil, !installShortcut(second, persist: true), store.shortcutLabel.contains("未生效"), status.menu?.items.first?.title.contains("不可用") == true else { print("FAIL: unregistered shortcut conflict was not visible"); exit(1) }
+            guard installShortcut(first, persist: false, preserveNotice: true), hotkey != nil, shortcut == first else { print("FAIL: conflict during recording did not restore prior shortcut"); exit(1) }
+            store.recordingShortcut = false
             if let occupied = occupied { UnregisterEventHotKey(occupied) }
             show(); openSettings(); beginShortcutRecording()
             guard store.recordingShortcut, hotkey == nil else { print("FAIL: begin recording"); exit(1) }
@@ -276,7 +336,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard !store.recordingShortcut, !store.settings, hotkey != nil else { print("FAIL: close recording did not restore hotkey"); exit(1) }
             print("PASS: global registration, conflict preserves original, cancel and close restore shortcut")
             NSApp.terminate(nil)
-        } else if CommandLine.arguments.contains("--layout-test") {
+        } else if TestMode.layout {
             show()
             let before = panel.frame
             guard let shelfScreen = panel.screen, before.minY == shelfScreen.frame.minY, before.minX == shelfScreen.frame.minX, before.width == shelfScreen.frame.width else { print("FAIL: shelf not flush with screen edges"); exit(1) }
@@ -294,7 +354,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if NSApp.isActive {
                     guard window.isKeyWindow else { print("FAIL: first settings opening did not receive focus"); exit(1) }
                     print("PASS: first menu settings request creates a visible focused window")
-                } else { print("SKIP: focus assertion requires foreground user activation; visibility verified") }
+                } else { print("FAIL: focus assertion requires foreground user activation; focus has not been verified"); exit(1) }
                 let ordinary = NSWindow(contentRect: window.frame.insetBy(dx: 80, dy: 80), styleMask: [.titled, .closable], backing: .buffered, defer: false)
                 ordinary.title = "Window ordering test"; ordinary.isReleasedWhenClosed = false
                 ordinary.makeKeyAndOrderFront(nil)
@@ -329,27 +389,71 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 runSettingsPageCacheTests(store: self.store)
                 NSApp.terminate(nil)
             }
-        } else if preview { show(); if CommandLine.arguments.contains("--settings") { openSettings() }; if CommandLine.arguments.contains("--translation-ui-test") { translateSelection("Hello\n    world") } } else if !UserDefaults.standard.bool(forKey: "recordingAccepted") { onboarding() } else { store.start(); if CommandLine.arguments.contains("--settings") { openSettings() } }
+        }
+        if TestMode.keyboard || TestMode.shortcut || TestMode.layout { return }
+        #endif
+        if preview {
+            show()
+            if CommandLine.arguments.contains("--settings") { let finish = AcceptanceMetrics.begin("launch.open-settings"); openSettings(); finish() }
+            if TestMode.translationUI { translateSelection("Hello\n    world") }
+        } else if !AppEnvironment.current.defaults.bool(forKey: "recordingAccepted") { onboarding() }
+        else {
+            let finishStart = AcceptanceMetrics.begin("launch.store-start"); store.start(); finishStart()
+            if CommandLine.arguments.contains("--settings") { let finish = AcceptanceMetrics.begin("launch.open-settings"); openSettings(); finish() }
+        }
     }
     func onboarding() {
+        let sourceApp = resolveExternalTarget()
+        let initialSource = sourceApp.map { ClipboardCaptureSource(name: $0.localizedName ?? "未知应用", bundleID: $0.bundleIdentifier ?? "") }
+        let initialChangeCount = NSPasteboard.general.changeCount
         let alert = NSAlert(); alert.messageText = "欢迎使用 OpenPaste"
         alert.informativeText = "启用后，当前剪贴板以及之后复制的文字、链接、图片和文件引用都会保存到这台 Mac。默认跳过已标记的敏感内容和常见密码管理器。普通应用复制的敏感文字仍可能被记录，请按需要暂停或设置排除应用。\n\n默认保存在本机；可在数据管理中选择 iCloud Drive 目录，由系统同步历史。网页预览与快速翻译按各自的设置联网。"
+        if UsageAnalytics.shared.available {
+            alert.informativeText += "\n\n使用统计默认开启：向 Google Firebase Analytics 发送首次启动、粘贴取用和翻译成功次数，以及 SDK 的应用实例、设备和版本信息，不包含剪贴板正文或翻译密钥。可单独关闭，不影响本地记录。"
+            alert.showsSuppressionButton = true
+            alert.suppressionButton?.title = "帮助改进 OpenPaste（发送使用统计）"
+            alert.suppressionButton?.state = UsageAnalytics.shared.enabled ? .on : .off
+        }
         alert.addButton(withTitle: "启用本地记录"); alert.addButton(withTitle: "暂不启用")
         NSApp.activate()
-        if runAlert(alert) == .alertFirstButtonReturn { UserDefaults.standard.set(true, forKey: "recordingAccepted"); store.start() } else { store.paused = true }
+        let accepted = runAlert(alert) == .alertFirstButtonReturn
+        if UsageAnalytics.shared.available {
+            UsageAnalytics.shared.enabled = alert.suppressionButton?.state == .on
+            UsageAnalytics.shared.start()
+        }
+        store.setRecordingAccepted(accepted)
+        if accepted { store.start(initialSource: initialSource, initialChangeCount: initialChangeCount) }
         show()
     }
+    func resolveExternalTarget(frontmost: NSRunningApplication? = NSWorkspace.shared.frontmostApplication) -> NSRunningApplication? {
+        [frontmost, lastExternalApp, target].compactMap { $0 }.first {
+            !$0.isTerminated && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        }
+    }
+    func rememberExternalTarget() {
+        target = resolveExternalTarget()
+        if let target { lastExternalApp = target }
+    }
+    func excludeCurrentTargetApplication() {
+        rememberExternalTarget()
+        guard let id = target?.bundleIdentifier else { return }
+        let excluded = store.ignored.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+        if !excluded.contains(id) { store.ignored += "\n" + id }
+    }
     func showShelf() {
+        let finishTiming = AcceptanceMetrics.begin("shelf.show"); defer { finishTiming() }
+        guard prepareShelfPresentation({ [weak self] in self?.showShelf() }) else { return }
         guard !store.changingDataDirectory else { openSettings(); return }
+        shelfPresentation += 1
+        pendingOutsideClick = false
+        pendingApplicationSwitch = false
         if store.settings { closeSettings() }
-        let front = NSWorkspace.shared.frontmostApplication
-        if let front = front, front.processIdentifier != ProcessInfo.processInfo.processIdentifier { target = front; lastExternalApp = front }
-        else if target == nil || target?.isTerminated == true { target = lastExternalApp }
-        if CommandLine.arguments.contains("--ui-test") { target = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.SwallOwDili.OpenPaste.fixture").first }
-        if CommandLine.arguments.contains("--ui-test") { print("UI show target: \(target?.bundleIdentifier ?? "none")"); fflush(stdout) }
+        rememberExternalTarget()
+        if TestMode.ui { target = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.SwallOwDili.OpenPaste.fixture").first }
+        if TestMode.ui { print("UI show target: \(target?.bundleIdentifier ?? "none")"); fflush(stdout) }
         pasteGeneration += 1
-        store.board = nil; store.kind = "全部"; store.sourceFilter = "全部来源"; store.todayOnly = false; store.dateRangeEnabled = false; store.filtersExpanded = false; store.query = ""
-        if !preview, UserDefaults.standard.bool(forKey: "recordingAccepted") { store.capture(force: true) }
+        store.resetFilters(); store.filtersExpanded = false
+        if !preview, AppEnvironment.current.defaults.bool(forKey: "recordingAccepted") { store.capture(force: true) }
         refreshPermission()
         store.searchFocused = false
         store.searchExpanded = false
@@ -360,24 +464,87 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.setFrame(NSRect(x: r.minX, y: r.minY, width: r.width, height: h), display: true)
         store.reverseHistory = false; store.selection.removeAll(); store.compact = h < 270
         store.selected = store.currentClipID ?? store.filtered.first?.id
-        panel.makeKeyAndOrderFront(nil); NSApp.activate()
+        NSApp.activate(); panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(panel.contentView)
-        DispatchQueue.main.async { if self.panel.isKeyWindow, !self.store.searchFocused { self.panel.makeFirstResponder(self.panel.contentView) } }
+        logInteraction("shelf.show")
+        DispatchQueue.main.async { [weak self] in self?.restoreShelfKeyboardFocus() }
+    }
+    func restoreShelfKeyboardFocus() {
+        // A visible borderless shelf can lose its key window after activation or
+        // closing an auxiliary window. Never steal focus from another app/window.
+        guard let panel, panel.isVisible, NSApp.keyWindow == nil,
+              !interactionState.menuTracking, NSApp.modalWindow == nil,
+              !store.settings, !modalShowing, panel.attachedSheet == nil,
+              settingsWindow?.isVisible != true, previewWindow?.isVisible != true,
+              editorWindow?.isVisible != true, NSApp.isActive else { return }
+        panel.makeKeyAndOrderFront(nil)
+        if !store.searchFocused { panel.makeFirstResponder(panel.contentView) }
+    }
+    var interactionState: InteractionState {
+        InteractionState(
+            modal: modalShowing || NSApp.modalWindow != nil,
+            attachedSheet: [panel, settingsWindow, previewWindow, editorWindow].contains { $0?.attachedSheet != nil },
+            menuTracking: !trackingMenus.isEmpty || menuFinishing || RunLoop.current.currentMode == .eventTracking,
+            recordingShortcut: store.recordingShortcut,
+            editorVisible: editorWindow?.isVisible == true,
+            previewVisible: previewWindow?.isVisible == true)
+    }
+    func prepareShelfPresentation(_ retry: @escaping () -> Void) -> Bool {
+        switch InteractionPolicy.presentationDecision(for: interactionState) {
+        case .ignored: return false
+        case .deferred:
+            if pendingShelfPresentation == nil {
+                RunLoop.main.perform(inModes: [.default]) { [weak self] in
+                    let action = self?.pendingShelfPresentation
+                    self?.pendingShelfPresentation = nil
+                    action?()
+                }
+            }
+            pendingShelfPresentation = retry
+            return false
+        case .focusEditor:
+            NSApp.activate(); editorWindow?.makeKeyAndOrderFront(nil)
+            return false
+        case .focusPreview:
+            NSApp.activate(); previewWindow?.makeKeyAndOrderFront(nil)
+            return false
+        case .showShelf: return true
+        }
+    }
+    func restoreWorkingWindowFocus() {
+        guard NSApp.isActive, NSApp.keyWindow == nil, !interactionState.menuTracking, NSApp.modalWindow == nil else { return }
+        let windows = [editorWindow, previewWindow, settingsWindow, panel].compactMap { $0 }.filter(\.isVisible)
+        if let sheet = windows.compactMap(\.attachedSheet).first {
+            sheet.makeKeyAndOrderFront(nil)
+        } else if !modalShowing, let window = windows.first, window !== panel {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            restoreShelfKeyboardFocus()
+        }
     }
     func hideShelf() {
+        logInteraction("shelf.hide", reason: "explicit")
         cancelTranslation()
         store.reverseHistory = false
         panel.orderOut(nil)
         if NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier, let target = target { NSApp.yieldActivation(to: target); _ = target.activate(options: []) }
     }
-    func toggle() { if panel.isVisible && panel.isKeyWindow { hideShelf() } else { show() } }
+    func toggle() {
+        guard prepareShelfPresentation({ [weak self] in self?.toggle() }) else { return }
+        if panel.isVisible && panel.isKeyWindow { hideShelf() } else { show() }
+    }
     @objc func togglePause() {
-        if !UserDefaults.standard.bool(forKey: "recordingAccepted"), !preview { onboarding(); return }
-        pauseTimer?.invalidate(); pauseTimer = nil
-        store.paused.toggle()
-        if !store.paused { store.capture(force: true) }
+        switch store.recordingPauseControl.action {
+        case .pause: pauseFor(nil)
+        case .resume: resumeRecording()
+        case .enable: onboarding()
+        case .retryLoad, .retrySave: store.retryRecordingStorage()
+        case .unavailable: showToast(store.recordingPauseControl.status)
+        }
     }
     @objc func openSettings() {
+        let finishTiming = AcceptanceMetrics.begin("settings.open"); defer { finishTiming() }
+        rememberExternalTarget()
         settingsRequest += 1
         store.settings = true
         cancelTranslation()
@@ -402,7 +569,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate()
+        logInteraction("shelf.hide", reason: "settings")
         panel.orderOut(nil)
+        logInteraction("settings.open")
         let request = settingsRequest
         RunLoop.main.perform(inModes: [.default]) { [weak self] in
             guard let self, self.settingsRequest == request, self.store.settings,
@@ -411,6 +580,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
     @objc func openSettingsFromMenu() {
+        logInteraction("settings.request")
         settingsRequest += 1
         let request = settingsRequest
         store.settings = true
@@ -467,7 +637,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var registered: EventHotKeyRef?
         let result = RegisterEventHotKey(candidate.keyCode, candidate.modifiers, EventHotKeyID(signature: 0x4C505354, id: 1), GetApplicationEventTarget(), 0, &registered)
         guard result == noErr else {
-            store.shortcutNotice = "\(candidate.label) 无法注册，可能已被占用。原快捷键保持不变。"
+            if hotkey == nil {
+                store.shortcutLabel = "\(candidate.label) · 未生效"
+                store.shortcutNotice = "\(candidate.label) 无法注册，可能已被占用。请点击“更改…”设置其他快捷键。"
+                status.menu?.items.first?.title = "打开剪贴板（快捷键不可用）"
+            } else {
+                store.shortcutNotice = "\(candidate.label) 无法注册，可能已被占用。原快捷键保持不变。"
+            }
             store.message = "\(candidate.label) 无法注册；请从菜单栏打开或在设置中更换"
             return false
         }
@@ -480,20 +656,81 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !preview { store.message = store.storageDescription }
         return true
     }
-    func dismissShelfForExternalInteraction() {
+    enum ShelfDismissReason: String { case outsideClick, activation, resignKey, menuEnd }
+    var externalApplicationActive: Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return false }
+        return app.processIdentifier != ProcessInfo.processInfo.processIdentifier
+    }
+    func logInteraction(_ event: String, reason: String = "none") {
+        let keyWindow = NSApp.keyWindow
+        let keyRole = keyWindow == nil ? "none" : (keyWindow === panel ? "shelf" : (keyWindow === settingsWindow ? "settings" : (keyWindow === previewWindow ? "preview" : (keyWindow === editorWindow ? "editor" : "temporary"))))
+        AppDiagnostics.record(event, [
+            "reason": reason, "visible": String(panel?.isVisible == true),
+            "key": String(panel?.isKeyWindow == true), "active": String(NSApp.isActive),
+            "external": String(externalApplicationActive), "menus": String(trackingMenus.count),
+            "finishing": String(menuFinishing), "settings": String(store.settings), "keyRole": keyRole
+        ])
+    }
+    func observeMenuTracking() {
+        let center = NotificationCenter.default
+        menuObservers.append(center.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: nil) { [weak self] notification in
+            guard let self, let menu = notification.object as? NSMenu else { return }
+            self.menuTransition += 1
+            self.trackingMenus.insert(ObjectIdentifier(menu))
+            self.logInteraction("menu.begin")
+        })
+        menuObservers.append(center.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: nil) { [weak self] notification in
+            guard let self, let menu = notification.object as? NSMenu else { return }
+            self.trackingMenus.remove(ObjectIdentifier(menu))
+            self.menuFinishing = true
+            self.menuTransition += 1
+            let transition = self.menuTransition
+            self.logInteraction("menu.end")
+            // Menu actions and temporary windows finish before normal focus decisions.
+            RunLoop.main.perform(inModes: [.default]) { [weak self] in
+                guard let self, self.menuTransition == transition, self.trackingMenus.isEmpty else { return }
+                self.menuFinishing = false
+                let outsideClick = self.pendingOutsideClick
+                let applicationSwitch = self.pendingApplicationSwitch
+                self.pendingOutsideClick = false
+                self.pendingApplicationSwitch = false
+                // A click consumed by menu tracking may already be stale after
+                // the user returns to OpenPaste. Recheck the current application.
+                if (outsideClick || applicationSwitch) && !NSApp.isActive && self.externalApplicationActive {
+                    self.dismissShelfForExternalInteraction(reason: outsideClick ? .outsideClick : .menuEnd)
+                } else {
+                    self.restoreWorkingWindowFocus()
+                }
+                self.logInteraction("menu.settled")
+            }
+        })
+    }
+    func dismissShelfForExternalInteraction(reason: ShelfDismissReason = .outsideClick) {
         guard panel.isVisible, !modalShowing, panel.attachedSheet == nil,
               previewWindow?.isVisible != true, editorWindow?.isVisible != true, !store.settings else { return }
+        if interactionState.menuTracking {
+            if reason == .outsideClick { pendingOutsideClick = true }
+            else { pendingApplicationSwitch = true }
+            logInteraction("shelf.dismiss-deferred", reason: reason.rawValue)
+            return
+        }
+        // Delayed activation/resign notifications must still refer to another app.
+        guard reason == .outsideClick || (!NSApp.isActive && externalApplicationActive) else { return }
+        logInteraction("shelf.hide", reason: reason.rawValue)
         cancelTranslation()
         store.reverseHistory = false
         panel.orderOut(nil)
     }
     func windowDidResignKey(_ notification: Notification) {
         if let window = notification.object as? NSWindow, window === panel {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self, !self.panel.isKeyWindow else { return }
-                let externalApp = NSWorkspace.shared.frontmostApplication?.processIdentifier != ProcessInfo.processInfo.processIdentifier
-                let otherWindow = NSApp.keyWindow.map { $0 !== self.panel } ?? false
-                if externalApp || otherWindow { self.dismissShelfForExternalInteraction() }
+            logInteraction("shelf.resign-key")
+            store.reverseHistory = false
+            let presentation = shelfPresentation
+            RunLoop.main.perform(inModes: [.default]) { [weak self] in
+                guard let self, self.shelfPresentation == presentation, !self.panel.isKeyWindow else { return }
+                // AppKit's temporary popup windows are part of this interaction.
+                // Known auxiliary windows manage shelf visibility explicitly.
+                self.dismissShelfForExternalInteraction(reason: .resignKey)
             }
         }
         if let window = notification.object as? NSWindow, window === settingsWindow { cancelShortcutRecording() }
@@ -501,16 +738,48 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowDidResize(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window === panel else { return }
         store.compact = window.frame.height < 270
-        if !preview { UserDefaults.standard.set(Double(window.frame.height), forKey: "shelfHeight") }
+        if !preview { AppEnvironment.current.defaults.set(Double(window.frame.height), forKey: "shelfHeight") }
         if let screen = window.screen, abs(window.frame.minY - screen.frame.minY) > 0.5 || abs(window.frame.width - screen.frame.width) > 0.5 { window.setFrame(NSRect(x: screen.frame.minX, y: screen.frame.minY, width: screen.frame.width, height: window.frame.height), display: true) }
     }
-    func windowDidBecomeKey(_ notification: Notification) { refreshPermission() }
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { show(); return true }
+    func windowDidBecomeKey(_ notification: Notification) {
+        refreshPermission()
+        if notification.object as? NSWindow === panel { logInteraction("shelf.become-key") }
+    }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        let finishTiming = AcceptanceMetrics.begin("app.reopen"); defer { finishTiming() }
+        let workingWindows = [editorWindow, previewWindow, settingsWindow].compactMap { $0 }.filter(\.isVisible)
+        var visibleWindows = workingWindows
+        if let panel, panel.isVisible { visibleWindows.append(panel) }
+        let attachedSheet = visibleWindows.compactMap(\.attachedSheet).first
+        if let sheet = attachedSheet {
+            NSApp.activate()
+            sheet.makeKeyAndOrderFront(nil)
+            return true
+        }
+        if let window = workingWindows.first {
+            NSApp.activate()
+            window.makeKeyAndOrderFront(nil)
+            return true
+        }
+        if panel.isVisible {
+            NSApp.activate()
+            panel.makeKeyAndOrderFront(nil)
+            return true
+        }
+        show()
+        return true
+    }
     func windowWillClose(_ notification: Notification) {
         if let window = notification.object as? NSWindow, window === settingsWindow { cancelShortcutRecording(); store.settings = false }
+        if let window = notification.object as? NSWindow, window === previewWindow || window === editorWindow {
+            if window === previewWindow { previewClipID = nil; previewWindow = nil }
+            if window === editorWindow { editorWindow = nil }
+            DispatchQueue.main.async { [weak self] in self?.restoreWorkingWindowFocus() }
+        }
     }
     @objc func quit() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        AppDiagnostics.record("app.terminate")
         store.flush()
         if let savedClipboard = savedClipboard {
             let items = savedClipboard.map { parts in let item = NSPasteboardItem(); for part in parts { item.setData(part.data, forType: NSPasteboard.PasteboardType(part.type)) }; return item }
@@ -530,14 +799,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func pastePrepared() {
         cancelTranslation()
         refreshPermission()
+        logInteraction("shelf.hide", reason: "paste")
         panel.orderOut(nil)
         pasteGeneration += 1
         let generation = pasteGeneration
         guard let target = target, !target.isTerminated else { showToast("已复制，请回到输入框按 ⌘V"); return }
-        if CommandLine.arguments.contains("--ui-test") { print("UI paste target: \(target.bundleIdentifier ?? "none"), AX: \(AXIsProcessTrusted()), event access: \(CGPreflightPostEventAccess())"); fflush(stdout) }
+        if TestMode.ui { print("UI paste target: \(target.bundleIdentifier ?? "none"), AX: \(AXIsProcessTrusted()), event access: \(CGPreflightPostEventAccess())"); fflush(stdout) }
         NSApp.yieldActivation(to: target)
         _ = target.activate(options: [])
-        guard store.directPasteAuthorized else { showToast("已复制，按 ⌘V 粘贴 · 自动粘贴需要辅助功能授权"); return }
+        // The background permission state is for display only. It may still be
+        // unknown at startup; finishPaste checks live permission before sending.
         finishPaste(target: target, generation: generation, attempt: 0)
     }
     private func finishPaste(target: NSRunningApplication, generation: Int, attempt: Int) {
@@ -580,12 +851,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func openExternal(_ url: URL) {
         cancelTranslation()
         closeSettings()
+        logInteraction("shelf.hide", reason: "open-external")
         panel.orderOut(nil)
         toast?.orderOut(nil)
         NSWorkspace.shared.open(url)
     }
     func requestAccessibility() {
         closeSettings()
+        logInteraction("shelf.hide", reason: "permission-settings")
         panel.orderOut(nil)
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
@@ -599,24 +872,28 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         presentAlert(alert) { [weak self] response in if response == .alertFirstButtonReturn { self?.store.addBoard(field.stringValue) } }
     }
     func edit(_ clip: Clip) {
+        let editTarget = store.contentEditTarget(for: clip)
         if CapturedColor.parse(clip.text) != nil {
             editorWindow?.close(); let window = auxiliaryWindow("编辑颜色", size: NSSize(width: 400, height: 340)); editorWindow = window
-            window.contentView = NSHostingView(rootView: ColorEditor(clip: clip, save: { [weak self] hex in var edited = clip; edited.text = hex; edited.title = hex; edited.kind = "颜色"; edited.parts = [[ClipPart(type: "public.utf8-plain-text", data: Data(hex.utf8))]]; edited.cachedDigest = nil; self?.store.replace(edited, label: "颜色") }, close: { [weak self] in self?.editorWindow?.close() })); window.makeKeyAndOrderFront(nil); return
+            window.contentView = NSHostingView(rootView: ColorEditor(clip: clip, save: { [weak self] hex in
+                guard let self else { return false }
+                let saved = store.saveContentEdit(.color(hex), to: editTarget, label: "颜色")
+                if !saved { showToast(store.message) }
+                return saved
+            }, close: { [weak self] in self?.editorWindow?.close() })); window.makeKeyAndOrderFront(nil); return
         }
         editorWindow?.close()
         let window = auxiliaryWindow("编辑内容", size: NSSize(width: 700, height: 480)); editorWindow = window
         let editor = NativeEditor(clip: clip, save: { [weak self] rich in
-            guard let self else { return }; var edited = clip
-            edited.text = rich.string; edited.title = String(rich.string.prefix(100)); edited.kind = CapturedColor.parse(rich.string) != nil ? "颜色" : (URL(string: rich.string)?.scheme?.hasPrefix("http") == true ? "链接" : "文字")
-            var parts = [ClipPart(type: "public.utf8-plain-text", data: Data(rich.string.utf8))]
-            if let rtf = try? rich.data(from: NSRange(location: 0, length: rich.length), documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) { parts.append(ClipPart(type: "public.rtf", data: rtf)) }
-            edited.parts = [parts]; edited.cachedDigest = nil; edited.linkTitle = nil
-            if store.archive.clips.contains(where: { $0.id == edited.id }) { store.replace(edited, label: "编辑") }
-            else if !edited.text.isEmpty, let id = store.ingest(edited) { if id == edited.id { store.undoItems.append(ItemUndo(clips: [], ids: [id], label: "新建")) }; store.choose(id) }
+            guard let self else { return false }
+            let saved = store.saveContentEdit(.text(rich), to: editTarget)
+            if !saved { showToast(store.message) }
+            return saved
         }, close: { [weak self] in self?.editorWindow?.close() })
         window.contentViewController = editor; window.makeKeyAndOrderFront(nil); window.makeFirstResponder(editor.text)
     }
     func importPaste(selectFile: Bool = false) {
+        guard store.canModifyHistory else { showToast(store.historyModificationNotice); return }
         guard !store.importingPaste, !store.changingDataDirectory else { return }
         if selectFile {
             let picker = NSOpenPanel(); picker.title = "选择 Paste 数据库"; picker.canChooseDirectories = false; picker.allowsMultipleSelection = false
@@ -626,7 +903,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else { readPaste(urls: PasteImport.candidates) }
     }
     private func readPaste(urls: [URL]) {
+        guard store.canModifyHistory else { showToast(store.historyModificationNotice); return }
         store.importingPaste = true
+        store.beginTemporaryPause()
         let existing = store.archive
         store.importProgress = ImportProgress(phase: "准备解析", completed: 0, total: 0)
         let destination = store.root
@@ -635,6 +914,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let result = Result { try PasteImport.read(existing: existing, urls: urls, destination: destination, progress: progress) }
             DispatchQueue.main.async {
                 self.store.importingPaste = false
+                self.store.endTemporaryPause()
                 switch result {
                 case .failure(let error):
                     let alert = NSAlert(); alert.messageText = "无法导入 Paste"; alert.informativeText = error.localizedDescription; alert.addButton(withTitle: "好")
@@ -644,26 +924,43 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     alert.informativeText = result.summary + "\n去重后内容用量：\(ByteCountFormatter.string(fromByteCount: Int64(result.storageBytes), countStyle: .file))。按磁盘可用空间导入，不再设 2 GB 上限。\n\n保留时间、来源、收藏分组和原始格式。原有历史不会删除；导入前会自动备份。文件条目保留引用，原文件需仍然存在。"
                     alert.addButton(withTitle: "导入"); alert.addButton(withTitle: "取消")
                     self.presentAlert(alert) { response in
-                        guard response == .alertFirstButtonReturn else { return }
+                        guard response == .alertFirstButtonReturn, self.store.canModifyHistory else { return }
                         self.store.importingPaste = true
                         // Freeze recording during the transactional write, then restore its state.
-                        let wasPaused = self.store.paused; self.store.paused = true
+                        self.store.beginTemporaryPause()
+                        self.logInteraction("shelf.hide", reason: "import")
                         self.panel.orderOut(nil)
+                        self.store.invalidatePendingStorageCallbacks()
+                        let storageGeneration = self.store.storageCallbackGeneration
                         let snapshot = self.store.archive; let root = self.store.root
+                        let syncBaseline = self.store.syncBaseline
+                        let syncDevice = self.store.deviceIDForPersistence()
                         self.store.settings = true
                         self.store.importProgress = ImportProgress(phase: "准备导入", completed: 0, total: result.clips.count)
                         self.store.message = "正在保存导入数据…"
                         self.store.persistenceQueue.async {
-                            let outcome = Result { try PasteImport.commit(result, snapshot: snapshot, root: root, progress: progress) }
+                            let outcome = Result { try PasteImport.commit(result, snapshot: snapshot, root: root,
+                                                                         syncBaseline: syncBaseline, syncDevice: syncDevice,
+                                                                         progress: progress) }
                             DispatchQueue.main.async {
-                                switch outcome {
-                                case .success(let (merged, added)):
-                                    self.store.installImportedArchive(merged)
-                                    let omitted = result.unreadable + result.oversized + result.capacity + max(0, result.clips.count - added)
-                                    self.store.message = "已导入 \(added) 条；重复 \(result.duplicate) 条；其他跳过 \(omitted) 条。导入前的历史已备份。"
-                                case .failure(let error): self.store.message = "导入失败：\(error.localizedDescription)"
+                                let current = self.store.storageCallbackGeneration == storageGeneration && self.store.root.standardizedFileURL == root.standardizedFileURL
+                                if current {
+                                    switch outcome {
+                                    case .success(let (merged, added, synchronized)):
+                                        if let synchronized { self.store.syncBaseline = synchronized }
+                                        self.store.installImportedArchive(merged)
+                                        let omitted = result.unreadable + result.oversized + result.capacity + max(0, result.clips.count - added)
+                                        self.store.message = "已导入 \(added) 条；重复 \(result.duplicate) 条；其他跳过 \(omitted) 条。导入前的历史已备份。"
+                                    case .failure(let error): self.store.message = "导入失败：\(error.localizedDescription)"
+                                    }
+                                } else {
+                                    self.store.message = "导入结果已取消：数据目录状态已经变化。"
                                 }
-                                self.store.paused = wasPaused; self.store.importingPaste = false
+                                self.store.importingPaste = false; self.store.endTemporaryPause()
+                                // The final save persists either the installed import or the
+                                // unchanged archive after a failure, replacing saves cancelled
+                                // when the transaction boundary was established.
+                                self.store.save()
                             }
                         }
                     }
@@ -679,9 +976,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 struct ShelfView: View {
     @State private var resizeStart: CGFloat?
+    @State private var renderedClipCount = ShelfRenderWindow.batchSize
     @ObservedObject var store: Store
     @FocusState private var searchFocused: Bool
     var body: some View {
+        let renderedClips = Array(store.filtered.prefix(renderedClipCount))
         VStack(spacing: 0) {
             Rectangle().fill(Color.clear).frame(height: 6).contentShape(Rectangle())
                 .overlay(Capsule().fill(Color.secondary.opacity(0.25)).frame(width: 36, height: 2))
@@ -716,12 +1015,12 @@ struct ShelfView: View {
                             if !store.draggingIDs.isEmpty, Date().timeIntervalSince(store.dragStartedAt) < 60 {
                                 let ids = store.draggingIDs; store.draggingIDs.removeAll()
                                 for id in ids { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
-                                if CommandLine.arguments.contains("--feature-ui-test") { print("UI board pinned \(ids.count) items"); fflush(stdout) }
+                                if TestMode.featureUI { print("UI board pinned \(ids.count) items"); fflush(stdout) }
                                 return true
                             }
                             guard let provider = providers.first else { return false }
                             provider.loadDataRepresentation(forTypeIdentifier: "io.github.SwallOwDili.OpenPaste.clip-id") { data, error in
-                                if CommandLine.arguments.contains("--feature-ui-test") { print("UI drop data bytes=\(data?.count ?? -1) error=\(error?.localizedDescription ?? "none")"); fflush(stdout) }
+                                if TestMode.featureUI { print("UI drop data bytes=\(data?.count ?? -1) error=\(error?.localizedDescription ?? "none")"); fflush(stdout) }
                                 guard let data, let string = String(data: data, encoding: .utf8), let id = UUID(uuidString: string) else { return }
                                 DispatchQueue.main.async { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
                             }; return true
@@ -746,7 +1045,10 @@ struct ShelfView: View {
                     Button("新建文字 · ⌘N") { Controller.shared.createText() }
                     Button("撤销 · ⌘Z") { store.undoItemChange() }.disabled(store.undoItems.isEmpty)
                     Button("设置…") { Controller.shared.openSettingsFromMenu() }
-                    Button(store.paused ? "继续记录" : "暂停记录… · ⌘T") { if store.paused { Controller.shared.togglePause() } else { Controller.shared.pauseMenu() } }
+                    Button(store.recordingPauseControl.buttonTitle + (store.recordingPauseControl.action == .pause ? "… · ⌘T" : "")) {
+                        if store.recordingPauseControl.action == .pause { Controller.shared.pauseMenu() }
+                        else { Controller.shared.togglePause() }
+                    }.disabled(store.recordingPauseControl.action == .unavailable)
                     Divider()
                     Text("← → 选择 · ↵ 粘贴 · ⌘1–9 快速粘贴")
                     Button("关闭 · Esc") { Controller.shared.hideShelf() }
@@ -770,7 +1072,7 @@ struct ShelfView: View {
                 Menu { Button("全部来源") { store.sourceFilter = "全部来源" }; ForEach(store.sources, id: \.self) { source in Button(source) { store.sourceFilter = source } } } label: { Label(store.sourceFilter, systemImage: "line.3.horizontal.decrease") }.menuStyle(.borderlessButton).fixedSize().font(.system(size: 12))
                 Button { store.todayOnly.toggle() } label: { Label("今天", systemImage: "calendar").foregroundStyle(store.todayOnly ? Color.blue : Color.secondary) }.buttonStyle(.plain).font(.system(size: 12))
                 Spacer()
-                Text(store.paused ? "已暂停记录" : (store.query.isEmpty ? "\(store.filtered.count) 条历史" : "找到 \(store.filtered.count) 条结果")).font(.system(size: 12)).foregroundStyle(store.paused ? .orange : .secondary)
+                Text(store.paused ? store.recordingPauseControl.status : (store.query.isEmpty ? "\(store.filtered.count) 条历史" : "找到 \(store.filtered.count) 条结果")).font(.system(size: 12)).foregroundStyle(store.paused ? .orange : .secondary)
             }.padding(.horizontal, 20).padding(.vertical, 8)
             }
             if store.searchExpanded && !store.query.isEmpty {
@@ -789,11 +1091,12 @@ struct ShelfView: View {
                     ScrollView(.horizontal) {
                         LazyHStack(spacing: 12) {
                             if store.translating { VStack(spacing: 12) { ProgressView(); Text("正在翻译…"); Text("原文保持不变").font(.caption).foregroundStyle(.secondary) }.frame(width: store.compact ? 180 : 240).frame(maxHeight: .infinity).background(.quaternary, in: RoundedRectangle(cornerRadius: 12)) }
-                            ForEach(Array(store.filtered.enumerated()), id: \.element.id) { index, clip in
-                                ClipCard(clip: clip, index: index, selected: store.selection.contains(clip.id) || clip.id == store.selected, current: clip.id == store.currentClipID, store: store).equatable().id(clip.id)
+                            ForEach(renderedClips) { clip in
+                                ClipCard(clip: clip, index: store.visibleIndex(of: clip.id) ?? 0, selected: store.selection.contains(clip.id) || clip.id == store.selected, current: clip.id == store.currentClipID, store: store).equatable().id(clip.id)
+                                    .onAppear { if clip.id == renderedClips.last?.id { growRenderWindow() } }
                             }
                         }.padding(.horizontal, 20).padding(.vertical, 8)
-                    }.onChange(of: store.selected) { _, id in if let id = id { proxy.scrollTo(id) } }
+                    }.onChange(of: store.selected) { _, id in if let id { revealAndScroll(to: id, proxy: proxy) } }
                 }
             }
             if !store.translationStatus.isEmpty { Text(store.translationStatus).font(.system(size: 11)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 20).padding(.bottom, 6) }
@@ -803,14 +1106,40 @@ struct ShelfView: View {
         }
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.2)).frame(height: 1) }
-        .onChange(of: store.query) { _, query in if !query.isEmpty { store.indexImages() } }
+        .onChange(of: store.query) { _, query in resetRenderWindow(); if !query.isEmpty { store.indexImages() } }
+        .onChange(of: store.board) { resetRenderWindow() }
+        .onChange(of: store.kind) { resetRenderWindow() }
+        .onChange(of: store.sourceFilter) { resetRenderWindow() }
+        .onChange(of: store.dateRangeEnabled) { resetRenderWindow() }
+        .onChange(of: store.startDate) { resetRenderWindow() }
+        .onChange(of: store.endDate) { resetRenderWindow() }
+        .onChange(of: store.todayOnly) { resetRenderWindow() }
+        .onChange(of: store.reverseHistory) { resetRenderWindow() }
         .onChange(of: store.searchFocused) { _, focused in
             if focused { store.searchExpanded = true; DispatchQueue.main.async { searchFocused = true } } else { searchFocused = false; if store.query.isEmpty && store.kind == "全部" && store.sourceFilter == "全部来源" && !store.todayOnly { store.searchExpanded = false } }
         }
         .onChange(of: searchFocused) { _, focused in if store.searchFocused != focused { store.searchFocused = focused } }
 
     }
-    func resetSearch() { store.query = ""; store.kind = "全部"; store.sourceFilter = "全部来源"; store.todayOnly = false }
+    func growRenderWindow() {
+        let next = ShelfRenderWindow.nextCount(current: renderedClipCount, total: store.filtered.count)
+        if next > renderedClipCount { renderedClipCount = next }
+    }
+    func resetRenderWindow() {
+        let selectedIndex = store.selected.flatMap { store.visibleIndex(of: $0) }
+        renderedClipCount = ShelfRenderWindow.resetCount(total: store.filtered.count, selectedIndex: selectedIndex)
+    }
+    func revealAndScroll(to id: UUID, proxy: ScrollViewProxy) {
+        guard let index = store.visibleIndex(of: id) else { return }
+        let required = ShelfRenderWindow.countIncluding(index: index, total: store.filtered.count)
+        if required > renderedClipCount {
+            renderedClipCount = required
+            DispatchQueue.main.async { proxy.scrollTo(id) }
+        } else {
+            proxy.scrollTo(id)
+        }
+    }
+    func resetSearch() { store.resetFilters(preserveBoard: true, preserveDateRange: true) }
     func tab(_ name: String, icon: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) { Label(name, systemImage: icon).font(.system(size: 13, weight: .medium)).padding(.horizontal, 10).padding(.vertical, 6).background(active ? Color.primary.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 8)).foregroundStyle(Color.primary) }.buttonStyle(.plain)
     }
@@ -842,7 +1171,7 @@ struct ClipCard: View, Equatable {
     let current: Bool
     @ObservedObject var store: Store
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.clip.id == rhs.clip.id && lhs.index == rhs.index && lhs.selected == rhs.selected && lhs.current == rhs.current && lhs.clip.title == rhs.clip.title && lhs.clip.userLabel == rhs.clip.userLabel && lhs.clip.text == rhs.clip.text && lhs.clip.kind == rhs.clip.kind && lhs.clip.boards == rhs.clip.boards && lhs.clip.created == rhs.clip.created && lhs.clip.source == rhs.clip.source && lhs.clip.ocrText == rhs.clip.ocrText && lhs.clip.linkTitle == rhs.clip.linkTitle
+        lhs.clip.id == rhs.clip.id && lhs.clip.cachedDigest == rhs.clip.cachedDigest && lhs.index == rhs.index && lhs.selected == rhs.selected && lhs.current == rhs.current && lhs.clip.title == rhs.clip.title && lhs.clip.userLabel == rhs.clip.userLabel && lhs.clip.text == rhs.clip.text && lhs.clip.kind == rhs.clip.kind && lhs.clip.boards == rhs.clip.boards && lhs.clip.created == rhs.clip.created && lhs.clip.source == rhs.clip.source && lhs.clip.ocrText == rhs.clip.ocrText && lhs.clip.linkTitle == rhs.clip.linkTitle
     }
     var color: Color { if clip.kind == "文字", CodeSyntax.language(clip.text) != nil { return .purple }; switch clip.kind { case "链接": return .blue; case "图片": return .purple; case "文件": return .orange; default: return .teal } }
     var icon: String { switch clip.kind { case "链接": return "link"; case "图片": return "photo"; case "文件": return "folder"; default: return "text.alignleft" } }
@@ -888,7 +1217,7 @@ struct ClipCard: View, Equatable {
         .shadow(color: .black.opacity(0.03), radius: 2, y: 1)
         .contentShape(Rectangle())
         .onTapGesture(count: 2) { Controller.shared.pasteSelection(fallback: clip) }
-        .onDrag { let selected = store.selectedClips; store.draggingIDs = selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]; store.dragStartedAt = Date(); if CommandLine.arguments.contains("--feature-ui-test") { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
+        .onDrag { let selected = store.selectedClips; store.draggingIDs = selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]; store.dragStartedAt = Date(); if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
         .onTapGesture { store.searchFocused = false; store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) }
         .contextMenu {
             Button("粘贴") { Controller.shared.pasteSelection(fallback: clip) }
@@ -909,7 +1238,26 @@ struct ClipCard: View, Equatable {
     }
 }
 
-if CommandLine.arguments.contains("--update-test") {
+#if OPENPASTE_TESTING
+if CommandLine.arguments.contains("--interaction-policy-test") {
+    runInteractionPolicyTests()
+} else if CommandLine.arguments.contains("--recording-pause-test") {
+    runRecordingPauseTests()
+} else if CommandLine.arguments.contains("--storage-recovery-test") {
+    runStorageRecoveryTests()
+} else if CommandLine.arguments.contains("--permission-monitor-test") {
+    runPermissionMonitorTests()
+} else if CommandLine.arguments.contains("--content-editing-test") {
+    runContentEditingTests()
+} else if CommandLine.arguments.contains("--capture-boundary-test") {
+    runCaptureBoundaryTests()
+} else if CommandLine.arguments.contains("--filter-test") {
+    runFilterTests()
+} else if CommandLine.arguments.contains("--paste-queue-test") {
+    runPasteQueueTests()
+} else if CommandLine.arguments.contains("--clipboard-write-test") {
+    runClipboardWriteTests()
+} else if CommandLine.arguments.contains("--update-test") {
     runUpdateTests()
 } else if CommandLine.arguments.contains("--maintenance-test") {
     runMaintenanceTests()
@@ -917,6 +1265,8 @@ if CommandLine.arguments.contains("--update-test") {
     runDataDirectoryTests()
 } else if CommandLine.arguments.contains("--code-style-test") {
     runCodeStyleTests()
+} else if CommandLine.arguments.contains("--translation-config-test") {
+    runTranslationConfigTests()
 } else if CommandLine.arguments.contains("--translation-test") {
     DispatchQueue.global().async {
         runTranslationTests()
@@ -946,3 +1296,9 @@ if CommandLine.arguments.contains("--update-test") {
     let delegate = Controller(); app.delegate = delegate
     app.run()
 }
+
+#else
+let app = NSApplication.shared
+let delegate = Controller(); app.delegate = delegate
+app.run()
+#endif

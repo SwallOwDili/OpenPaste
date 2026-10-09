@@ -31,12 +31,34 @@ final class ImportStaging {
     }
 }
 enum HistoryStorage {
-    static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+    private static let hexDigits = Array("0123456789abcdef".utf8)
+    // Table lookup is ~25x faster than String(format:) per byte; digests are computed for every clip on load.
+    static func hex<D: Sequence>(_ bytes: D) -> String where D.Element == UInt8 {
+        var out = [UInt8]()
+        out.reserveCapacity(64)
+        for byte in bytes { out.append(hexDigits[Int(byte >> 4)]); out.append(hexDigits[Int(byte & 15)]) }
+        return String(decoding: out, as: UTF8.self)
+    }
+    static func digest(_ data: Data) -> String { hex(SHA256.hash(data: data)) }
     static func validID(_ id: String) -> Bool { id.count == 64 && id.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }
     static func freeBytes(at root: URL) throws -> Int {
         let values = try root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         if let value = values.volumeAvailableCapacityForImportantUsage { return Int(clamping: value) }
         return (try FileManager.default.attributesOfFileSystem(forPath: root.path)[.systemFreeSize] as? NSNumber)?.intValue ?? 0
+    }
+    private enum BlobState { case missing, invalid, regular(size: Int) }
+    /// The one rule shared by read and write for an attachment path: it must be a regular file
+    /// inside the blobs folder; a symlink is accepted only if it resolves to such a file there.
+    private static func blobState(_ file: URL, resolvedFolder: URL) -> BlobState {
+        var link = stat()
+        guard lstat(file.path, &link) == 0 else { return .missing }
+        var info = link
+        if link.st_mode & S_IFMT == S_IFLNK {
+            guard stat(file.path, &info) == 0 else { return .missing }
+            guard file.resolvingSymlinksInPath().deletingLastPathComponent() == resolvedFolder else { return .invalid }
+        }
+        guard info.st_mode & S_IFMT == S_IFREG else { return .invalid }
+        return .regular(size: Int(info.st_size))
     }
     static func read(from url: URL, contentRoot: URL? = nil) throws -> Archive {
         try DataDirectory.ready(url)
@@ -46,16 +68,26 @@ enum HistoryStorage {
         guard header?["version"] != nil else { return try JSONDecoder().decode(Archive.self, from: data) }
         let disk = try JSONDecoder().decode(DiskArchive.self, from: data)
         guard disk.version == 2 else { throw PasteImport.failure("历史数据版本不受支持") }
-        let folder = (contentRoot ?? url.deletingLastPathComponent()).appendingPathComponent("blobs")
+        let folder = (contentRoot ?? url.deletingLastPathComponent()).appendingPathComponent("blobs", isDirectory: true)
+        // Per-attachment filesystem probes dominated cold start (~1.1 s for 7,500 files):
+        // resolve the folder and iCloud state once, and avoid URL calls that stat the disk.
+        let resolvedFolder = folder.resolvingSymlinksInPath()
+        let folderPath = folder.path
+        let checkPlaceholders = DataDirectory.isCloud(folder)
+        let fileManager = FileManager.default
         let clips = try disk.clips.map { item -> Clip in
             var clip = item.clip
             clip.parts = try item.parts.map { try $0.map { part in
                 guard validID(part.blob) else { throw PasteImport.failure("历史内容路径无效") }
-                let path = folder.appendingPathComponent(part.blob)
-                try DataDirectory.ready(path)
-                guard path.resolvingSymlinksInPath().deletingLastPathComponent() == folder.resolvingSymlinksInPath(),
-                      try path.resourceValues(forKeys: [.fileSizeKey]).fileSize == part.size else { throw PasteImport.failure("历史内容文件缺失或损坏") }
-                return ClipPart(type: part.type, data: try Data(contentsOf: path, options: .mappedIfSafe), storageID: part.blob)
+                let path = URL(fileURLWithPath: folderPath + "/" + part.blob, isDirectory: false)
+                if checkPlaceholders { try DataDirectory.ready(path) }
+                guard case .regular(let size) = blobState(path, resolvedFolder: resolvedFolder), size == part.size,
+                      let content = try? Data(contentsOf: path, options: .mappedIfSafe), content.count == part.size else {
+                    // Missing placeholders must still report the iCloud download state, as before.
+                    if !checkPlaceholders { try DataDirectory.ready(path) }
+                    throw PasteImport.failure("历史内容文件缺失或损坏")
+                }
+                return ClipPart(type: part.type, data: content, storageID: part.blob)
             } }
             return clip
         }
@@ -67,6 +99,7 @@ enum HistoryStorage {
     static func write(_ archive: Archive, to url: URL, phase: String = "保存内容", progress: ((ImportProgress) -> Void)? = nil, sync: SyncIndex? = nil) throws {
         let folder = url.deletingLastPathComponent().appendingPathComponent("blobs")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let resolvedFolder = folder.resolvingSymlinksInPath()
         var written = 0
         var records: [DiskClip] = []
         var lastUpdate = Date.distantPast
@@ -75,10 +108,16 @@ enum HistoryStorage {
             try autoreleasepool {
                 let parts = try clip.parts.map { try $0.map { part -> DiskPart in
                     let id = part.storageID.flatMap { validID($0) ? $0 : nil } ?? digest(part.data)
-                    let file = folder.appendingPathComponent(id)
-                    if FileManager.default.fileExists(atPath: file.path) {
-                        guard try file.resourceValues(forKeys: [.fileSizeKey]).fileSize == part.data.count else { throw PasteImport.failure("已有内容文件损坏") }
-                    } else {
+                    let file = folder.appendingPathComponent(id, isDirectory: false)
+                    // Same rule as read: an existing attachment must be a regular file inside blobs
+                    // (symlinks only if they resolve inside it) with the expected size. A dangling
+                    // link counts as missing and is replaced by the atomic write.
+                    switch blobState(file, resolvedFolder: resolvedFolder) {
+                    case .regular(let size):
+                        guard size == part.data.count else { throw PasteImport.failure("已有内容文件损坏") }
+                    case .invalid:
+                        throw PasteImport.failure("已有内容文件损坏")
+                    case .missing:
                         try part.data.write(to: file, options: .atomic)
                         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
                     }
