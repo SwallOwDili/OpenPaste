@@ -77,6 +77,33 @@ jobs:
           OPENPASTE_FIREBASE_CONFIG_B64: ${{ secrets.OPENPASTE_FIREBASE_CONFIG_B64 }}
         run: python3 scripts/inject_firebase_config.py
 
+      - name: Import signing certificate
+        env:
+          OPENPASTE_SIGNING_P12_B64: ${{ secrets.OPENPASTE_SIGNING_P12_B64 }}
+          OPENPASTE_SIGNING_P12_PASSWORD: ${{ secrets.OPENPASTE_SIGNING_P12_PASSWORD }}
+          OPENPASTE_SIGNING_IDENTITY: ${{ secrets.OPENPASTE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          for name in OPENPASTE_SIGNING_P12_B64 OPENPASTE_SIGNING_P12_PASSWORD OPENPASTE_SIGNING_IDENTITY; do
+            [ -n "${!name}" ] || { echo "::error::Missing secret $name; refusing to publish an ad-hoc signed build."; exit 1; }
+          done
+          keychain="$RUNNER_TEMP/openpaste-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$OPENPASTE_SIGNING_P12_B64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$OPENPASTE_SIGNING_P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          existing="$(security list-keychains -d user | tr -d '"')"
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$keychain" $existing
+          security find-identity -p codesigning "$keychain" | grep -F "$OPENPASTE_SIGNING_IDENTITY"
+          echo "OPENPASTE_SIGNING_IDENTITY=$OPENPASTE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          echo "OPENPASTE_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
       - name: Build universal application
         run: ./build.sh
 
@@ -95,6 +122,10 @@ jobs:
           PY
           lipo build/OpenPaste.app/Contents/MacOS/OpenPaste -verify_arch arm64 x86_64
           codesign --verify --deep --strict build/OpenPaste.app
+          requirement="$(codesign -dr - build/OpenPaste.app 2>&1)"
+          echo "$requirement"
+          grep -q 'certificate leaf = H"' <<< "$requirement" || { echo "::error::Signature requirement is not certificate based; Accessibility permission would reset on update."; exit 1; }
+          if grep -q 'cdhash' <<< "$requirement"; then echo "::error::Ad-hoc signature detected."; exit 1; fi
 
       - name: Package and checksum
         run: |
@@ -122,3 +153,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$RELEASE_TAG" "build/release/$ASSET_NAME.zip" "build/release/$ASSET_NAME.sha256" --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          if [ -n "${OPENPASTE_SIGNING_KEYCHAIN:-}" ]; then security delete-keychain "$OPENPASTE_SIGNING_KEYCHAIN" || true; fi
+          rm -f "$RUNNER_TEMP/signing.p12"
