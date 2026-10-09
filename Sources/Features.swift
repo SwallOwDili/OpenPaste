@@ -19,9 +19,8 @@ struct ItemUndo { var clips: [Clip]; var ids: Set<UUID>; var label: String }
 extension Store {
     func enrichLink(_ clip: Clip) {
         LinkPreviewCache.shared.load(clip.text) { [weak self] result in
-            guard let self, let result, let i = archive.clips.firstIndex(where: { $0.id == clip.id && $0.text == clip.text }) else { return }
-            let metadata = result.title + "\n" + result.subtitle
-            if archive.clips[i].linkTitle != metadata { archive.clips[i].linkTitle = metadata; save() }
+            guard let self, let result else { return }
+            self.applyLinkPreview(result, to: clip)
         }
     }
     var selectedClips: [Clip] { filtered.filter { selection.contains($0.id) || (selection.isEmpty && $0.id == selected) } }
@@ -31,12 +30,13 @@ extension Store {
             if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
             selectionAnchor = id
             selected = selection.contains(id) ? id : filtered.first(where: { selection.contains($0.id) })?.id
-        } else if modifiers.contains(.shift), let anchor = selectionAnchor ?? selected, let a = filtered.firstIndex(where: { $0.id == anchor }), let b = filtered.firstIndex(where: { $0.id == id }) {
+        } else if modifiers.contains(.shift), let anchor = selectionAnchor ?? selected, let a = visibleIndex(of: anchor), let b = visibleIndex(of: id) {
             selection = Set(filtered[min(a,b)...max(a,b)].map(\.id)); selected = id
         } else { selected = id; selection = [id]; selectionAnchor = id }
     }
     func remember(_ clips: [Clip], label: String) { undoItems.append(ItemUndo(clips: clips, ids: Set(clips.map(\.id)), label: label)); if undoItems.count > 10 { undoItems.removeFirst() } }
     func undoItemChange() {
+        guard canModifyHistory else { return }
         guard let undo = undoItems.popLast() else { return }
         archive.clips.removeAll { undo.ids.contains($0.id) }
         archive.clips.append(contentsOf: undo.clips); archive.clips.sort { $0.created > $1.created }
@@ -44,10 +44,11 @@ extension Store {
         selected = undo.clips.first?.id; selection = undo.ids; save(); message = "已撤销\(undo.label)"
     }
     func replace(_ clip: Clip, label: String) {
+        guard canModifyHistory else { message = historyModificationNotice; return }
         guard let i = archive.clips.firstIndex(where: { $0.id == clip.id }), clip.byteCount <= 20 * 1024 * 1024 else { message = "内容超过单条 20 MB 上限"; return }
         remember([archive.clips[i]], label: label); var updated = clip; updated.cachedDigest = updated.fingerprint; archive.clips[i] = updated; save()
     }
-    func deleteChosen() { let clips = selectedClips; guard !clips.isEmpty else { return }; remember(clips, label: "删除"); for clip in clips { delete(clip.id, recordUndo: false) }; selection = selected.map { [$0] } ?? [] }
+    func deleteChosen() { guard canModifyHistory else { return }; let clips = selectedClips; guard !clips.isEmpty else { return }; remember(clips, label: "删除"); for clip in clips { delete(clip.id, recordUndo: false) }; selection = selected.map { [$0] } ?? [] }
     func restoreMany(_ clips: [Clip], plain: Bool, pasteboard: NSPasteboard = .general) -> Bool {
         guard !clips.isEmpty else { return false }
         if clips.count == 1 { return restore(clips[0], plain: plain, pasteboard: pasteboard) }
@@ -61,28 +62,66 @@ extension Store {
                 for (index, clip) in clips.enumerated() { if index > 0 { rich.append(NSAttributedString(string: "\n")) }; rich.append(clip.attributedText) }
                 if let rtf = try? rich.data(from: NSRange(location: 0, length: rich.length), documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) { item.setData(rtf, forType: .rtf) }
             }
-            change = pasteboard.clearContents(); let ok = pasteboard.writeObjects([item]); change = pasteboard.changeCount; if ok { recordUse(clips) }; return ok
+            let originalChangeCount = pasteboard.changeCount
+            let outcome = ClipboardWrite.attempt([item], to: pasteboard)
+            if outcome == .restoredPrevious { recordRestoredClipboardChange(from: originalChangeCount, pasteboard: pasteboard) }
+            else if outcome != .superseded { change = pasteboard.changeCount }
+            if outcome.succeeded { recordUse(clips) }
+            return outcome.succeeded
         }
-        let items = clips.flatMap(\.parts).map { parts -> NSPasteboardItem in let item = NSPasteboardItem(); for part in parts { item.setData(part.data, forType: NSPasteboard.PasteboardType(part.type)) }; return item }
-        pasteboard.clearContents(); let ok = pasteboard.writeObjects(items); change = pasteboard.changeCount; if ok { recordUse(clips) }; return ok
+        let itemParts = clips.flatMap { $0.parts.isEmpty ? [[]] : $0.parts }
+        let items = itemParts.map { parts -> NSPasteboardItem in let item = NSPasteboardItem(); for part in parts { item.setData(part.data, forType: NSPasteboard.PasteboardType(part.type)) }; return item }
+        let originalChangeCount = pasteboard.changeCount
+        let outcome = ClipboardWrite.attempt(items, to: pasteboard)
+        if outcome == .restoredPrevious { recordRestoredClipboardChange(from: originalChangeCount, pasteboard: pasteboard) }
+        else if outcome != .superseded { change = pasteboard.changeCount }
+        if outcome.succeeded { recordUse(clips) }
+        return outcome.succeeded
     }
     func indexImages() {
-        guard !indexingImages else { return }
+        guard canModifyHistory, !indexingImages else { return }
         let images = archive.clips.filter { $0.kind == "图片" && $0.ocrText == nil }
         guard !images.isEmpty else { return }
+        let storageGeneration = storageCallbackGeneration
         indexingImages = true; ocrProgress = "识别图片 0 / \(images.count)"
         ocrQueue.async { [weak self] in
+            // Each archive assignment rebuilds sources and re-filters all history, so write results in batches.
+            var batch: [(clip: Clip, text: String)] = []
             for (index, clip) in images.enumerated() {
                 let text: String = autoreleasepool { Self.recognize(clip) }
+                batch.append((clip, text))
+                let isLast = index == images.count - 1
+                guard batch.count == 25 || isLast else { continue }
+                let items = batch
+                batch.removeAll()
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    if let i = self.archive.clips.firstIndex(where: { $0.id == clip.id && $0.fingerprint == clip.fingerprint }) { self.archive.clips[i].ocrText = text }
+                    defer { if isLast { self.indexingImages = false; self.ocrProgress = "" } }
+                    guard self.applyRecognizedTexts(items, storageGeneration: storageGeneration) > 0 else { return }
                     self.ocrProgress = "识别图片 \(index + 1) / \(images.count)"
-                    if index % 25 == 24 { self.save() }
-                    if index == images.count - 1 { self.indexingImages = false; self.ocrProgress = ""; self.save() }
+                    self.save()
                 }
             }
         }
+    }
+    @discardableResult
+    func applyRecognizedText(_ text: String, to clip: Clip, storageGeneration: Int) -> Bool {
+        applyRecognizedTexts([(clip, text)], storageGeneration: storageGeneration) == 1
+    }
+    /// Applies several OCR results with one archive assignment. Returns how many still matched their clip.
+    @discardableResult
+    func applyRecognizedTexts(_ results: [(clip: Clip, text: String)], storageGeneration: Int) -> Int {
+        guard canModifyHistory, storageCallbackGeneration == storageGeneration, !results.isEmpty else { return 0 }
+        var clips = archive.clips
+        let indexByID = Dictionary(clips.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var applied = 0
+        for (clip, text) in results {
+            guard let index = indexByID[clip.id], clips[index].fingerprint == clip.fingerprint else { continue }
+            clips[index].ocrText = text
+            applied += 1
+        }
+        if applied > 0 { archive.clips = clips }
+        return applied
     }
     static func recognize(_ clip: Clip) -> String {
         guard let data = clip.parts.flatMap({ $0 }).first(where: { ["public.png", "public.tiff", "public.jpeg", "public.heic"].contains($0.type) })?.data else { return "" }
@@ -98,14 +137,27 @@ extension Clip {
         return NSAttributedString(string: text)
     }
     func dragProvider() -> NSItemProvider {
+        let parts = exportParts().flatMap { $0 }
         let provider: NSItemProvider
         if kind == "文件", let path = text.components(separatedBy: "\n").first, let file = NSItemProvider(contentsOf: URL(fileURLWithPath: path)) { provider = file } else { provider = NSItemProvider() }
-        provider.suggestedName = kind == "图片" ? "OpenPaste-图片.png" : title
-        for part in exportParts().flatMap({ $0 }) where UTType(part.type) != nil { provider.registerDataRepresentation(forTypeIdentifier: part.type, visibility: .all) { completion in completion(part.data, nil); return nil } }
-        if kind == "图片", let png = parts.flatMap({ $0 }).first(where: { $0.type == "public.png" })?.data {
-            provider.registerFileRepresentation(forTypeIdentifier: UTType.png.identifier, fileOptions: [], visibility: .all) { completion in
+        let formats: [(type: UTType, extension: String)] = [(.png, "png"), (.jpeg, "jpg"), (.tiff, "tiff"), (.heic, "heic"), (.gif, "gif"), (.bmp, "bmp")]
+        let images: [(data: Data, type: UTType, extension: String)] = kind == "图片" ? parts.compactMap { part in
+            guard UTType(part.type)?.conforms(to: .image) == true,
+                  let source = CGImageSourceCreateWithData(part.data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+                  CGImageSourceGetCount(source) > 0,
+                  CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+                  let identifier = CGImageSourceGetType(source) as String?, let detected = UTType(identifier),
+                  let format = formats.first(where: { $0.type == detected }) else { return nil }
+            return (part.data, format.type, format.extension)
+        } : []
+        let image = formats.lazy.compactMap { format in images.first(where: { $0.type == format.type }) }.first
+        provider.suggestedName = image.map { "OpenPaste-图片." + $0.extension } ?? title
+        for part in parts where UTType(part.type).map({ kind != "图片" || !$0.conforms(to: .image) }) == true { provider.registerDataRepresentation(forTypeIdentifier: part.type, visibility: .all) { completion in completion(part.data, nil); return nil } }
+        if let image {
+            provider.registerDataRepresentation(forTypeIdentifier: image.type.identifier, visibility: .all) { completion in completion(image.data, nil); return nil }
+            provider.registerFileRepresentation(forTypeIdentifier: image.type.identifier, fileOptions: [], visibility: .all) { completion in
                 let directory = FileManager.default.temporaryDirectory.appendingPathComponent("OpenPaste-drag", isDirectory: true)
-                do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]); let file = directory.appendingPathComponent(self.id.uuidString + ".png"); try png.write(to: file, options: .atomic); completion(file, false, nil) } catch { completion(nil, false, error) }; return nil
+                do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]); let file = directory.appendingPathComponent(self.id.uuidString + "." + image.extension); try image.data.write(to: file, options: .atomic); completion(file, false, nil) } catch { completion(nil, false, error) }; return nil
             }
         }
         if kind == "链接" { provider.registerDataRepresentation(forTypeIdentifier: UTType.url.identifier, visibility: .all) { completion in completion(Data(self.text.utf8), nil); return nil } }
@@ -151,10 +203,10 @@ struct FullItemPreview: View {
 }
 final class NativeEditor: NSViewController {
     let clip: Clip
-    let save: (NSAttributedString) -> Void
+    let save: (NSAttributedString) -> Bool
     let close: () -> Void
     let text = NSTextView()
-    init(clip: Clip, save: @escaping (NSAttributedString) -> Void, close: @escaping () -> Void) { self.clip = clip; self.save = save; self.close = close; super.init(nibName: nil, bundle: nil) }
+    init(clip: Clip, save: @escaping (NSAttributedString) -> Bool, close: @escaping () -> Void) { self.clip = clip; self.save = save; self.close = close; super.init(nibName: nil, bundle: nil) }
     required init?(coder: NSCoder) { fatalError() }
     override func loadView() {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 700, height: 480))
@@ -171,8 +223,19 @@ final class NativeEditor: NSViewController {
         stack.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(stack)
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: view.leadingAnchor), stack.trailingAnchor.constraint(equalTo: view.trailingAnchor), stack.topAnchor.constraint(equalTo: view.topAnchor), stack.bottomAnchor.constraint(equalTo: view.bottomAnchor), scroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24)])
     }
-    @objc func commit() { save(NSAttributedString(attributedString: text.textStorage ?? NSTextStorage())); close() }
+    @objc func commit() { if save(NSAttributedString(attributedString: text.textStorage ?? NSTextStorage())) { close() } }
     @objc func cancelEdit() { close() }
+}
+extension Store {
+    @discardableResult
+    func applyRotatedImage(_ part: ClipPart, to id: UUID, replacing expectedFingerprint: String) -> Bool {
+        guard canModifyHistory else { return false }
+        guard let index = archive.clips.firstIndex(where: { $0.id == id }), archive.clips[index].fingerprint == expectedFingerprint else { return false }
+        var edited = archive.clips[index]
+        edited.parts = [[part]]; edited.ocrText = nil; edited.cachedDigest = nil
+        replace(edited, label: "旋转")
+        return true
+    }
 }
 extension Controller {
     func auxiliaryWindow(_ title: String, size: NSSize) -> NSWindow {
@@ -181,19 +244,23 @@ extension Controller {
     }
     func showPreview(_ clip: Clip) {
         previewWindow?.close(); let window = auxiliaryWindow("内容预览", size: NSSize(width: 820, height: 580)); previewWindow = window
+        previewClipID = clip.id
         window.contentView = NSHostingView(rootView: FullItemPreview(store: store, id: clip.id)); window.makeKeyAndOrderFront(nil)
     }
     func openItem(_ clip: Clip) { if let url = URL(string: clip.text), clip.kind == "链接" { openExternal(url) } else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first { openExternal(URL(fileURLWithPath: path)) } else { showPreview(clip) } }
     func rename(_ clip: Clip) {
         let alert = NSAlert(); alert.messageText = "重命名内容"; let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24)); field.stringValue = clip.title; alert.accessoryView = field; alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消"); alert.window.initialFirstResponder = field
-        presentAlert(alert) { [weak self] response in guard response == .alertFirstButtonReturn, let self else { return }; var edited = clip; edited.title = field.stringValue; edited.userLabel = field.stringValue; store.replace(edited, label: "重命名") }
+        presentAlert(alert) { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self, var edited = store.archive.clips.first(where: { $0.id == clip.id }) else { return }
+            edited.title = field.stringValue; edited.userLabel = field.stringValue; store.replace(edited, label: "重命名")
+        }
     }
     func createText() { var clip = Clip(source: "OpenPaste", sourceID: Bundle.main.bundleIdentifier ?? "", kind: "文字", title: "新建文字", text: "", parts: []); clip.parts = [[ClipPart(type: "public.utf8-plain-text", data: Data())]]; edit(clip) }
     func rotate(_ clip: Clip) {
+        let expectedFingerprint = clip.fingerprint
         store.captureQueue.async { [weak self] in
             guard let part = ImageTools.rotated(clip) else { return }
-            var edited = clip; edited.parts = [[part]]; edited.ocrText = nil; edited.cachedDigest = nil
-            DispatchQueue.main.async { self?.store.replace(edited, label: "旋转"); PreviewCache.shared.images.removeObject(forKey: clip.id.uuidString as NSString) }
+            DispatchQueue.main.async { self?.store.applyRotatedImage(part, to: clip.id, replacing: expectedFingerprint) }
         }
     }
     func extractText(_ clip: Clip) {
@@ -210,18 +277,73 @@ extension Controller {
     }
     func enqueueSelection() { store.pasteQueue = store.selectedClips.map(\.id) }
     func pasteNext() {
-        while let id = store.pasteQueue.first { store.pasteQueue.removeFirst(); if let clip = store.archive.clips.first(where: { $0.id == id }) { paste(clip); return } }
-        showToast("粘贴队列已完成")
+        switch store.prepareNextQueuedPaste() {
+        case .ready: pastePrepared()
+        case .empty: showToast("粘贴队列已完成")
+        case .failed: showToast("无法复制此内容，已保留在队列中，可重试或结束队列")
+        }
     }
     func pauseFor(_ minutes: Int?) {
-        pauseTimer?.invalidate(); pauseTimer = nil; store.paused = true
-        if let minutes { pauseTimer = Timer.scheduledTimer(withTimeInterval: Double(minutes * 60), repeats: false) { [weak self] _ in self?.store.paused = false; self?.store.capture(force: true); self?.pauseTimer = nil } }
+        cancelScheduledRecordingResume()
+        store.setUserPaused(true)
+        guard store.usePreferences else { return }
+        if let minutes {
+            switch recordingPausePersistence.pause(for: Double(minutes * 60)) {
+            case .until(let deadline): scheduleRecordingResume(at: deadline)
+            case .recording, .expired: resumeRecording()
+            case .indefinitely: break
+            }
+        } else {
+            _ = recordingPausePersistence.pauseIndefinitely()
+        }
+    }
+    func restoreRecordingPause() {
+        guard store.usePreferences else { return }
+        cancelScheduledRecordingResume()
+        switch recordingPausePersistence.restore() {
+        case .recording: store.setUserPaused(false)
+        case .expired:
+            store.notePersistedPauseExpired()
+            recordingPausePersistence.clear()
+        case .indefinitely: store.setUserPaused(true)
+        case .until(let deadline):
+            store.setUserPaused(true)
+            scheduleRecordingResume(at: deadline)
+        }
+    }
+    func resumeRecording() {
+        cancelScheduledRecordingResume()
+        if store.usePreferences { recordingPausePersistence.clear() }
+        store.setUserPaused(false)
+        if !store.paused, AppEnvironment.current.defaults.bool(forKey: "recordingAccepted") { store.capture(force: true) }
+    }
+    private func cancelScheduledRecordingResume() {
+        pauseTimer?.invalidate()
+        pauseTimer = nil
+        pauseTimerSchedule.cancel()
+    }
+    private func scheduleRecordingResume(at deadline: Date) {
+        pauseTimer?.invalidate()
+        pauseTimer = nil
+        let token = pauseTimerSchedule.replace(with: deadline)
+        handleRecordingResumeTimer(token)
+    }
+    private func handleRecordingResumeTimer(_ token: RecordingPauseTimerToken) {
+        guard let interval = pauseTimerSchedule.remainingDelay(for: token, now: Date()) else { return }
+        guard interval > 0 else { resumeRecording(); return }
+        let timer = Timer(timeInterval: interval, repeats: false) { [weak self] firedTimer in
+            guard let self else { return }
+            if self.pauseTimer === firedTimer { self.pauseTimer = nil }
+            self.handleRecordingResumeTimer(token)
+        }
+        pauseTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
     func pauseMenu() {
         let alert = NSAlert(); alert.messageText = "暂停记录"; for name in ["5 分钟", "15 分钟", "1 小时", "直到手动恢复", "取消"] { alert.addButton(withTitle: name) }
         presentAlert(alert) { [weak self] response in let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue; guard index >= 0 && index < 4 else { return }; self?.pauseFor([5,15,60,nil][index]) }
     }
-    func resizeShelf(_ height: CGFloat) { guard let screen = panel.screen else { return }; let frame = screen.frame; let height = min(max(height, 180), frame.height * 0.75); panel.setFrame(NSRect(x: frame.minX, y: frame.minY, width: frame.width, height: height), display: true); store.compact = height < 270; if !preview { UserDefaults.standard.set(Double(height), forKey: "shelfHeight") } }
+    func resizeShelf(_ height: CGFloat) { guard let screen = panel.screen else { return }; let frame = screen.frame; let height = min(max(height, 180), frame.height * 0.75); panel.setFrame(NSRect(x: frame.minX, y: frame.minY, width: frame.width, height: height), display: true); store.compact = height < 270; if !preview { AppEnvironment.current.defaults.set(Double(height), forKey: "shelfHeight") } }
 }
 
 struct FullImagePreview: View {
@@ -242,13 +364,13 @@ struct FullImagePreview: View {
 
 struct ColorEditor: View {
     let clip: Clip
-    let save: (String) -> Void
+    let save: (String) -> Bool
     let close: () -> Void
     @State var color: Color
-    init(clip: Clip, save: @escaping (String) -> Void, close: @escaping () -> Void) { self.clip = clip; self.save = save; self.close = close; _color = State(initialValue: Color(nsColor: CapturedColor.parse(clip.text)?.nsColor ?? .white)) }
+    init(clip: Clip, save: @escaping (String) -> Bool, close: @escaping () -> Void) { self.clip = clip; self.save = save; self.close = close; _color = State(initialValue: Color(nsColor: CapturedColor.parse(clip.text)?.nsColor ?? .white)) }
     var hex: String { let c = NSColor(color).usingColorSpace(.sRGB) ?? .white; return String(format: "#%02X%02X%02X", Int(round(c.redComponent * 255)), Int(round(c.greenComponent * 255)), Int(round(c.blueComponent * 255))) }
     var body: some View {
-        VStack(spacing: 20) { RoundedRectangle(cornerRadius: 12).fill(color).frame(height: 160); ColorPicker("颜色", selection: $color, supportsOpacity: false); Text(hex).font(.title2.monospaced()); HStack { Button("取消", action: close); Button("保存") { save(hex); close() }.keyboardShortcut(.defaultAction) } }.padding(24).frame(width: 360)
+        VStack(spacing: 20) { RoundedRectangle(cornerRadius: 12).fill(color).frame(height: 160); ColorPicker("颜色", selection: $color, supportsOpacity: false); Text(hex).font(.title2.monospaced()); HStack { Button("取消", action: close); Button("保存") { if save(hex) { close() } }.keyboardShortcut(.defaultAction) } }.padding(24).frame(width: 360)
     }
 }
 

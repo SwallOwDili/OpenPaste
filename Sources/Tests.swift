@@ -23,6 +23,25 @@ func runTests() {
     let file = root.appendingPathComponent("history.json")
     let attrs = try! FileManager.default.attributesOfItem(atPath: file.path)
     check((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600, "private file permissions")
+    let preferencesSuiteName = "OpenPaste.StoreIsolationTests.\(UUID().uuidString)"
+    let preferences = UserDefaults(suiteName: preferencesSuiteName)!
+    preferences.removePersistentDomain(forName: preferencesSuiteName)
+    defer { preferences.removePersistentDomain(forName: preferencesSuiteName) }
+    preferences.set(321, forKey: "storageLimitMB")
+    preferences.set(77, forKey: "historyLimit")
+    preferences.set(12, forKey: "retentionDays")
+    preferences.set(false, forKey: "networkPreviews")
+    preferences.set("test.excluded", forKey: "ignoredApps")
+    let preferencesBefore = preferences.persistentDomain(forName: preferencesSuiteName) ?? [:]
+    let injectedDeviceID = UUID().uuidString
+    let configured = Store(root: root.appendingPathComponent("isolated-preferences"), defaults: preferences, deviceID: injectedDeviceID)
+    check(configured.storageLimitMB == 321 && configured.limit == 77 && configured.retentionDays == 12 && !configured.networkPreviews && configured.ignored == "test.excluded", "root-injected Store reads only its explicit configuration")
+    check(configured.deviceIDForPersistence() == injectedDeviceID, "root-injected Store uses its injected sync device identity")
+    configured.ingest(clip("isolated preference save")); configured.limit = 76; configured.ignored = "changed.only.in.memory"; configured.retentionDays = 11; configured.flush()
+    let ephemeralPreferences = Store(ephemeral: true, defaults: preferences, deviceID: UUID().uuidString)
+    ephemeralPreferences.limit = 75; ephemeralPreferences.ignored = "ephemeral.only"; ephemeralPreferences.retentionDays = 10
+    let preferencesAfter = preferences.persistentDomain(forName: preferencesSuiteName) ?? [:]
+    check(NSDictionary(dictionary: preferencesBefore).isEqual(NSDictionary(dictionary: preferencesAfter)), "root-injected and ephemeral Stores leave the explicit defaults domain unchanged")
     store.clearHistory(); check(store.archive.clips.count == 1, "clear keeps pinned clips")
     store.removeBoard(b); check(store.archive.clips[0].boards.isEmpty, "delete board retains item")
     store.limit = 500
@@ -42,9 +61,9 @@ func runTests() {
     pb.clearContents(); pb.setString("ignored secret", forType: .string)
     isolated.ignored = "test"; isolated.captureContents(pb, source: "Test", sourceID: "test")
     check(isolated.archive.clips.count == 1, "excluded app skipped")
-    isolated.ignored = ""; isolated.paused = true; isolated.captureContents(pb, source: "Test", sourceID: "test")
+    isolated.ignored = ""; isolated.setUserPaused(true); isolated.captureContents(pb, source: "Test", sourceID: "test")
     check(isolated.archive.clips.count == 1, "pause prevents recording")
-    isolated.paused = false; pb.clearContents(); pb.setString("https://example.com", forType: .string)
+    isolated.setUserPaused(false); pb.clearContents(); pb.setString("https://example.com", forType: .string)
     isolated.captureContents(pb, source: "Test", sourceID: "test")
     check(isolated.archive.clips[0].kind == "链接", "link classification")
     pb.clearContents(); pb.setData(Data([1, 2, 3]), forType: .png)
@@ -174,7 +193,15 @@ func runShortcutTests() {
     check(GlobalShortcut.standard.valid && GlobalShortcut.standard.label == "⇧⌘V", "default shortcut")
     let bare = GlobalShortcut(keyCode: 9, modifiers: 0, keyName: "V")
     check(!bare.valid, "plain key rejected")
-    check(!GlobalShortcut(keyCode: 9, modifiers: UInt32(cmdKey), keyName: "V").valid, "ordinary command shortcut rejected")
+    check(GlobalShortcut(keyCode: 9, modifiers: UInt32(cmdKey), keyName: "V").valid, "command-only modifier accepted")
+    check(!GlobalShortcut(keyCode: 9, modifiers: UInt32(shiftKey), keyName: "V").valid, "shift-only modifier rejected")
+    for modifiers in [controlKey, optionKey, cmdKey | shiftKey, cmdKey | controlKey] {
+        check(GlobalShortcut(keyCode: 40, modifiers: UInt32(modifiers), keyName: "K").valid, "existing modifier combination remains valid: \(modifiers)")
+    }
+    for keyCode: UInt32 in [53, 55, 56, 59, 128] {
+        check(!GlobalShortcut(keyCode: keyCode, modifiers: UInt32(cmdKey), keyName: "Key").valid, "cancel, modifier and invalid key codes remain rejected: \(keyCode)")
+    }
+    check(!GlobalShortcut(keyCode: 40, modifiers: UInt32(cmdKey | alphaLock), keyName: "K").valid, "unsupported modifier bits rejected")
     let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.control, .option], timestamp: 0, windowNumber: 0, context: nil, characters: "k", charactersIgnoringModifiers: "k", isARepeat: false, keyCode: 40)!
     let parsed = GlobalShortcut.from(event)
     check(parsed.valid && parsed.label == "⌃⌥K" && parsed.keyCode == 40, "record key and modifiers")
@@ -183,6 +210,11 @@ func runShortcutTests() {
     defer { defaults.removePersistentDomain(forName: suite) }
     parsed.save(to: defaults)
     check(GlobalShortcut.load(from: defaults) == parsed, "shortcut persistence")
+    let commandEvent = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: 0, windowNumber: 0, context: nil, characters: "k", charactersIgnoringModifiers: "k", isARepeat: false, keyCode: 40)!
+    let commandShortcut = GlobalShortcut.from(commandEvent)
+    check(commandShortcut.valid && commandShortcut.label == "⌘K" && commandShortcut.modifiers == UInt32(cmdKey), "record Command plus letter without extra modifiers")
+    commandShortcut.save(to: defaults)
+    check(GlobalShortcut.load(from: defaults) == commandShortcut, "Command-only shortcut survives saved configuration reload")
     defaults.set(Data("broken".utf8), forKey: "globalShortcut")
     check(GlobalShortcut.load(from: defaults) == .standard, "invalid saved shortcut falls back")
 }
@@ -211,18 +243,103 @@ func fixtureImage() -> Clip {
     return Clip(source: "Fixture", sourceID: "", kind: "图片", title: "3200 × 2000 测试图片", text: "", parts: [[ClipPart(type: "public.png", data: data)]])
 }
 func runPreviewTests() {
+    runLinkPreviewBoundaryTests()
+    func check(_ value: @autoclosure () -> Bool, _ label: String) {
+        guard value() else { print("FAIL: \(label)"); exit(1) }
+        print("PASS: \(label)")
+    }
+    func wait(_ done: @autoclosure () -> Bool) {
+        let deadline = Date().addingTimeInterval(5)
+        while !done() && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+    }
+    func png(width: Int, height: Int, byte: UInt8) -> Data {
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        memset(rep.bitmapData!, Int32(byte), rep.bytesPerRow * rep.pixelsHigh)
+        return rep.representation(using: .png, properties: [:])!
+    }
+    func imageClip(_ data: Data, id: UUID = UUID()) -> Clip {
+        Clip(id: id, source: "Fixture", sourceID: "", kind: "图片", title: "Preview fixture", text: "", parts: [[ClipPart(type: "public.png", data: data)]])
+    }
+    func dimensions(_ data: Data) -> (Int, Int)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        return (image.width, image.height)
+    }
+
     let clip = fixtureImage()
     let cache = PreviewCache()
     var image: NSImage?
     var completed = false
     cache.load(clip) { image = $0; completed = true }
-    let deadline = Date().addingTimeInterval(5)
-    while !completed && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
-    guard completed, let image = image, image.size.width <= 600, image.size.height <= 600 else { print("FAIL: bounded image preview"); exit(1) }
+    wait(completed)
+    check(completed && image != nil && image!.size.width <= 600 && image!.size.height <= 600, "3200x2000 image is reduced to a 600px preview")
     let decodes = cache.decodeCount
     for _ in 0..<100 { cache.load(clip) { guard $0 != nil else { print("FAIL: preview cache miss"); exit(1) } } }
-    guard cache.decodeCount == decodes else { print("FAIL: navigation decodes image again"); exit(1) }
-    print("PASS: 3200x2000 image reduced to 600px, 100 reuse calls do not decode again")
+    check(cache.decodeCount == decodes, "100 reuse calls do not decode the same content again")
+
+    let originalPNG = png(width: 80, height: 40, byte: 32)
+    let original = imageClip(originalPNG)
+    let rotatedPart = ImageTools.rotated(original)!
+    check(dimensions(originalPNG)?.0 == 80 && dimensions(originalPNG)?.1 == 40 && dimensions(rotatedPart.data)?.0 == 40 && dimensions(rotatedPart.data)?.1 == 80, "real PNG rotation swaps full pixel dimensions")
+
+    let sameID = UUID()
+    let oldPNG = png(width: 90, height: 30, byte: 64)
+    let newPNG = png(width: 25, height: 70, byte: 192)
+    let oldClip = imageClip(oldPNG, id: sameID)
+    let newClip = imageClip(newPNG, id: sameID)
+    let oldStarted = DispatchSemaphore(value: 0)
+    let allowOld = DispatchSemaphore(value: 0)
+    let concurrent = DispatchQueue(label: "openpaste.preview-test", attributes: .concurrent)
+    let racingCache = PreviewCache(queue: concurrent, decoder: { data, url in
+        if data == oldPNG { oldStarted.signal(); allowOld.wait() }
+        return PreviewCache.decode(data: data, fileURL: url)
+    })
+    var requestedVersion = oldClip.fingerprint
+    var displayed: NSImage?
+    var oldFinished = false, newFinished = false
+    racingCache.load(oldClip) { result in
+        oldFinished = true
+        if requestedVersion == oldClip.fingerprint { displayed = result }
+    }
+    check(oldStarted.wait(timeout: .now() + 2) == .success, "old preview decode can remain pending")
+    requestedVersion = newClip.fingerprint
+    racingCache.load(newClip) { result in
+        newFinished = true
+        if requestedVersion == newClip.fingerprint { displayed = result }
+    }
+    wait(newFinished)
+    check(displayed?.size == NSSize(width: 25, height: 70) && racingCache.decodeCount == 2, "same UUID with new content decodes and displays its own version")
+    allowOld.signal(); wait(oldFinished)
+    check(oldFinished && displayed?.size == NSSize(width: 25, height: 70), "late old callback cannot overwrite the requested content version")
+    let raceDecodes = racingCache.decodeCount
+    var cachedNew: NSImage?
+    racingCache.load(newClip) { cachedNew = $0 }
+    check(cachedNew?.size == NSSize(width: 25, height: 70) && racingCache.decodeCount == raceDecodes, "late old decode cannot overwrite the new-version cache entry")
+
+    let store = Store(ephemeral: true)
+    var rotating = original
+    rotating.title = "Original name"
+    store.archive.clips = [rotating]
+    let expectedFingerprint = rotating.fingerprint
+    let boardID = UUID()
+    store.archive.clips[0].title = "Renamed while rotating"
+    store.archive.clips[0].userLabel = "Renamed while rotating"
+    store.archive.clips[0].boards = [boardID]
+    check(store.applyRotatedImage(rotatedPart, to: rotating.id, replacing: expectedFingerprint), "rotation applies when the current image content still matches")
+    let merged = store.archive.clips[0]
+    check(merged.title == "Renamed while rotating" && merged.userLabel == "Renamed while rotating" && merged.boards == [boardID] && dimensions(merged.parts[0][0].data)?.0 == 40, "rotation preserves later name and board changes")
+
+    let deletedStore = Store(ephemeral: true)
+    deletedStore.archive.clips = [original]
+    let deletedFingerprint = original.fingerprint
+    deletedStore.delete(original.id)
+    check(!deletedStore.applyRotatedImage(rotatedPart, to: original.id, replacing: deletedFingerprint) && deletedStore.archive.clips.isEmpty, "late rotation does not resurrect a deleted record")
+
+    let changedStore = Store(ephemeral: true)
+    changedStore.archive.clips = [oldClip]
+    let staleFingerprint = oldClip.fingerprint
+    changedStore.archive.clips[0].parts = newClip.parts
+    changedStore.archive.clips[0].cachedDigest = nil
+    check(!changedStore.applyRotatedImage(ImageTools.rotated(oldClip)!, to: sameID, replacing: staleFingerprint) && changedStore.archive.clips[0].fingerprint == newClip.fingerprint, "late rotation does not replace newer image content")
 }
 
 func runCurrentClipboardTests() {
@@ -265,7 +382,7 @@ func runCurrentClipboardTests() {
     store.captureContents(pb, source: "Screenshot", sourceID: "com.apple.screencaptureui", backgroundImages: true)
     store.flush()
     check(store.currentClipID == imageID && Store(root: root).archive.clips.count == 2, "background screenshot is committed before exit")
-    store.paused = true
+    store.setUserPaused(true)
     pb.clearContents(); pb.setString("Do not store while paused", forType: .string)
     store.capture(force: true, pasteboard: pb)
     check(store.archive.clips.count == 2, "forced current import respects pause")
@@ -373,7 +490,7 @@ func runPasteImportUnitTests() {
         var writeProgress: [ImportProgress] = []
         let newRoot = folder.appendingPathComponent("NewImport")
         try FileManager.default.createDirectory(at: newRoot, withIntermediateDirectories:true)
-        let (imported, importedCount) = try PasteImport.commit(automatic, snapshot: Archive(), root: newRoot, progress: { writeProgress.append($0) })
+        let (imported, importedCount, _) = try PasteImport.commit(automatic, snapshot: Archive(), root: newRoot, progress: { writeProgress.append($0) })
         check(importedCount == 2 && imported.clips.count == 2 && writeProgress.contains { $0.phase == "导入内容" && $0.completed == 1 } && writeProgress.last?.phase == "导入完成", "import progress follows backup, payload writes and final commit")
         let before = try Data(contentsOf: newRoot.appendingPathComponent("history.json"))
         let invalid = folder.appendingPathComponent("not-a-directory"); try Data("blocked".utf8).write(to: invalid)
@@ -392,8 +509,41 @@ func fixtureOCRImage() -> Clip {
 }
 
 func runDragProviderTests() {
-    let clip = fixtureOCRImage()
-    let provider = clip.dragProvider()
+    func bitmap(_ type: NSBitmapImageRep.FileType, properties: [NSBitmapImageRep.PropertyKey: Any] = [:]) -> Data {
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 12, pixelsHigh: 8, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        memset(rep.bitmapData!, 127, rep.bytesPerRow * rep.pixelsHigh)
+        return rep.representation(using: type, properties: properties)!
+    }
+    func imageClip(_ type: String, _ data: Data, _ title: String) -> Clip {
+        Clip(source: "Fixture", sourceID: "fixture", kind: "图片", title: title, text: "", parts: [[ClipPart(type: type, data: data)]])
+    }
+    func verifyFile(_ clip: Clip, type: String, extension expectedExtension: String) {
+        let provider = clip.dragProvider()
+        guard provider.suggestedName?.hasSuffix("." + expectedExtension) == true,
+              provider.registeredTypeIdentifiers.contains(type) else { print("FAIL: \(type) drag declaration"); exit(1) }
+        var completed = false, valid = false
+        provider.loadFileRepresentation(forTypeIdentifier: type) { url, _ in
+            if let url, let data = try? Data(contentsOf: url),
+               data == clip.parts[0][0].data,
+               url.pathExtension.lowercased() == expectedExtension,
+               let source = CGImageSourceCreateWithData(data as CFData, nil),
+               CGImageSourceGetType(source) as String? == type { valid = true }
+            completed = true
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while !completed && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
+        guard completed, valid else { print("FAIL: \(type) drag file bytes, type, or extension"); exit(1) }
+    }
+    let png = imageClip("public.png", bitmap(.png), "PNG fixture")
+    let jpeg = imageClip("public.jpeg", bitmap(.jpeg, properties: [.compressionFactor: 0.8]), "JPEG fixture")
+    let tiff = imageClip("public.tiff", bitmap(.tiff), "TIFF fixture")
+    let history = Store(ephemeral: true); history.archive.clips = [png, jpeg, tiff]
+    let before = history.archive.clips
+    for (clip, type, ext) in [(png, "public.png", "png"), (jpeg, "public.jpeg", "jpg"), (tiff, "public.tiff", "tiff")] { verifyFile(clip, type: type, extension: ext) }
+    guard zip(before, history.archive.clips).allSatisfy({ $0.0.id == $0.1.id && $0.0.parts == $0.1.parts }) else { print("FAIL: drag provider mutated history"); exit(1) }
+
+    let idClip = png
+    let provider = idClip.dragProvider()
     var completed = false
     var identifier: String?
     provider.loadDataRepresentation(forTypeIdentifier: "io.github.SwallOwDili.OpenPaste.clip-id") { data, error in
@@ -402,12 +552,9 @@ func runDragProviderTests() {
     }
     let until = Date().addingTimeInterval(5)
     while !completed && Date() < until { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
-    guard completed, identifier == clip.id.uuidString else { print("FAIL: image drag does not preserve item identifier"); exit(1) }
+    guard completed, identifier == idClip.id.uuidString else { print("FAIL: image drag does not preserve item identifier"); exit(1) }
     print("PASS: image drag resolves original item identifier")
-    completed = false; var fileOK = false
-    provider.loadFileRepresentation(forTypeIdentifier: "public.png") { url, _ in fileOK = url.map { FileManager.default.fileExists(atPath: $0.path) } ?? false; completed = true }
-    let deadline = Date().addingTimeInterval(5)
-    while !completed && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
-    guard completed, fileOK else { print("FAIL: image drag does not provide PNG file"); exit(1) }
-    print("PASS: image drag provides a readable PNG file")
+    let invalid = imageClip("public.png", Data("not an image".utf8), "Invalid fixture").dragProvider()
+    guard invalid.suggestedName?.hasSuffix(".png") != true && !invalid.registeredTypeIdentifiers.contains("public.png") else { print("FAIL: invalid image advertised as PNG"); exit(1) }
+    print("PASS: PNG, JPEG, and TIFF drag files preserve bytes, type, and extension; invalid bytes are not advertised as PNG")
 }

@@ -1,7 +1,10 @@
 import AppKit
 import SwiftUI
 import ApplicationServices
-import Security
+
+// Selection-copy fallback is main-thread only. Tracking its request generation
+// prevents an older canceled callback from disabling a newer fallback.
+private var activeSelectionCaptureGeneration: Int?
 
 struct TranslationFailure: LocalizedError {
     let message: String
@@ -34,37 +37,61 @@ enum TranslationAPI {
 final class TranslationNoRedirect: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
 }
+struct SavedTranslationConfiguration: Equatable {
+    let base: String
+    let model: String
+    let language: String
+    let key: String
+}
+
 final class TranslationConfig: ObservableObject {
     static let shared = TranslationConfig()
-    @Published var enabled = UserDefaults.standard.bool(forKey: "translationEnabled") { didSet { UserDefaults.standard.set(enabled, forKey: "translationEnabled"); if !enabled { Controller.shared?.cancelTranslation() } } }
-    @Published var base = UserDefaults.standard.string(forKey: "translationBase") ?? "https://api.openai.com/v1"
-    @Published var model = UserDefaults.standard.string(forKey: "translationModel") ?? ""
-    @Published var language = UserDefaults.standard.string(forKey: "translationLanguage") ?? "简体中文"
+    @Published var enabled: Bool { didSet { defaults.set(enabled, forKey: "translationEnabled"); if !enabled { Controller.shared?.cancelTranslation() } } }
+    @Published var base: String
+    @Published var model: String
+    @Published var language: String
     @Published var notice = ""
     var revision = 0
-    static var query: [String: Any] { [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "io.github.SwallOwDili.OpenPaste.translation", kSecAttrAccount as String: "api-key"] }
-    func key() -> String {
-        var q = Self.query; q[kSecReturnData as String] = true; q[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        if SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess, let data = result as? Data { return String(data: data, encoding: .utf8) ?? "" }
-        return ""
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = AppEnvironment.current.defaults) {
+        self.defaults = defaults
+        enabled = defaults.bool(forKey: "translationEnabled")
+        base = defaults.string(forKey: "translationBase") ?? "https://api.openai.com/v1"
+        model = defaults.string(forKey: "translationModel") ?? ""
+        language = defaults.string(forKey: "translationLanguage") ?? "简体中文"
     }
-    func save(newKey: String) {
+
+    func key() -> String { defaults.string(forKey: "translationAPIKey") ?? "" }
+    // Published fields are editing drafts; requests always use one saved snapshot.
+    func savedRequestConfiguration() -> SavedTranslationConfiguration {
+        SavedTranslationConfiguration(
+            base: defaults.string(forKey: "translationBase") ?? "https://api.openai.com/v1",
+            model: defaults.string(forKey: "translationModel") ?? "",
+            language: defaults.string(forKey: "translationLanguage") ?? "简体中文",
+            key: key())
+    }
+
+    @discardableResult
+    func save(newKey: String) -> Bool {
+        let suppliedKey = newKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let savedKey = suppliedKey.isEmpty ? key() : suppliedKey
         do {
             _ = try TranslationAPI.endpoint(base)
             guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw TranslationFailure(message: "请填写模型名称") }
-            if !newKey.isEmpty {
-                let status = SecItemUpdate(Self.query as CFDictionary, [kSecValueData as String: Data(newKey.trimmingCharacters(in: .whitespacesAndNewlines).utf8)] as CFDictionary)
-                if status == errSecItemNotFound { var q = Self.query; q[kSecValueData as String] = Data(newKey.trimmingCharacters(in: .whitespacesAndNewlines).utf8); q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly; guard SecItemAdd(q as CFDictionary, nil) == errSecSuccess else { throw TranslationFailure(message: "API Key 无法保存到钥匙串") } }
-                else if status != errSecSuccess { throw TranslationFailure(message: "API Key 无法更新到钥匙串") }
-            }
-            guard !key().isEmpty else { throw TranslationFailure(message: "请填写 API Key") }
-            UserDefaults.standard.set(base, forKey: "translationBase"); UserDefaults.standard.set(model, forKey: "translationModel"); UserDefaults.standard.set(language, forKey: "translationLanguage")
-            revision += 1; Controller.shared?.cancelTranslation(); notice = "配置已保存，API Key 保存在本机钥匙串"
-        } catch { notice = error.localizedDescription }
+            guard !savedKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw TranslationFailure(message: "请填写 API Key") }
+        } catch { notice = error.localizedDescription; return false }
+        revision += 1; Controller.shared?.cancelTranslation()
+        defaults.set(savedKey, forKey: "translationAPIKey")
+        defaults.set(base, forKey: "translationBase")
+        defaults.set(model, forKey: "translationModel")
+        defaults.set(language, forKey: "translationLanguage")
+        notice = "配置已保存"
+        return true
     }
 }
 struct TranslationSettings: View {
+    @ObservedObject var store: Store
     @ObservedObject var config = TranslationConfig.shared
     @Binding var key: String
     private func field<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -74,6 +101,19 @@ struct TranslationSettings: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack { Text("开启快速翻译"); Spacer(); Toggle("开启快速翻译", isOn: $config.enabled).labelsHidden().toggleStyle(.switch) }
             Text("选中文字后呼出，译文自动置顶。按回车取用并替换原选区；取用前不改动原文。").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if config.enabled {
+                HStack {
+                    Label(store.translationSelectionAuthorized ? "读取选中文字：已授权" : "读取选中文字：未授权", systemImage: store.translationSelectionAuthorized ? "checkmark.circle" : "exclamationmark.circle")
+                        .font(.caption).foregroundStyle(store.translationSelectionAuthorized ? Color.green : Color.orange)
+                    Spacer()
+                    if !store.translationSelectionAuthorized {
+                        Button("打开辅助功能设置…") { Controller.shared.requestAccessibility() }
+                    }
+                }
+                if !store.translationSelectionAuthorized {
+                    Text("快速翻译需要辅助功能权限读取选中文字；未授权时仍可使用剪贴板历史。").font(.caption).foregroundStyle(.secondary)
+                }
+            }
             Divider()
             VStack(spacing: 14) {
                 field("Base URL") { TextField("https://api.openai.com/v1", text: $config.base).textFieldStyle(.roundedBorder) }
@@ -82,9 +122,9 @@ struct TranslationSettings: View {
                 field("目标语言") { TextField("简体中文、英文或其他语言", text: $config.language).textFieldStyle(.roundedBorder) }
             }.disabled(!config.enabled)
             HStack {
-                Label("密钥保存在 macOS 钥匙串", systemImage: "lock.shield").font(.caption).foregroundStyle(.secondary)
+                Label("密钥与其他设置一同保存在本机", systemImage: "doc.text").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("保存配置") { config.save(newKey: key); key = "" }.buttonStyle(.borderedProminent).disabled(!config.enabled)
+                Button("保存配置") { if config.save(newKey: key) { key = "" } }.buttonStyle(.borderedProminent).disabled(!config.enabled)
             }
             if !config.notice.isEmpty { Label(config.notice, systemImage: config.notice.hasPrefix("配置已保存") ? "checkmark.circle.fill" : "exclamationmark.circle").font(.caption).foregroundStyle(config.notice.hasPrefix("配置已保存") ? Color.green : Color.orange).fixedSize(horizontal: false, vertical: true) }
         }
@@ -116,72 +156,153 @@ extension Controller {
         return (nil, false)
     }
     @objc func show() {
+        guard prepareShelfPresentation({ [weak self] in self?.show() }) else { return }
         cancelTranslation(); store.translationStatus = ""
-        let config = TranslationConfig.shared
-        let workflowFixture = CommandLine.arguments.contains("--translation-workflow-test")
+        let config = translationConfig
+        let workflowFixture = TestMode.translationWorkflow
         guard (config.enabled || workflowFixture), (!preview || workflowFixture), let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { showShelf(); return }
         target = app; lastExternalApp = app
         guard !store.ignored.components(separatedBy: .newlines).map({ $0.trimmingCharacters(in: .whitespaces) }).contains(app.bundleIdentifier ?? "") else { showShelf(); store.translationStatus = "当前应用已排除，不执行翻译"; return }
-        guard AXIsProcessTrusted() else { showShelf(); store.translationStatus = "快速翻译需要辅助功能权限以读取选中文字"; return }
+        let selectionAuthorized = AXIsProcessTrusted()
+        store.translationSelectionAuthorized = selectionAuthorized
+        guard selectionAuthorized else { refreshPermission(); showShelf(); return }
         let (text, noSelection) = selectedText(in: app)
         if let text { showShelf(); translateSelection(text); return }
         if noSelection { showShelf(); return }
         // Apps without selected-text accessibility support: copy selection, then restore all original clipboard types.
         let pb = NSPasteboard.general
-        let original = (pb.pasteboardItems ?? []).map { item in item.types.compactMap { type in item.data(forType: type).map { ClipPart(type: type.rawValue, data: $0) } } }
-        let before = pb.changeCount; let generation = translationGeneration
+        guard let original = ClipboardWrite.snapshot(pb) else {
+            showShelf(); store.translationStatus = "当前剪贴板无法完整暂存，已取消翻译"; return
+        }
+        let before = original.changeCount; let generation = translationGeneration
+        activeSelectionCaptureGeneration = generation
         store.selectionCaptureActive = true
         let down = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: true); let up = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: false)
         down?.flags = .maskCommand; up?.flags = .maskCommand; down?.post(tap: .cghidEventTap); up?.post(tap: .cghidEventTap)
+        func endSelectionCapture() {
+            guard activeSelectionCaptureGeneration == generation else { return }
+            activeSelectionCaptureGeneration = nil
+            self.store.selectionCaptureActive = false
+        }
+        func suppressCurrentCapture() {
+            let current = pb.changeCount
+            self.store.change = current
+            self.store.deletedCurrentChange = current
+            self.store.deletedCurrentID = nil
+        }
+        func failSelectionCapture(_ message: String) {
+            guard generation == self.translationGeneration, activeSelectionCaptureGeneration == generation else { return }
+            // Do not let the shelf's forced capture turn our synthetic Command-C
+            // payload into a history item after a canceled fallback.
+            if pb.changeCount != before { suppressCurrentCapture() }
+            self.showShelf(); self.store.translationStatus = message
+            endSelectionCapture()
+        }
         func finish(_ attempt: Int) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                if pb.changeCount == before, attempt < 10 { finish(attempt + 1); return }
-                let copied = pb.changeCount != before ? pb.string(forType: .string) : nil
-                let confidential = pb.types?.contains(where: { $0.rawValue.contains("Concealed") || $0.rawValue.contains("confidential") || $0.rawValue.contains("Transient") }) == true
-                if pb.changeCount != before {
-                    let items = original.map { parts in let item = NSPasteboardItem(); for part in parts { item.setData(part.data, forType: NSPasteboard.PasteboardType(part.type)) }; return item }
-                    pb.clearContents(); _ = pb.writeObjects(items); self.store.change = pb.changeCount
+                guard generation == self.translationGeneration else {
+                    // Once canceled, the current board may be our synthetic copy or a
+                    // newer external copy. Never overwrite it; suppress this one count
+                    // so the synthetic payload cannot enter history.
+                    if activeSelectionCaptureGeneration == generation {
+                        if pb.changeCount != before { suppressCurrentCapture() }
+                        endSelectionCapture()
+                    }
+                    return
                 }
-                self.store.selectionCaptureActive = false
-                guard generation == self.translationGeneration else { return }
+                if pb.changeCount == before, attempt < 10 { finish(attempt + 1); return }
+                guard pb.changeCount != before else { failSelectionCapture(""); return }
+                guard !app.isTerminated,
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+                      self.target?.processIdentifier == app.processIdentifier else {
+                    failSelectionCapture("目标应用已切换，已取消翻译并保留当前剪贴板")
+                    return
+                }
+                let copiedChangeCount = pb.changeCount
+                let copied = pb.string(forType: .string)
+                let confidential = pb.types?.contains(where: { $0.rawValue.contains("Concealed") || $0.rawValue.contains("confidential") || $0.rawValue.contains("Transient") }) == true
+                guard pb.changeCount == copiedChangeCount else {
+                    failSelectionCapture("剪贴板已被其他内容更新，已取消翻译")
+                    return
+                }
+                guard generation == self.translationGeneration else {
+                    suppressCurrentCapture(); endSelectionCapture(); return
+                }
+                guard !app.isTerminated,
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+                      self.target?.processIdentifier == app.processIdentifier else {
+                    failSelectionCapture("目标应用已切换，已取消翻译并保留当前剪贴板")
+                    return
+                }
+                let restoration = ClipboardWrite.restore(original, to: pb, expectedChangeCount: copiedChangeCount)
+                guard restoration == .written else {
+                    if restoration == .superseded {
+                        let owner = NSWorkspace.shared.frontmostApplication
+                        self.store.selectionCaptureActive = false
+                        self.store.capture(pasteboard: pb, sourceOverride: ClipboardCaptureSource(name: owner?.localizedName ?? "未知应用", bundleID: owner?.bundleIdentifier ?? ""))
+                        self.store.selectionCaptureActive = activeSelectionCaptureGeneration == generation
+                    } else {
+                        suppressCurrentCapture()
+                    }
+                    self.showShelf()
+                    self.store.translationStatus = restoration == .superseded
+                        ? "剪贴板已被其他内容更新，已取消翻译"
+                        : "无法安全恢复原剪贴板，已取消翻译"
+                    endSelectionCapture()
+                    return
+                }
+                self.store.recordRestoredClipboardChange(from: before, pasteboard: pb)
+                guard generation == self.translationGeneration else { endSelectionCapture(); return }
                 self.showShelf()
+                endSelectionCapture()
                 if !confidential, let copied, !copied.isEmpty { self.translateSelection(copied) }
-                else { self.store.translationStatus = "没有读取到可翻译的选中文字" }
             }
         }
         finish(0)
     }
     func translateSelection(_ text: String) {
-        let config = TranslationConfig.shared
-        let request: URLRequest
-        let fixture = CommandLine.arguments.contains("--translation-ui-test") || CommandLine.arguments.contains("--translation-workflow-test")
-        do { if fixture { request = try TranslationAPI.request(base: "http://127.0.0.1:18767/v1", key: "fixture-key", model: "fixture-model", language: "简体中文", text: text) } else { request = try TranslationAPI.request(base: UserDefaults.standard.string(forKey: "translationBase") ?? config.base, key: config.key(), model: UserDefaults.standard.string(forKey: "translationModel") ?? config.model, language: UserDefaults.standard.string(forKey: "translationLanguage") ?? config.language, text: text) } }
-        catch { store.translationStatus = error.localizedDescription; return }
+        let config = translationConfig
+        let fixture = TestMode.translationUI || TestMode.translationWorkflow
         let generation = translationGeneration; let revision = config.revision
+        var saved = config.savedRequestConfiguration()
+        #if OPENPASTE_TESTING
+        if fixture { saved = SavedTranslationConfiguration(base: "http://127.0.0.1:18767/v1", model: "fixture-model", language: "简体中文", key: "fixture-key") }
+        #endif
+        let base = saved.base, model = saved.model, language = saved.language
         store.translating = true; store.translationStatus = "正在翻译选中文字…"
-        let configuration = URLSessionConfiguration.ephemeral; configuration.timeoutIntervalForResource = 65
-        let session = URLSession(configuration: configuration, delegate: TranslationNoRedirect(), delegateQueue: nil)
-        translationTask = session.dataTask(with: request) { data, response, error in
-            session.finishTasksAndInvalidate()
-            let result: Result<String, Error>
-            if let error { result = .failure(TranslationFailure(message: (error as NSError).code == NSURLErrorTimedOut ? "翻译超时，请稍后重试" : "无法连接翻译服务，请检查地址和网络")) }
-            else { result = Result { try TranslationAPI.result(data ?? Data(), status: (response as? HTTPURLResponse)?.statusCode ?? 0) } }
-            DispatchQueue.main.async {
-                guard generation == self.translationGeneration, revision == config.revision, (config.enabled || fixture), self.panel.isVisible else { return }
-                self.store.translating = false; self.translationTask = nil
-                switch result {
-                case .failure(let error): self.store.translationStatus = error.localizedDescription
-                case .success(let translated):
-                    let clip = Clip(created: max(Date(), self.store.archive.clips.first?.created.addingTimeInterval(0.01) ?? Date()), source: "快速翻译", sourceID: "io.github.SwallOwDili.OpenPaste", kind: "文字", title: "翻译 · \(config.language)", text: translated, parts: [[ClipPart(type: "public.utf8-plain-text", data: Data(translated.utf8))]])
-                    self.store.board = nil; self.store.kind = "全部"; self.store.sourceFilter = "全部来源"; self.store.todayOnly = false; self.store.dateRangeEnabled = false; self.store.reverseHistory = false; self.store.query = ""
-                    if let id = self.store.ingest(clip) { UsageAnalytics.shared.record(.translationCompleted); self.store.selection.removeAll(); self.store.selected = id; self.store.translationStatus = "翻译完成 · ↵ 替换选中原文" }
-                    else { self.store.translationStatus = "译文无法保存：\(self.store.message)" }
+        func beginRequest(_ keyResult: Result<String, Error>) {
+            guard generation == self.translationGeneration, revision == config.revision,
+                  (config.enabled || fixture), self.panel.isVisible else { return }
+            let request: URLRequest
+            do { request = try TranslationAPI.request(base: base, key: keyResult.get(), model: model, language: language, text: text) }
+            catch { self.store.translating = false; self.store.translationStatus = error.localizedDescription; return }
+            let configuration = URLSessionConfiguration.ephemeral; configuration.timeoutIntervalForResource = 65
+            let session = URLSession(configuration: configuration, delegate: TranslationNoRedirect(), delegateQueue: nil)
+            self.translationTask = session.dataTask(with: request) { data, response, error in
+                session.finishTasksAndInvalidate()
+                let result: Result<String, Error>
+                if let error { result = .failure(TranslationFailure(message: (error as NSError).code == NSURLErrorTimedOut ? "翻译超时，请稍后重试" : "无法连接翻译服务，请检查地址和网络")) }
+                else { result = Result { try TranslationAPI.result(data ?? Data(), status: (response as? HTTPURLResponse)?.statusCode ?? 0) } }
+                DispatchQueue.main.async {
+                    guard generation == self.translationGeneration, revision == config.revision, (config.enabled || fixture), self.panel.isVisible else { return }
+                    self.store.translating = false; self.translationTask = nil
+                    switch result {
+                    case .failure(let error): self.store.translationStatus = error.localizedDescription
+                    case .success(let translated):
+                        let clip = Clip(created: max(Date(), self.store.archive.clips.first?.created.addingTimeInterval(0.01) ?? Date()), source: "快速翻译", sourceID: "io.github.SwallOwDili.OpenPaste", kind: "文字", title: "翻译 · \(language)", text: translated, parts: [[ClipPart(type: "public.utf8-plain-text", data: Data(translated.utf8))]])
+                        self.store.resetFilters(); self.store.reverseHistory = false
+                        if let id = self.store.ingest(clip) { UsageAnalytics.shared.record(.translationCompleted); self.store.selection.removeAll(); self.store.selected = id; self.store.translationStatus = "翻译完成 · ↵ 替换选中原文" }
+                        else { self.store.translationStatus = "译文无法保存：\(self.store.message)" }
+                    }
                 }
             }
-        }; translationTask?.resume()
+            self.translationTask?.resume()
+        }
+        beginRequest(.success(saved.key))
     }
 }
 
+#if OPENPASTE_TESTING
 func runTranslationTests() {
     func check(_ value: @autoclosure () -> Bool, _ label: String) { guard value() else { print("FAIL: \(label)"); exit(1) }; print("PASS: \(label)") }
     check((try? TranslationAPI.endpoint("https://example.com"))?.path == "/v1/chat/completions", "base origin adds v1 endpoint")
@@ -228,3 +349,5 @@ func runTranslationTests() {
     session.invalidateAndCancel()
     print("Translation tests passed")
 }
+
+#endif
