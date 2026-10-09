@@ -33,6 +33,8 @@ OPENPASTE_ACCEPTANCE_ROOT="$PWD/build/acceptance/$profile" \
   build/OpenPaste.app/Contents/MacOS/OpenPaste --acceptance-profile "$profile"
 ```
 
+验收实例的启动方式有两条限制，2026-10-09 实测：一是不能用 `open` 启动，隔离校验要求当前工作目录为仓库根（`build/acceptance/<uuid>` 的上级），`open` 启动的工作目录是 `/`，进程会在启动时断言终止；二是从 shell 或代理工具直接运行二进制时，系统可能把辅助功能与按键事件权限算到启动者头上，表现为“权限未生效”、取用后只复制不粘贴。需要验证直接粘贴时，用 `Tests/Support/SpawnDisclaimed.swift` 编译出的启动器脱离责任进程：`swiftc -O Tests/Support/SpawnDisclaimed.swift -o build/acceptance-tools/spawn-disclaimed`，再在仓库根执行 `OPENPASTE_ACCEPTANCE_ROOT="$PWD/build/acceptance/$profile" build/acceptance-tools/spawn-disclaimed "$PWD/<App 路径>/Contents/MacOS/OpenPaste" --acceptance-profile "$profile"`，使 OpenPaste 以自己的签名身份取得已有授权。验收期间候选会记录系统里的任何复制，数据目录含操作痕迹，只留在本机。
+
 同一 profile 重启会保留验收历史与设置；新 UUID 表示新安装。该模式仍运行真实捕获与保存流程，但使用专用数据与偏好配置，关闭统计和个人 Paste 数据自动发现。不要在验收实例中填写真实 Key。粘贴目标只有在启动时取得完整剪贴板快照、退出时剪贴板仍保持该目标最后一次写入的修订时，才会尝试写回启动前内容；快照不完整或测试期间有其他进程复制新内容时保留当前剪贴板。无论是否尝试恢复，退出后都须核对实际剪贴板状态。
 
 验收模式日志中的 `next-turn-ms` 是同步操作到下一次主队列执行的耗时，拆成 `sync-ms` 与 `queue-ms`；`main-loop max-delay-ms` 是每 5 秒窗口内 20 ms 定时器的最大迟到，`max-turn-ms` 是主循环从唤醒到再次等待的最长时间，另记发生时间与 RunLoop mode。定时器迟到不一定表示应用代码阻塞；长主循环也可能包含 AppKit、系统文件提供者或桌面工具操作，需结合调用栈定位。上述指标都不是精确屏幕绘制延迟。超过 100 ms 的交互停顿需定位并复测，磁盘/网络长任务另记总耗时，不能阻塞核心操作。启动单独记录 `launch.store-init`、`launch.panel-host` 与 `launch.delegate-tail-ms`，不得把冷启动和热操作混算。
