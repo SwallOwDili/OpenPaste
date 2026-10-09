@@ -14,10 +14,10 @@ struct SyncSnapshot {
     var index: SyncIndex
 }
 enum DataDirectory {
-    static var defaultRoot: URL { FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("OpenPaste", isDirectory: true) }
-    static var deviceID: String {
-        if let id = UserDefaults.standard.string(forKey: "dataDeviceID"), UUID(uuidString: id) != nil { return id }
-        let id = UUID().uuidString; UserDefaults.standard.set(id, forKey: "dataDeviceID"); return id
+    static var defaultRoot: URL { AppEnvironment.current.defaultDataRoot }
+    static func deviceID(defaults: UserDefaults) -> String {
+        if let id = defaults.string(forKey: "dataDeviceID"), UUID(uuidString: id) != nil { return id }
+        let id = UUID().uuidString; defaults.set(id, forKey: "dataDeviceID"); return id
     }
     static func isCloud(_ root: URL) -> Bool {
         let cloud = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Mobile Documents").path + "/"
@@ -137,7 +137,9 @@ enum DataDirectory {
         return next
     }
     static func load(_ root: URL) throws -> SyncSnapshot {
-        let files = try manifests(root)
+        try load(root, manifestFiles: manifests(root))
+    }
+    private static func load(_ root: URL, manifestFiles files: [URL]) throws -> SyncSnapshot {
         if files.isEmpty {
             let url = root.appendingPathComponent("history.json")
             try ready(url)
@@ -159,16 +161,34 @@ enum DataDirectory {
         }
         return snapshot
     }
+    static func loadRecoveryTarget(_ root: URL) throws -> SyncSnapshot {
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory)
+        if exists, !isDirectory.boolValue { throw PasteImport.failure("目标路径不是文件夹") }
+        var snapshot: SyncSnapshot
+        if exists {
+            let files = try manifests(root)
+            snapshot = try load(root, manifestFiles: files)
+        } else {
+            snapshot = baseline(Archive())
+        }
+        if let cached = try cached(root) { snapshot = merge(snapshot, cached) }
+        return snapshot
+    }
     static func write(_ snapshot: SyncSnapshot, root: URL, device: String, progress: ((ImportProgress) -> Void)? = nil) throws {
         let url = root.appendingPathComponent("device-\(device).json")
         try coordinated(url, writing: true) { path in try HistoryStorage.write(snapshot.archive, to: path, phase: "保存同步历史", progress: progress, sync: snapshot.index) }
     }
-    static func migrate(_ archive: Archive, from source: URL, to destination: URL, device: String, progress: ((ImportProgress) -> Void)? = nil) throws -> SyncSnapshot {
-        let source = source.standardizedFileURL.resolvingSymlinksInPath(), destination = destination.standardizedFileURL.resolvingSymlinksInPath()
+    static func migrate(_ archive: Archive, from source: URL, to destination: URL, device: @autoclosure () -> String, environment: AppEnvironment = .current, destinationIsCloud: Bool? = nil, manifestEnumerator: (URL) throws -> [URL] = DataDirectory.manifests, progress: ((ImportProgress) -> Void)? = nil) throws -> SyncSnapshot {
+        let source = try environment.validateDataRoot(source).standardizedFileURL.resolvingSymlinksInPath()
+        let destination = try environment.validateDataRoot(destination).standardizedFileURL.resolvingSymlinksInPath()
         guard destination.path != source.path, !destination.path.hasPrefix(source.path + "/"), !source.path.hasPrefix(destination.path + "/") else { throw PasteImport.failure("请选择独立的数据文件夹，不能使用当前目录或它的上级、子目录") }
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        _ = try environment.validateDataRoot(destination)
+        let cloudDestination = destinationIsCloud ?? isCloud(destination)
         var existing = try load(destination)
-        if usesSync(destination), let cached = try cached(destination) { existing = merge(existing, cached) }
+        let files = try manifestEnumerator(destination)
+        if (cloudDestination || !files.isEmpty), let cached = try cached(destination) { existing = merge(existing, cached) }
         let local = changes(archive, from: baseline(Archive()))
         let merged = merge(existing, local)
         // The source remains a complete backup; also snapshot destination before changing it.
@@ -179,9 +199,8 @@ enum DataDirectory {
         try HistoryStorage.write(merged.archive, to: stagingManifest, phase: "迁移历史与附件", progress: progress, sync: merged.index)
         let verified = try HistoryStorage.read(from: stagingManifest)
         guard verified.clips.count == merged.archive.clips.count else { throw PasteImport.failure("迁移校验失败") }
-        let files = try manifests(destination)
-        let shared = isCloud(destination) || !files.isEmpty
-        if shared { try write(merged, root: destination, device: device); try cache(merged, root: destination) }
+        let shared = cloudDestination || !files.isEmpty
+        if shared { try write(merged, root: destination, device: device()); try cache(merged, root: destination) }
         else { try coordinated(history, writing: true) { path in try HistoryStorage.write(merged.archive, to: path) } }
         return SyncSnapshot(archive: verified, index: merged.index)
     }
@@ -195,47 +214,85 @@ extension Store {
         picker.canChooseDirectories = true; picker.canChooseFiles = false; picker.canCreateDirectories = true; picker.allowsMultipleSelection = false; picker.directoryURL = root
         if let parent = Controller.shared.settingsWindow { picker.beginSheetModal(for: parent) { response in if response == .OK, let url = picker.url { self.changeDataDirectory(to: url) } } }
     }
-    func changeDataDirectory(to destination: URL) {
+    func changeDataDirectory(to destination: URL, environment: AppEnvironment = .current) {
         guard !ephemeral, !changingDataDirectory, !importingPaste else { return }
+        let validatedDestination: URL
+        do {
+            validatedDestination = try environment.validateDataRoot(destination).standardizedFileURL.resolvingSymlinksInPath()
+            let source = try environment.validateDataRoot(root).standardizedFileURL.resolvingSymlinksInPath()
+            guard validatedDestination.path != source.path,
+                  !validatedDestination.path.hasPrefix(source.path + "/"),
+                  !source.path.hasPrefix(validatedDestination.path + "/") else {
+                throw PasteImport.failure("请选择独立的数据文件夹，不能使用当前目录或它的上级、子目录")
+            }
+        }
+        catch { directoryStatus = "切换失败：\(error.localizedDescription)。仍使用原目录。"; return }
+        let recoveringFromLoadFailure = hasHistoryLoadFailure
         // Finish capture while recording still has its previous state; then freeze migration.
         captureQueue.sync {}
         finishDirectoryCapture()
+        invalidatePendingStorageCallbacks()
+        let operationGeneration = directoryMutation
         changingDataDirectory = true
-        let wasPaused = paused; paused = true
-        directoryStatus = "正在迁移，原目录会保留…"
-        directoryProgress = ImportProgress(phase: "准备迁移", completed: 0, total: archive.clips.count)
-        let snapshot = archive, source = root, device = DataDirectory.deviceID
+        beginTemporaryPause()
+        directoryStatus = recoveringFromLoadFailure ? "正在读取目标目录，损坏的原目录不会迁移…" : "正在迁移，原目录会保留…"
+        directoryProgress = ImportProgress(phase: recoveringFromLoadFailure ? "读取目标目录" : "准备迁移", completed: 0, total: recoveringFromLoadFailure ? 0 : archive.clips.count)
+        let snapshot = archive, source = root
         persistenceQueue.async {
-            let result = Result { try DataDirectory.migrate(snapshot, from: source, to: destination, device: device) { progress in DispatchQueue.main.async { self.directoryProgress = progress } } }
+            let result = Result { () throws -> (SyncSnapshot, Bool) in
+                let destinationIsCloud = DataDirectory.isCloud(validatedDestination)
+                if recoveringFromLoadFailure {
+                    return (try DataDirectory.loadRecoveryTarget(validatedDestination), destinationIsCloud)
+                }
+                return (try DataDirectory.migrate(snapshot, from: source, to: validatedDestination, device: self.deviceIDForPersistence(), environment: environment, destinationIsCloud: destinationIsCloud, progress: { progress in
+                    DispatchQueue.main.async {
+                        guard self.root.standardizedFileURL == source.standardizedFileURL,
+                              self.directoryMutation == operationGeneration,
+                              self.changingDataDirectory else { return }
+                        self.directoryProgress = progress
+                    }
+                }), destinationIsCloud)
+            }
             DispatchQueue.main.async {
+                guard self.root.standardizedFileURL == source.standardizedFileURL,
+                      self.directoryMutation == operationGeneration,
+                      self.changingDataDirectory else { return }
+                var completedRecovery = false
                 switch result {
-                case .success(let migrated):
-                    self.root = destination.standardizedFileURL
+                case .success(let (migrated, destinationIsCloud)):
+                    self.root = validatedDestination.standardizedFileURL
                     self.syncBaseline = migrated
                     self.syncStamp = ""
-                    self.installImportedArchive(migrated.archive)
-                    if self.usePreferences { UserDefaults.standard.set(self.root.path, forKey: "dataDirectory") }
-                    self.directoryStatus = "目录已切换，原目录保留为备份。" + (DataDirectory.isCloud(self.root) ? " iCloud 上传与下载由系统完成。" : "")
-                    self.message = self.storageDescription
+                    if recoveringFromLoadFailure { self.installLoadedArchive(migrated.archive) }
+                    else { self.installImportedArchive(migrated.archive) }
+                    self.persistSelectedDataRoot()
+                    self.initialDirectoryLoadFailed = false
+                    self.directoryStatus = (recoveringFromLoadFailure ? "目录已切换；未迁移读取失败的原目录。" : "目录已切换，原目录保留为备份。") + (destinationIsCloud ? " iCloud 上传与下载由系统完成。" : "")
+                    self.message = destinationIsCloud ? "由 iCloud Drive 同步" : "保存在所选目录"
+                    self.setRecordingLoadFailure(nil)
+                    self.setRecordingSaveFailure(nil)
+                    completedRecovery = recoveringFromLoadFailure
                 case .failure(let error): self.directoryStatus = "切换失败：\(error.localizedDescription)。仍使用原目录。"
                 }
-                self.changingDataDirectory = false; self.paused = wasPaused
-                self.save()
+                self.changingDataDirectory = false; self.endTemporaryPause()
+                if completedRecovery { self.resumeDeferredInitialStart() }
+                else if !recoveringFromLoadFailure { self.save() }
             }
         }
     }
-    func pollDirectory() {
-        guard !ephemeral, !changingDataDirectory, !importingPaste, !syncChecking, DataDirectory.usesSync(root) else { return }
+    func pollDirectory(usesSync: @escaping (URL) -> Bool = DataDirectory.usesSync) {
+        guard !ephemeral, !changingDataDirectory, !importingPaste, !syncChecking else { return }
         syncChecking = true
         let folder = root, local = archive, baseline = syncBaseline, generation = directoryMutation
         let previousStamp = syncStamp, retry = directoryStatus.hasPrefix("等待同步")
         persistenceQueue.async {
             let result = Result { () throws -> (SyncSnapshot, String)? in
+                guard usesSync(folder) else { return nil }
                 let stamp = try DataDirectory.stamp(folder)
                 if stamp == previousStamp && !retry { return nil }
                 let remote = try DataDirectory.load(folder)
                 let merged = DataDirectory.merge(remote, DataDirectory.changes(local, from: baseline))
-                if merged.index.clips != remote.index.clips || merged.index.boards != remote.index.boards { try DataDirectory.write(merged, root: folder, device: DataDirectory.deviceID) }
+                if merged.index.clips != remote.index.clips || merged.index.boards != remote.index.boards { try DataDirectory.write(merged, root: folder, device: self.deviceIDForPersistence()) }
                 try DataDirectory.cache(merged, root: folder)
                 return (merged, try DataDirectory.stamp(folder))
             }
@@ -245,23 +302,30 @@ extension Store {
                 switch result {
                 case .success(let update):
                     if let (snapshot, stamp) = update {
-                        self.syncBaseline = snapshot; self.archive = snapshot.archive; self.syncStamp = stamp
+                        self.syncBaseline = snapshot; self.syncStamp = stamp
                         if self.initialDirectoryLoadFailed {
-                            self.installImportedArchive(snapshot.archive)
-                            self.initialDirectoryLoadFailed = false; self.paused = false
+                            self.installLoadedArchive(snapshot.archive)
+                            self.initialDirectoryLoadFailed = false; self.setRecordingLoadFailure(nil)
+                            self.message = self.storageDescription
+                            self.resumeDeferredInitialStart()
+                        } else {
+                            self.archive = snapshot.archive; self.discardMissingQueueItems()
                         }
                         self.directoryStatus = "已读取 iCloud 历史；上传与下载由系统完成。"
                     }
-                case .failure(let error): self.directoryStatus = "等待同步：\(error.localizedDescription)"
+                case .failure(let error):
+                    self.directoryStatus = "等待同步：\(error.localizedDescription)"
+                    if self.initialDirectoryLoadFailed { self.setRecordingLoadFailure(error.localizedDescription) }
                 }
             }
         }
     }
 }
 
+#if OPENPASTE_TESTING
 func runDataDirectoryTests() {
     let fm = FileManager.default
-    let sandbox = fm.temporaryDirectory.appendingPathComponent("OpenPaste-directory-tests-\(UUID())")
+    let sandbox = fm.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("OpenPaste-directory-tests-\(UUID())")
     defer { try? fm.removeItem(at: sandbox) }
     var passed = 0
     func check(_ condition: Bool, _ label: String) {
@@ -285,6 +349,24 @@ func runDataDirectoryTests() {
         try fm.createDirectory(at: broken, withIntermediateDirectories: true)
         try Data("invalid json".utf8).write(to: broken.appendingPathComponent("history.json"))
         do { _ = try DataDirectory.migrate(migrated.archive, from: source, to: broken, device: "A"); check(false, "失败不切换") } catch { check(try HistoryStorage.read(from: source.appendingPathComponent("history.json")).clips.count == 1, "目标损坏时原历史仍完好") }
+        let enumerationFailureTarget = sandbox.appendingPathComponent("enumeration-failure")
+        let enumerationTargetClip = clip("枚举失败时必须保留")
+        let enumerationManifest = enumerationFailureTarget.appendingPathComponent("history.json")
+        try HistoryStorage.write(Archive(clips: [enumerationTargetClip]), to: enumerationManifest)
+        let enumerationFilesBefore = try fm.subpathsOfDirectory(atPath: enumerationFailureTarget.path).sorted()
+        let enumerationManifestHash = HistoryStorage.digest(try Data(contentsOf: enumerationManifest))
+        do {
+            _ = try DataDirectory.migrate(Archive(clips: [a]), from: source, to: enumerationFailureTarget, device: "A", manifestEnumerator: { _ in
+                throw PasteImport.failure("fixture manifest enumeration failed")
+            })
+            check(false, "缓存判定枚举错误必须抛出")
+        } catch {
+            check(error.localizedDescription.contains("fixture manifest enumeration failed"), "缓存判定不吞瞬时枚举错误")
+        }
+        let enumerationFilesAfter = try fm.subpathsOfDirectory(atPath: enumerationFailureTarget.path).sorted()
+        let enumerationManifestHashAfter = HistoryStorage.digest(try Data(contentsOf: enumerationManifest))
+        check(enumerationManifestHashAfter == enumerationManifestHash && enumerationFilesAfter == enumerationFilesBefore,
+              "枚举错误发生在写入前且保留目标目录原文件")
         let shared = sandbox.appendingPathComponent("shared")
         try fm.createDirectory(at: shared, withIntermediateDirectories: true)
         let empty = DataDirectory.baseline(Archive())
@@ -296,6 +378,15 @@ func runDataDirectoryTests() {
         try DataDirectory.write(deviceB, root: shared, device: "B")
         let both = try DataDirectory.load(shared)
         check(both.archive.clips.count == 2 && both.archive.boards.count == 1, "两台设备独立索引合并历史与收藏")
+        let cacheMergeTarget = sandbox.appendingPathComponent("migration-cache-merge")
+        let cacheTargetClip = clip("目标同步历史")
+        let cachedTargetClip = clip("目标缓存历史")
+        try DataDirectory.write(DataDirectory.changes(Archive(clips: [cacheTargetClip]), from: empty, at: 12), root: cacheMergeTarget, device: "target")
+        try DataDirectory.cache(DataDirectory.changes(Archive(clips: [cachedTargetClip]), from: empty, at: 13), root: cacheMergeTarget)
+        defer { try? fm.removeItem(at: DataDirectory.cacheURL(cacheMergeTarget).deletingLastPathComponent()) }
+        let cacheMergedMigration = try DataDirectory.migrate(Archive(clips: [a]), from: source, to: cacheMergeTarget, device: "migrating")
+        check(Set(cacheMergedMigration.archive.clips.map(\.id)) == Set([a.id, cacheTargetClip.id, cachedTargetClip.id]),
+              "迁移保留并合并目标同步历史与本地缓存")
         let deleted = DataDirectory.changes(Archive(clips: [b], boards: []), from: both, at: 20)
         try DataDirectory.write(deleted, root: shared, device: "A")
         let afterDelete = try DataDirectory.load(shared)
@@ -333,6 +424,50 @@ func runDataDirectoryTests() {
         while migratingStore.changingDataDirectory && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
         migratingStore.flush()
         check(migratingStore.root.path == newRoot.path && migratingStore.directoryStatus.hasPrefix("切换失败"), "Store 迁移失败恢复原目录与状态")
+        let pollRoot = sandbox.appendingPathComponent("poll-local")
+        let pollStore = Store(root: pollRoot)
+        let pollStarted = DispatchSemaphore(value: 0), releasePoll = DispatchSemaphore(value: 0)
+        let pollLock = NSLock()
+        var pollCalls = 0, pollRanOffMain = true, coalescedProbeCalls = 0
+        let pollContentsBefore = try fm.subpathsOfDirectory(atPath: pollRoot.path)
+        let pollBegan = ProcessInfo.processInfo.systemUptime
+        pollStore.pollDirectory(usesSync: { _ in
+            pollLock.lock(); pollCalls += 1; pollRanOffMain = pollRanOffMain && !Thread.isMainThread; pollLock.unlock()
+            pollStarted.signal(); releasePoll.wait()
+            return false
+        })
+        check(ProcessInfo.processInfo.systemUptime - pollBegan < 0.05, "目录同步判定不阻塞主线程")
+        check(pollStarted.wait(timeout: .now() + 1) == .success, "目录同步判定进入持久化后台队列")
+        pollStore.pollDirectory(usesSync: { _ in pollLock.lock(); coalescedProbeCalls += 1; pollLock.unlock(); return false })
+        releasePoll.signal()
+        deadline = Date().addingTimeInterval(1)
+        while pollStore.syncChecking && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+        pollLock.lock(); let finalPollCalls = pollCalls, finalPollOffMain = pollRanOffMain, finalCoalescedCalls = coalescedProbeCalls; pollLock.unlock()
+        check(finalPollCalls == 1 && finalPollOffMain && finalCoalescedCalls == 0 && !pollStore.syncChecking, "慢目录判定期间的重复轮询被合并且正确收尾")
+        check(try fm.subpathsOfDirectory(atPath: pollRoot.path) == pollContentsBefore && pollStore.archive.clips.isEmpty, "普通目录轮询不进入同步读写分支")
+        let acceptanceProfile = UUID()
+        let acceptanceWorkingDirectory = URL(fileURLWithPath: fm.currentDirectoryPath, isDirectory: true)
+        let acceptanceRoot = acceptanceWorkingDirectory.appendingPathComponent("build/acceptance/\(acceptanceProfile.uuidString)")
+        defer { try? fm.removeItem(at: acceptanceRoot) }
+        let acceptanceSuite = "io.github.SwallOwDili.OpenPaste.acceptance.\(acceptanceProfile.uuidString.lowercased())"
+        let acceptanceEnvironment = try AppEnvironment.resolve(
+            arguments: ["OpenPaste", AppEnvironment.acceptanceArgument, acceptanceProfile.uuidString],
+            environment: [AppEnvironment.acceptanceRootVariable: acceptanceRoot.path],
+            fileManager: fm,
+            currentDirectory: acceptanceWorkingDirectory
+        )
+        defer { acceptanceEnvironment.defaults.removePersistentDomain(forName: acceptanceSuite) }
+        let acceptanceSource = acceptanceEnvironment.defaultDataRoot
+        let outsideAcceptance = sandbox.appendingPathComponent("outside-acceptance")
+        let acceptanceStore = Store(root: acceptanceSource)
+        acceptanceStore.changeDataDirectory(to: outsideAcceptance, environment: acceptanceEnvironment)
+        check(acceptanceStore.root == acceptanceSource && !acceptanceStore.changingDataDirectory && acceptanceStore.directoryStatus.hasPrefix("切换失败"), "验收目录越界失败时不切换 Store 根目录")
+        do {
+            _ = try DataDirectory.migrate(Archive(), from: acceptanceSource, to: outsideAcceptance, device: "A", environment: acceptanceEnvironment)
+            check(false, "迁移入口拒绝验收根目录外目标")
+        } catch {
+            check(!fm.fileExists(atPath: outsideAcceptance.path), "迁移越界在写入前失败")
+        }
         defer { try? fm.removeItem(at: DataDirectory.cacheURL(shared).deletingLastPathComponent()) }
         let benchmark = Archive(clips: (0..<7500).map { clip("性能测试 \($0)") })
         let benchmarkBaseline = DataDirectory.baseline(benchmark)
@@ -347,3 +482,4 @@ func runDataDirectoryTests() {
         print("Data directory: \(passed) checks passed")
     } catch { print("FAIL: \(error)"); exit(1) }
 }
+#endif
