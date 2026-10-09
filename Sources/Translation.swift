@@ -135,6 +135,14 @@ struct TranslationSettings: View {
     }
 }
 
+/// Decides what the copy fallback captured. A Finder selection copies file references plus the file name as text;
+/// that name is not selected text and must not be sent to the translation service.
+enum SelectionCapturePolicy {
+    static func isFileSelection(types: [NSPasteboard.PasteboardType]) -> Bool {
+        types.contains { $0 == .fileURL || $0.rawValue == "NSFilenamesPboardType" || $0.rawValue == "com.apple.pasteboard.promised-file-url" }
+    }
+}
+
 extension Controller {
     func cancelTranslation() { translationGeneration += 1; translationTask?.cancel(); translationTask = nil; store.translating = false }
     func selectedText(in app: NSRunningApplication) -> (String?, Bool) {
@@ -221,6 +229,7 @@ extension Controller {
                 let copiedChangeCount = pb.changeCount
                 let copied = pb.string(forType: .string)
                 let confidential = pb.types?.contains(where: { $0.rawValue.contains("Concealed") || $0.rawValue.contains("confidential") || $0.rawValue.contains("Transient") }) == true
+                let fileSelection = SelectionCapturePolicy.isFileSelection(types: pb.types ?? [])
                 guard pb.changeCount == copiedChangeCount else {
                     failSelectionCapture("剪贴板已被其他内容更新，已取消翻译")
                     return
@@ -255,6 +264,7 @@ extension Controller {
                 guard generation == self.translationGeneration else { endSelectionCapture(); return }
                 self.showShelf()
                 endSelectionCapture()
+                if fileSelection { self.store.translationStatus = "选中的是文件，已跳过翻译"; return }
                 if !confidential, let copied, !copied.isEmpty { self.translateSelection(copied) }
             }
         }
