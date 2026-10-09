@@ -379,8 +379,9 @@ Command 单修饰键回归：在隔离配置的通用设置点击“更改…”
 | 路径 | 验收内容 | 层级与条件 | 当前状态 |
 | --- | --- | --- | --- |
 | 正常 | ZIP、SHA-256、版本元数据、资源、签名及 arm64/x86_64 架构正确；干净测试账户首次打开和退出正常 | 本机；GUI | 构建脚本检查入口存在，待执行确认；最终 ZIP 待实测 |
-| 边界 | macOS 14 最低版本、当前 macOS、Apple Silicon、Intel 实机、无网络启动、临时签名 Gatekeeper 流程 | GUI；Intel 实机 | 待实测 |
+| 边界 | macOS 14 最低版本、当前 macOS、Apple Silicon、Intel 实机、无网络启动、自签名（非 Apple 信任）Gatekeeper 流程 | GUI；Intel 实机 | 待实测 |
 | 恢复 | 校验失败或损坏 ZIP 阻止安装；旧版手动替换后历史保留；签名变化导致权限失效时按 README 重新授权 | GUI；辅助功能 | 待实测 |
+| 稳定签名 | Release 工作流使用固定自签名证书：`codesign -dr -` 的 designated requirement 含 `certificate leaf = H"…"` 且不含 `cdhash`；缺少任一签名 Secret 时工作流失败，不得退回临时签名；签名钥匙串在工作流结束后删除。用同一证书签名的两个不同构建依次覆盖安装，不执行 `tccutil reset`，辅助功能与按键权限保持，状态显示“已授权”并能跨应用粘贴。首个由临时签名升级到该证书的版本仍需重新授权一次，须在发布说明中写明 | CI 日志；GUI；辅助功能 | 待实测（工作流为静态检查通过，未在 GitHub 上运行；跨版本权限保留未验证） |
 
 ### 长期运行与桌面环境
 
@@ -402,7 +403,7 @@ Command 单修饰键回归：在隔离配置的通用设置点击“更改…”
 - Commit：
 - Git 状态（clean / 附差异说明）：
 - 候选 ZIP 与 SHA-256：
-- 签名（临时 / Developer ID / 公证）：
+- 签名（临时 / 固定自签名 / Developer ID / 公证），并记录 `codesign -dr -` 输出与证书哈希：
 - 执行人、日期、复核人：
 - 关联变更、Issue / PR：
 
