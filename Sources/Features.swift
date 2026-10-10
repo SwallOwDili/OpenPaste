@@ -176,31 +176,6 @@ struct SystemFilePreview: NSViewRepresentable {
     func makeNSView(context: Context) -> QLPreviewView { let view = QLPreviewView(frame: .zero, style: .normal)!; view.previewItem = url as NSURL; return view }
     func updateNSView(_ view: QLPreviewView, context: Context) { view.previewItem = url as NSURL }
 }
-struct FullItemPreview: View {
-    @ObservedObject var store: Store
-    let id: UUID
-    var clip: Clip? { store.archive.clips.first { $0.id == id } }
-    var body: some View {
-        VStack(spacing: 0) {
-            if let clip {
-                HStack {
-                    Text(clip.title).font(.headline).lineLimit(1)
-                    Spacer()
-                    Button("重命名") { Controller.shared.rename(clip) }
-                    if clip.kind == "图片" { Button("旋转") { Controller.shared.rotate(clip) }; Button("提取文字") { Controller.shared.extractText(clip) } }
-                    else if clip.kind != "文件" { Button("编辑") { Controller.shared.edit(clip) } }
-                    Button("关闭") { Controller.shared.previewWindow?.close() }.keyboardShortcut(.cancelAction)
-                }.padding(12)
-                Divider()
-                if clip.kind == "链接", let url = URL(string: clip.text), LinkPreviewCache.allowed(url) { LinkBrowser(url: url) }
-                else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first { SystemFilePreview(url: URL(fileURLWithPath: path)) }
-                else if clip.kind == "图片" { FullImagePreview(clip: clip).padding(12) }
-                else if clip.kind == "文字", CodeSyntax.language(clip.text) != nil { FullCodePreview(text: clip.text) }
-                else { ScrollView { Text(AttributedString(clip.attributedText)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(20) } }
-            } else { Text("该条目已删除") }
-        }.frame(minWidth: 640, minHeight: 420)
-    }
-}
 final class NativeEditor: NSViewController {
     let clip: Clip
     let save: (NSAttributedString) -> Bool
@@ -243,16 +218,147 @@ extension Controller {
         window.title = title; window.level = NSWindow.Level(rawValue: panel.level.rawValue + 1); window.isReleasedWhenClosed = false; window.center(); window.delegate = self; return window
     }
     func showPreview(_ clip: Clip) {
-        previewWindow?.close(); let window = auxiliaryWindow("内容预览", size: NSSize(width: 820, height: 580)); previewWindow = window
-        previewClipID = clip.id
-        window.contentView = NSHostingView(rootView: FullItemPreview(store: store, id: clip.id)); window.makeKeyAndOrderFront(nil)
+        closePreview()
+        let popover = NSPopover()
+        popover.behavior = .applicationDefined
+        popover.animates = true
+        popover.delegate = self
+        let host = NSHostingController(rootView: FullItemPreview(store: store, id: clip.id))
+        host.sizingOptions = []
+        popover.contentViewController = host
+        popover.contentSize = previewSize(for: clip.id)
+        previewPopover = popover; previewHost = host; previewClipID = clip.id
+        if let anchor = previewAnchor(for: clip.id) {
+            popover.show(relativeTo: anchor.rect, of: anchor.view, preferredEdge: anchor.edge)
+        } else if let content = panel.contentView {
+            popover.show(relativeTo: NSRect(x: content.bounds.midX, y: content.bounds.midY, width: 1, height: 1), of: content, preferredEdge: .maxY)
+        }
+        previewSelectionObserver = store.$selected.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] id in
+            guard let self, let id, self.previewPopover?.isShown == true, id != self.previewClipID else { return }
+            self.updatePreview(to: id)
+        }
+    }
+    func closePreview() {
+        previewSelectionObserver = nil
+        // Closing without animation leaves no lingering popover window to take part in focus handling.
+        if let popover = previewPopover, popover.isShown { popover.animates = false; popover.close() }
+        previewPopover = nil; previewHost = nil; previewClipID = nil
+    }
+    func popoverDidClose(_ notification: Notification) {
+        guard notification.object as? NSPopover === previewPopover || previewPopover == nil else { return }
+        previewSelectionObserver = nil
+        previewPopover = nil; previewHost = nil; previewClipID = nil
+        DispatchQueue.main.async { [weak self] in self?.restoreWorkingWindowFocus() }
+    }
+    private func previewSize(for id: UUID) -> NSSize {
+        let screen = (panel.screen ?? NSScreen.main ?? NSScreen.screens[0]).visibleFrame.size
+        let size = PreviewLayout.size(for: store.archive.clips.first { $0.id == id }, screen: screen)
+        return NSSize(width: size.width, height: size.height)
+    }
+    /// Swaps the previewed card in place and moves the popover's arrow to it.
+    func updatePreview(to id: UUID) {
+        guard let popover = previewPopover, let host = previewHost else { return }
+        previewClipID = id
+        host.rootView = FullItemPreview(store: store, id: id)
+        popover.contentSize = previewSize(for: id)
+        reanchorPreview(to: id)
+        // The shelf scrolls the new card into view asynchronously; anchor again once it has.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.previewClipID == id else { return }
+            self.reanchorPreview(to: id)
+        }
+    }
+    private func reanchorPreview(to id: UUID) {
+        guard let popover = previewPopover, let anchor = previewAnchor(for: id) else { return }
+        popover.positioningRect = anchor.rect
+    }
+    /// The selected card, in the coordinates of the shelf's scrolling content; nil when it is not on screen.
+    func previewAnchor(for id: UUID) -> (view: NSView, rect: NSRect, edge: NSRectEdge)? {
+        guard panel.isVisible, let content = panel.contentView, let index = store.visibleIndex(of: id),
+              let scroll = firstScrollView(in: content), let document = scroll.documentView else { return nil }
+        let width: CGFloat = store.compact ? 180 : 240
+        let slot = index + (store.translating ? 1 : 0)
+        let rect = NSRect(x: 20 + CGFloat(slot) * (width + 12), y: 8, width: width, height: max(40, document.bounds.height - 16))
+        return (document, rect, document.isFlipped ? .minY : .maxY)
+    }
+    private func firstScrollView(in view: NSView) -> NSScrollView? {
+        if let scroll = view as? NSScrollView { return scroll }
+        for child in view.subviews { if let found = firstScrollView(in: child) { return found } }
+        return nil
     }
     func openItem(_ clip: Clip) { if let url = URL(string: clip.text), clip.kind == "链接" { openExternal(url) } else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first { openExternal(URL(fileURLWithPath: path)) } else { showPreview(clip) } }
+    /// Renames the card title in place on the shelf; a dialog is only
+    /// used when the shelf card is not the target, e.g. from the preview window.
     func rename(_ clip: Clip) {
-        let alert = NSAlert(); alert.messageText = "重命名内容"; let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24)); field.stringValue = clip.title; alert.accessoryView = field; alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消"); alert.window.initialFirstResponder = field
+        if previewPopover?.isShown != true, panel.isVisible, !store.settings, store.visibleIndex(of: clip.id) != nil {
+            store.searchFocused = false
+            store.choose(clip.id)
+            store.renamingID = clip.id
+            return
+        }
+        let alert = NSAlert(); alert.messageText = "重命名标题"; alert.informativeText = "只修改卡片标题，不改变内容。留空恢复默认标题。"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24)); field.stringValue = clip.userLabel ?? clip.title; alert.accessoryView = field; alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消"); alert.window.initialFirstResponder = field
         presentAlert(alert) { [weak self] response in
-            guard response == .alertFirstButtonReturn, let self, var edited = store.archive.clips.first(where: { $0.id == clip.id }) else { return }
-            edited.title = field.stringValue; edited.userLabel = field.stringValue; store.replace(edited, label: "重命名")
+            guard response == .alertFirstButtonReturn, let self else { return }
+            self.applyRename(clip.id, to: field.stringValue)
+        }
+    }
+    /// Stores only the user label; the original title and clipboard bytes are untouched.
+    func applyRename(_ id: UUID, to text: String) {
+        guard var edited = store.archive.clips.first(where: { $0.id == id }) else { return }
+        let label = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newLabel: String? = label.isEmpty ? nil : label
+        guard edited.userLabel != newLabel else { return }
+        edited.userLabel = newLabel
+        store.replace(edited, label: "重命名")
+    }
+    func commitInlineRename(_ id: UUID, text: String) {
+        guard store.renamingID == id else { return }
+        store.renamingID = nil
+        applyRename(id, to: text)
+        panel.makeFirstResponder(panel.contentView)
+    }
+    func cancelInlineRename() {
+        store.renamingID = nil
+        panel.makeFirstResponder(panel.contentView)
+    }
+    /// ⌘← / ⌘→: cycle history and boards.
+    func switchBoard(_ delta: Int) {
+        guard let target = BoardNavigation.next(from: store.board, boards: store.archive.boards.map(\.id), delta: delta) else { return }
+        store.searchFocused = false
+        store.board = target
+        if let first = store.filtered.first { store.choose(first.id) }
+        panel.makeFirstResponder(panel.contentView)
+    }
+    func horizontalScrollView(in root: NSView, at location: NSPoint) -> NSScrollView? {
+        if let scroll = root as? NSScrollView,
+           scroll.convert(scroll.bounds, to: nil).contains(location),
+           let document = scroll.documentView, document.frame.width > scroll.contentSize.width + 1,
+           document.frame.height <= scroll.contentSize.height + 1 { return scroll }
+        for child in root.subviews { if let found = horizontalScrollView(in: child, at: location) { return found } }
+        return nil
+    }
+    /// Starts a search from a typed key without consuming it: the key events are held
+    /// until the field is first responder, then replayed so input methods compose normally.
+    func beginTypeToSearch(_ event: NSEvent) {
+        pendingSearchKeys.append(event)
+        store.searchFocused = true
+        guard pendingSearchKeys.count == 1 else { return }
+        pendingSearchAttempts = 0
+        flushPendingSearchKeys()
+    }
+    private func flushPendingSearchKeys() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+            guard let self, !self.pendingSearchKeys.isEmpty else { return }
+            if self.panel.firstResponder is NSTextView {
+                let events = self.pendingSearchKeys; self.pendingSearchKeys.removeAll()
+                for event in events { self.panel.sendEvent(event) }
+            } else if self.pendingSearchAttempts < 30 {
+                self.pendingSearchAttempts += 1; self.flushPendingSearchKeys()
+            } else {
+                let text = self.pendingSearchKeys.compactMap(\.characters).joined(); self.pendingSearchKeys.removeAll()
+                self.store.query += text
+            }
         }
     }
     func createText() { var clip = Clip(source: "OpenPaste", sourceID: Bundle.main.bundleIdentifier ?? "", kind: "文字", title: "新建文字", text: "", parts: []); clip.parts = [[ClipPart(type: "public.utf8-plain-text", data: Data())]]; edit(clip) }
