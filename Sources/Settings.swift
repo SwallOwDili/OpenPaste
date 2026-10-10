@@ -226,11 +226,43 @@ struct SettingsPageView: View {
             }
         }
     }
+    private func chordRow(_ title: String, target: ShelfChordTarget, chord: ShelfChord) -> some View {
+        HStack {
+            Text(title); Spacer()
+            Text(store.recordingChord == target ? "请按组合键…" : chord.label).font(.system(size: 12, weight: .medium, design: .monospaced)).padding(.horizontal, 10).padding(.vertical, 6).background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+            Button(store.recordingChord == target ? "取消" : "更改…") {
+                if store.recordingChord == target { store.recordingChord = nil; store.chordNotice = "" }
+                else { Controller.shared.cancelShortcutRecording(); store.recordingChord = target; store.chordNotice = "" }
+            }
+        }
+    }
     private var general: some View {
         VStack(alignment: .leading, spacing: 22) {
             group("键盘操作") {
                 HStack { Text("呼出剪贴板"); Spacer(); Text(store.recordingShortcut ? "请按组合键…" : store.shortcutLabel).font(.system(size: 12, weight: .medium, design: .monospaced)).padding(.horizontal, 10).padding(.vertical, 6).background(.quaternary, in: RoundedRectangle(cornerRadius: 6)); Button(store.recordingShortcut ? "取消" : "更改…") { Controller.shared.beginShortcutRecording() } }
                 HStack { note(store.shortcutNotice.isEmpty ? "使用 ⌘、⌃ 或 ⌥ 搭配一个按键，也可组合 ⇧。录制时按 Esc 取消。" : store.shortcutNotice); Spacer(); Button("恢复默认") { Controller.shared.cancelShortcutRecording(); Controller.shared.installShortcut(.standard, persist: true) }.buttonStyle(.link).font(.caption) }
+                Divider()
+                chordRow("下一个收藏板", target: .nextBoard, chord: store.shelfShortcuts.nextBoard)
+                chordRow("上一个收藏板", target: .previousBoard, chord: store.shelfShortcuts.previousBoard)
+                Divider()
+                HStack {
+                    Text("快速粘贴"); Spacer()
+                    Picker("快速粘贴修饰键", selection: Binding(get: { store.shelfShortcuts.quickPaste }, set: { store.shelfShortcuts = store.shelfShortcuts.settingQuickPaste($0) })) {
+                        ForEach(ShortcutModifier.quickPasteChoices, id: \.self) { Text($0.title).tag($0) }
+                    }.labelsHidden().frame(width: 150)
+                    Text("+ 1…9").foregroundStyle(.secondary)
+                }
+                HStack {
+                    Text("纯文本模式"); Spacer()
+                    Picker("纯文本修饰键", selection: Binding(get: { store.shelfShortcuts.plainText }, set: { store.shelfShortcuts = store.shelfShortcuts.settingPlainText($0) })) {
+                        ForEach(ShortcutModifier.plainTextChoices, id: \.self) { Text($0.title).tag($0) }
+                    }.labelsHidden().frame(width: 150)
+                }
+                HStack {
+                    note(store.chordNotice.isEmpty ? "纯文本修饰键可与 Return 或快速粘贴键同时按下；两个修饰键不能相同。" : store.chordNotice)
+                    Spacer()
+                    Button("恢复默认") { Controller.shared.cancelShortcutRecording(); store.shelfShortcuts = .standard }.buttonStyle(.link).font(.caption)
+                }
             }
             group("历史记录") {
                 HStack { Text("记录条数"); Spacer(); Picker("记录条数", selection: Binding(get: { store.limit }, set: { store.limit = $0 })) { Text("不限制").tag(0); Text("500 条").tag(500); Text("1,000 条").tag(1000); Text("5,000 条").tag(5000); if store.limit > 5000 { Text("\(store.limit) 条").tag(store.limit) } }.labelsHidden().frame(width: 150) }

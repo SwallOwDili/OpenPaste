@@ -110,6 +110,8 @@ final class Store: ObservableObject {
     @Published var translationSelectionAuthorized = false
     var selectionCaptureActive = false
     @Published var message = "所有内容仅保存在这台 Mac"
+    /// Card whose title is being edited in place; nil when no inline rename is active.
+    @Published var renamingID: UUID?
     @Published var query = "" { didSet { if query != oldValue { filterValueChanged() } } }
     @Published var board: UUID? { didSet { if board != oldValue { filterValueChanged() } } }
     @Published var kind = "全部" { didSet { if kind != oldValue { filterValueChanged() } } }
@@ -135,6 +137,10 @@ final class Store: ObservableObject {
     @Published var importingPaste = false
     @Published var settings = false
     @Published var shortcutLabel: String
+    /// Shelf-local shortcuts (board switching, quick paste and plain-text modifiers).
+    @Published var shelfShortcuts: ShelfShortcuts { didSet { if usePreferences { shelfShortcuts.save(to: configurationDefaults) } } }
+    @Published var recordingChord: ShelfChordTarget?
+    @Published var chordNotice = ""
     @Published var recordingShortcut = false
     @Published var shortcutNotice = ""
     @Published var directPasteAuthorized = false
@@ -200,6 +206,7 @@ final class Store: ObservableObject {
         self.injectedDeviceID = deviceID ?? (persistsPreferences ? nil : UUID().uuidString)
         storageLimitMB = max(200, configurationDefaults?.integer(forKey: "storageLimitMB") ?? 0)
         shortcutLabel = (configurationDefaults.map { GlobalShortcut.load(from: $0) } ?? .standard).label
+        shelfShortcuts = ShelfShortcuts.load(from: configurationDefaults)
         networkPreviews = configurationDefaults?.object(forKey: "networkPreviews") as? Bool ?? true
         retentionDays = configurationDefaults?.integer(forKey: "retentionDays") ?? 0
         limit = configurationDefaults?.object(forKey: "historyLimit") as? Int ?? 1000
@@ -345,7 +352,7 @@ final class Store: ObservableObject {
         visibleClips = archive.clips.filter { c in
             (board == nil || c.boards.contains(board!)) && (kind == "全部" || c.kind == kind) &&
             (sourceFilter == "全部来源" || c.source == sourceFilter) && (!todayOnly || Calendar.current.isDateInToday(c.created)) && (!dateRangeEnabled || (c.created >= Calendar.current.startOfDay(for: startDate) && c.created < Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: endDate))!)) &&
-            (query.isEmpty || [c.title, c.text, c.source, c.ocrText ?? "", c.linkTitle ?? ""].joined(separator: " ").localizedCaseInsensitiveContains(query))
+            (query.isEmpty || c.title.localizedCaseInsensitiveContains(query) || c.text.localizedCaseInsensitiveContains(query) || c.source.localizedCaseInsensitiveContains(query) || (c.ocrText?.localizedCaseInsensitiveContains(query) ?? false) || (c.linkTitle?.localizedCaseInsensitiveContains(query) ?? false) || (c.userLabel?.localizedCaseInsensitiveContains(query) ?? false))
         }
         if reverseHistory { visibleClips.reverse() }
         visibleIndexByID.removeAll(keepingCapacity: true)
@@ -732,6 +739,11 @@ final class Store: ObservableObject {
     }
     func addBoard(_ name: String) { let name = name.trimmingCharacters(in: .whitespacesAndNewlines); guard canModifyHistory, !name.isEmpty else { return }; archive.boards.append(Board(name: name)); save() }
     func setBoardColor(_ id: UUID, color: String) { guard canModifyHistory, let i = archive.boards.firstIndex(where: { $0.id == id }) else { return }; archive.boards[i].color = color; save() }
+    func renameBoard(_ id: UUID, to name: String) {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard canModifyHistory, !name.isEmpty, let i = archive.boards.firstIndex(where: { $0.id == id }), archive.boards[i].name != name else { return }
+        archive.boards[i].name = name; save()
+    }
     func removeBoard(_ id: UUID) { guard canModifyHistory else { return }; archive.boards.removeAll { $0.id == id }; for i in archive.clips.indices { archive.clips[i].boards.removeAll { $0 == id } }; if board == id { board = nil }; prune(); save() }
     func clearHistory() {
         guard canModifyHistory else { return }
