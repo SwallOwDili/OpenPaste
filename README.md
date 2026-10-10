@@ -114,7 +114,7 @@ Base URL: https://your-service.example/v1
 - 支持 HTTP 和 HTTPS。HTTP 会明文传输 API Key 与选中文字。
 - API Key 与其他设置一同保存在本机应用配置中（`~/Library/Preferences/io.github.SwallOwDili.OpenPaste.plist`），不随剪贴板历史同步；选中文字发送到你配置的服务。
 - 不接受 URL 内账号、查询参数或片段；不跟随重定向。
-- 选中文字上限 60 KB。辅助功能选区读取不被目标应用支持时，会尝试复制选区并恢复剪贴板。
+- 选中文字上限 60 KB。选区通过辅助功能读取，不会复制或改写剪贴板；呼出面板不会等待选区，读到后再翻译。目标应用不提供选区时（部分自绘界面或终端）不会翻译。
 
 <details>
 <summary>查看通用设置：快捷键、历史保留与内容预览</summary>

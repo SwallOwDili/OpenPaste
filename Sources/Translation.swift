@@ -4,7 +4,6 @@ import ApplicationServices
 
 // Selection-copy fallback is main-thread only. Tracking its request generation
 // prevents an older canceled callback from disabling a newer fallback.
-private var activeSelectionCaptureGeneration: Int?
 
 struct TranslationFailure: LocalizedError {
     let message: String
@@ -135,142 +134,31 @@ struct TranslationSettings: View {
     }
 }
 
-/// Decides what the copy fallback captured. A Finder selection copies file references plus the file name as text;
-/// that name is not selected text and must not be sent to the translation service.
-enum SelectionCapturePolicy {
-    static func isFileSelection(types: [NSPasteboard.PasteboardType]) -> Bool {
-        types.contains { $0 == .fileURL || $0.rawValue == "NSFilenamesPboardType" || $0.rawValue == "com.apple.pasteboard.promised-file-url" }
-    }
-}
-
 extension Controller {
     func cancelTranslation() { translationGeneration += 1; translationTask?.cancel(); translationTask = nil; store.translating = false }
-    func selectedText(in app: NSRunningApplication) -> (String?, Bool) {
-        let root = AXUIElementCreateApplication(app.processIdentifier); AXUIElementSetMessagingTimeout(root, 0.15)
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(root, kAXFocusedUIElementAttribute as CFString, &value) == .success, let value else { return (nil, false) }
-        let focused = value as! AXUIElement
-        var role: CFTypeRef?; var subrole: CFTypeRef?
-        AXUIElementCopyAttributeValue(focused, kAXRoleAttribute as CFString, &role); AXUIElementCopyAttributeValue(focused, kAXSubroleAttribute as CFString, &subrole)
-        if (subrole as? String) == "AXSecureTextField" { return (nil, true) }
-        var text: CFTypeRef?
-        if AXUIElementCopyAttributeValue(focused, kAXSelectedTextAttribute as CFString, &text) == .success, let s = text as? String { return (s.isEmpty ? nil : s, s.isEmpty) }
-        var range: CFTypeRef?
-        if AXUIElementCopyAttributeValue(focused, kAXSelectedTextRangeAttribute as CFString, &range) == .success, let range, CFGetTypeID(range) == AXValueGetTypeID() {
-            var r = CFRange(); AXValueGetValue(range as! AXValue, .cfRange, &r)
-            if r.length == 0 { return (nil, true) }
-            if AXUIElementCopyParameterizedAttributeValue(focused, kAXStringForRangeParameterizedAttribute as CFString, range, &text) == .success, let s = text as? String { return (s, false) }
-        }
-        return (nil, false)
-    }
+    /// Shows the shelf at once and only then looks for a selection, so presenting the shelf never waits for it.
+    /// The selection is read through accessibility alone, off the main thread; nothing is copied or synthesized.
     @objc func show() {
         guard prepareShelfPresentation({ [weak self] in self?.show() }) else { return }
         cancelTranslation(); store.translationStatus = ""
         let config = translationConfig
         let workflowFixture = TestMode.translationWorkflow
-        guard (config.enabled || workflowFixture), (!preview || workflowFixture), let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { showShelf(); return }
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        showShelf()
+        guard (config.enabled || workflowFixture), (!preview || workflowFixture), let app = frontmost, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
         target = app; lastExternalApp = app
-        guard !store.ignored.components(separatedBy: .newlines).map({ $0.trimmingCharacters(in: .whitespaces) }).contains(app.bundleIdentifier ?? "") else { showShelf(); store.translationStatus = "当前应用已排除，不执行翻译"; return }
+        guard !store.ignored.components(separatedBy: .newlines).map({ $0.trimmingCharacters(in: .whitespaces) }).contains(app.bundleIdentifier ?? "") else { store.translationStatus = "当前应用已排除，不执行翻译"; return }
         let selectionAuthorized = AXIsProcessTrusted()
         store.translationSelectionAuthorized = selectionAuthorized
-        guard selectionAuthorized else { refreshPermission(); showShelf(); return }
-        // Show the shelf first, without taking focus: the target app must stay frontmost for the copy fallback below.
-        showShelf(activating: false)
-        let (text, noSelection) = selectedText(in: app)
-        if let text { activateShelf(); translateSelection(text); return }
-        if noSelection { activateShelf(); return }
-        // Apps without selected-text accessibility support: copy selection, then restore all original clipboard types.
-        let pb = NSPasteboard.general
-        guard let original = ClipboardWrite.snapshot(pb) else {
-            activateShelf(); store.translationStatus = "当前剪贴板无法完整暂存，已取消翻译"; return
-        }
-        let before = original.changeCount; let generation = translationGeneration
-        activeSelectionCaptureGeneration = generation
-        store.selectionCaptureActive = true
-        let down = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: true); let up = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: false)
-        down?.flags = .maskCommand; up?.flags = .maskCommand; down?.post(tap: .cghidEventTap); up?.post(tap: .cghidEventTap)
-        func endSelectionCapture() {
-            guard activeSelectionCaptureGeneration == generation else { return }
-            activeSelectionCaptureGeneration = nil
-            self.store.selectionCaptureActive = false
-        }
-        func suppressCurrentCapture() {
-            let current = pb.changeCount
-            self.store.change = current
-            self.store.deletedCurrentChange = current
-            self.store.deletedCurrentID = nil
-        }
-        func failSelectionCapture(_ message: String) {
-            guard generation == self.translationGeneration, activeSelectionCaptureGeneration == generation else { return }
-            // Do not let the shelf's forced capture turn our synthetic Command-C
-            // payload into a history item after a canceled fallback.
-            if pb.changeCount != before { suppressCurrentCapture() }
-            self.activateShelf(); self.store.translationStatus = message
-            endSelectionCapture()
-        }
-        func finish(_ attempt: Int) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                guard generation == self.translationGeneration else {
-                    // Once canceled, the current board may be our synthetic copy or a
-                    // newer external copy. Never overwrite it; suppress this one count
-                    // so the synthetic payload cannot enter history.
-                    if activeSelectionCaptureGeneration == generation {
-                        if pb.changeCount != before { suppressCurrentCapture() }
-                        endSelectionCapture()
-                    }
-                    return
-                }
-                if pb.changeCount == before, attempt < 10 { finish(attempt + 1); return }
-                guard pb.changeCount != before else { failSelectionCapture(""); return }
-                guard !app.isTerminated,
-                      NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
-                      self.target?.processIdentifier == app.processIdentifier else {
-                    failSelectionCapture("目标应用已切换，已取消翻译并保留当前剪贴板")
-                    return
-                }
-                let copiedChangeCount = pb.changeCount
-                let copied = pb.string(forType: .string)
-                let confidential = pb.types?.contains(where: { $0.rawValue.contains("Concealed") || $0.rawValue.contains("confidential") || $0.rawValue.contains("Transient") }) == true
-                let fileSelection = SelectionCapturePolicy.isFileSelection(types: pb.types ?? [])
-                guard pb.changeCount == copiedChangeCount else {
-                    failSelectionCapture("剪贴板已被其他内容更新，已取消翻译")
-                    return
-                }
-                guard generation == self.translationGeneration else {
-                    suppressCurrentCapture(); endSelectionCapture(); return
-                }
-                guard !app.isTerminated,
-                      NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
-                      self.target?.processIdentifier == app.processIdentifier else {
-                    failSelectionCapture("目标应用已切换，已取消翻译并保留当前剪贴板")
-                    return
-                }
-                let restoration = ClipboardWrite.restore(original, to: pb, expectedChangeCount: copiedChangeCount)
-                guard restoration == .written else {
-                    if restoration == .superseded {
-                        let owner = NSWorkspace.shared.frontmostApplication
-                        self.store.selectionCaptureActive = false
-                        self.store.capture(pasteboard: pb, sourceOverride: ClipboardCaptureSource(name: owner?.localizedName ?? "未知应用", bundleID: owner?.bundleIdentifier ?? ""))
-                        self.store.selectionCaptureActive = activeSelectionCaptureGeneration == generation
-                    } else {
-                        suppressCurrentCapture()
-                    }
-                    self.activateShelf()
-                    self.store.translationStatus = restoration == .superseded
-                        ? "剪贴板已被其他内容更新，已取消翻译"
-                        : "无法安全恢复原剪贴板，已取消翻译"
-                    endSelectionCapture()
-                    return
-                }
-                self.store.recordRestoredClipboardChange(from: before, pasteboard: pb)
-                guard generation == self.translationGeneration else { endSelectionCapture(); return }
-                self.activateShelf()
-                endSelectionCapture()
-                if fileSelection { self.store.translationStatus = "选中的是文件，已跳过翻译"; return }
-                if !confidential, let copied, !copied.isEmpty { self.translateSelection(copied) }
+        guard selectionAuthorized else { refreshPermission(); return }
+        let generation = translationGeneration
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let text = AccessibilitySelection.read(in: app)
+            DispatchQueue.main.async {
+                guard let self, generation == self.translationGeneration, self.panel.isVisible, let text else { return }
+                self.translateSelection(text)
             }
         }
-        finish(0)
     }
     func translateSelection(_ text: String) {
         let config = translationConfig
@@ -363,3 +251,32 @@ func runTranslationTests() {
 }
 
 #endif
+
+/// Reads the selected text of another application through accessibility. Read-only: nothing is copied,
+/// no keys are sent, and the other application's settings or state are never changed.
+enum AccessibilitySelection {
+    /// `definitive` marks a final answer (a secure field or an empty selection) as opposed to "not exposed".
+    static func attempt(root: AXUIElement) -> (text: String?, definitive: Bool) {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(root, kAXFocusedUIElementAttribute as CFString, &value) == .success, let value else { return (nil, false) }
+        let focused = value as! AXUIElement
+        var subrole: CFTypeRef?
+        AXUIElementCopyAttributeValue(focused, kAXSubroleAttribute as CFString, &subrole)
+        if (subrole as? String) == "AXSecureTextField" { return (nil, true) }
+        var text: CFTypeRef?
+        if AXUIElementCopyAttributeValue(focused, kAXSelectedTextAttribute as CFString, &text) == .success, let s = text as? String { return (s.isEmpty ? nil : s, s.isEmpty) }
+        var range: CFTypeRef?
+        if AXUIElementCopyAttributeValue(focused, kAXSelectedTextRangeAttribute as CFString, &range) == .success, let range, CFGetTypeID(range) == AXValueGetTypeID() {
+            var r = CFRange(); AXValueGetValue(range as! AXValue, .cfRange, &r)
+            if r.length == 0 { return (nil, true) }
+            if AXUIElementCopyParameterizedAttributeValue(focused, kAXStringForRangeParameterizedAttribute as CFString, range, &text) == .success, let s = text as? String { return (s.isEmpty ? nil : s, false) }
+        }
+        return (nil, false)
+    }
+    /// Blocking; call off the main thread. One read: if the application does not expose a selection, there is none to translate.
+    static func read(in app: NSRunningApplication) -> String? {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(root, 0.25)
+        return attempt(root: root).text
+    }
+}
