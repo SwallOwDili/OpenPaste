@@ -59,6 +59,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     var keyMonitor: Any?
     var outsideClickMonitor: Any?
     var wheelMonitor: Any?
+    var shelfAwaitingActivation = false
     var pendingSearchKeys: [NSEvent] = []
     var pendingSearchAttempts = 0
     var menuObservers: [NSObjectProtocol] = []
@@ -237,7 +238,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         menu.addItem(withTitle: "退出 OpenPaste", action: #selector(quit), keyEquivalent: "q")
         for item in menu.items { item.target = self }; status.menu = menu
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in Controller.shared?.toggle(); return noErr }, 1, &spec, nil, &handler)
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in Controller.shared?.hotkeyFired(eventTime: event.map { GetEventTime($0) }); return noErr }, 1, &spec, nil, &handler)
         _ = installShortcut(shortcut, persist: false)
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self = self else { return event }
@@ -480,9 +481,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         let excluded = store.ignored.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
         if !excluded.contains(id) { store.ignored += "\n" + id }
     }
-    func showShelf() {
+    /// Shows the shelf. With `activating: false` it is ordered in front without taking keyboard focus, so the
+    /// frontmost app stays the target while the selection is read; call `activateShelf()` afterwards.
+    func showShelf(activating: Bool = true) {
         let finishTiming = AcceptanceMetrics.begin("shelf.show"); defer { finishTiming() }
-        guard prepareShelfPresentation({ [weak self] in self?.showShelf() }) else { return }
+        guard prepareShelfPresentation({ [weak self] in self?.showShelf(activating: activating) }) else { return }
         guard !store.changingDataDirectory else { openSettings(); return }
         shelfPresentation += 1
         pendingOutsideClick = false
@@ -504,9 +507,26 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         panel.setFrame(NSRect(x: r.minX, y: r.minY, width: r.width, height: h), display: true)
         store.reverseHistory = false; store.selection.removeAll(); store.compact = h < 270
         store.selected = store.currentClipID ?? store.filtered.first?.id
+        if activating {
+            shelfAwaitingActivation = false
+            NSApp.activate(); panel.makeKeyAndOrderFront(nil)
+            panel.makeFirstResponder(panel.contentView)
+            logInteraction("shelf.show")
+            DispatchQueue.main.async { [weak self] in self?.restoreShelfKeyboardFocus() }
+        } else {
+            shelfAwaitingActivation = true
+            panel.orderFrontRegardless()
+            logInteraction("shelf.show-unfocused")
+        }
+    }
+    /// Gives a shelf that was shown without focus the keyboard, once the selection check is done.
+    func activateShelf() {
+        guard shelfAwaitingActivation else { return }
+        shelfAwaitingActivation = false
+        guard panel.isVisible else { return }
         NSApp.activate(); panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(panel.contentView)
-        logInteraction("shelf.show")
+        logInteraction("shelf.activate")
         DispatchQueue.main.async { [weak self] in self?.restoreShelfKeyboardFocus() }
     }
     func restoreShelfKeyboardFocus() {
@@ -564,15 +584,52 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     }
     func hideShelf() {
         logInteraction("shelf.hide", reason: "explicit")
+        shelfAwaitingActivation = false
         closePreview()
         cancelTranslation()
         store.reverseHistory = false
         panel.orderOut(nil)
         if NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier, let target = target { NSApp.yieldActivation(to: target); _ = target.activate(options: []) }
     }
+    /// Global hotkey entry. With the `diagnosticsShowTiming` preference set, records where time goes between the
+    /// key event and the committed frame (numbers only): event-to-handler lag, synchronous show work, the wait for
+    /// the next main-queue turn, and the Core Animation commit.
+    func hotkeyFired(eventTime: Double?) {
+        let enter = ProcessInfo.processInfo.systemUptime
+        guard AppEnvironment.current.defaults.bool(forKey: "diagnosticsShowTiming") else { toggle(); return }
+        toggle()
+        let afterToggle = ProcessInfo.processInfo.systemUptime
+        DispatchQueue.main.async { [weak self] in
+            let turnStart = ProcessInfo.processInfo.systemUptime
+            CATransaction.flush()
+            let committed = ProcessInfo.processInfo.systemUptime
+            func ms(_ value: Double) -> String { String(format: "%.1f", max(0, value) * 1000) }
+            let visibleNow = self?.panel.isVisible == true
+            let translating = AppEnvironment.current.defaults.bool(forKey: "translationEnabled")
+            func record(visibleAt: Double?) {
+                AppDiagnostics.record("shelf.timing", [
+                    "lag-ms": eventTime.map { ms(enter - $0) } ?? "unknown",
+                    "sync-ms": ms(afterToggle - enter),
+                    "queue-ms": ms(turnStart - afterToggle),
+                    "commit-ms": ms(committed - turnStart),
+                    "visible-ms": visibleAt.map { ms($0 - (eventTime ?? enter)) } ?? "never",
+                    "quick-translation": String(translating)
+                ])
+            }
+            if visibleNow { record(visibleAt: committed); return }
+            // The shelf can be shown later (quick translation reads the selection first); poll until it is.
+            func poll() {
+                let now = ProcessInfo.processInfo.systemUptime
+                if self?.panel.isVisible == true { record(visibleAt: now) }
+                else if now - enter > 3 { record(visibleAt: nil) }
+                else { DispatchQueue.main.asyncAfter(deadline: .now() + 0.005) { poll() } }
+            }
+            poll()
+        }
+    }
     func toggle() {
         guard prepareShelfPresentation({ [weak self] in self?.toggle() }) else { return }
-        if panel.isVisible && panel.isKeyWindow { hideShelf() } else { show() }
+        if panel.isVisible && (panel.isKeyWindow || shelfAwaitingActivation) { hideShelf() } else { show() }
     }
     @objc func togglePause() {
         switch store.recordingPauseControl.action {
