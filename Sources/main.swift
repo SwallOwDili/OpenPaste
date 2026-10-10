@@ -513,6 +513,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             panel.makeFirstResponder(panel.contentView)
             logInteraction("shelf.show")
             DispatchQueue.main.async { [weak self] in self?.restoreShelfKeyboardFocus() }
+            verifyShelfActivation(attempt: 0)
         } else {
             shelfAwaitingActivation = true
             panel.orderFrontRegardless()
@@ -528,6 +529,23 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         panel.makeFirstResponder(panel.contentView)
         logInteraction("shelf.activate")
         DispatchQueue.main.async { [weak self] in self?.restoreShelfKeyboardFocus() }
+        verifyShelfActivation(attempt: 0)
+    }
+    /// A delayed activation request can be dropped by the system while another app (a browser) stays frontmost,
+    /// leaving the visible shelf without the keyboard until the user clicks it. Check, retry, and record the result.
+    func verifyShelfActivation(attempt: Int) {
+        let presentation = shelfPresentation
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self, self.shelfPresentation == presentation, self.panel.isVisible, !self.shelfAwaitingActivation else { return }
+            if self.panel.isKeyWindow && NSApp.isActive { if attempt > 0 { self.logInteraction("shelf.activate-recovered") }; return }
+            guard attempt < 3, !self.store.settings, !self.modalShowing, self.previewWindow?.isVisible != true, self.editorWindow?.isVisible != true else { return }
+            self.logInteraction("shelf.activate-retry", reason: "attempt\(attempt + 1)")
+            _ = NSRunningApplication.current.activate(options: [.activateAllWindows])
+            NSApp.activate()
+            self.panel.makeKeyAndOrderFront(nil)
+            self.panel.makeFirstResponder(self.panel.contentView)
+            self.verifyShelfActivation(attempt: attempt + 1)
+        }
     }
     func restoreShelfKeyboardFocus() {
         // A visible borderless shelf can lose its key window after activation or
