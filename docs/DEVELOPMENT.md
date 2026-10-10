@@ -43,8 +43,8 @@ base64 < /path/to/GoogleService-Info.plist | tr -d '\n' | gh secret set OPENPAST
 发布步骤：
 
 1. 将本项目根目录内容提交到仓库，包含 `.github/workflows/`。
-2. 在 GitHub 创建 Release，标签使用 `v0.6.0` 等 `v主版本.次版本.修订版本` 格式；也接受 `v0.6.0-beta.1`。
-3. 发布后，Actions 从该标签的代码构建，完成检查后把 `OpenPaste-0.6.0-macos-universal.zip` 和 `.sha256` 上传到同一 Release。
+2. 在 GitHub 创建 Release，标签使用 `v0.0.5` 等 `v主版本.次版本.修订版本` 格式；也接受 `v0.0.5-rc1` 等预发布后缀。
+3. 发布后，Actions 从该标签的代码构建，完成检查后把 `OpenPaste-0.0.5-macos-universal.zip` 和 `.sha256` 上传到同一 Release。
 
 App 的版本来自 Release 标签，Build 来自工作流运行编号；预发布版本在「关于」页面显示完整后缀。GitHub Release 的标题不会影响版本号。工作流可重复运行，同名附件会覆盖。
 
@@ -52,7 +52,7 @@ App 的版本来自 Release 标签，Build 来自工作流运行编号；预发�
 
 | 构建来源 | App 显示版本 |
 | --- | --- |
-| GitHub Release 工作流 | 标签版本，如 `0.6.0` 或 `0.6.0-beta.1` |
+| GitHub Release 工作流 | 标签版本，如 `0.0.5` 或 `0.0.5-rc1` |
 | 本地 Git / 普通 CI 构建 | 分支名 + 8 位 commit，如 `main-a1b2c3d4` |
 | 无 Git 仓库或尚无 commit | `draft` |
 
@@ -61,14 +61,14 @@ App 的版本来自 Release 标签，Build 来自工作流运行编号；预发�
 需要显式模拟 Release 构建时：
 
 ```sh
-OPENPASTE_VERSION=v0.6.0 OPENPASTE_ARCH=universal ./build.sh
+OPENPASTE_VERSION=v0.0.5 OPENPASTE_ARCH=universal ./build.sh
 ```
 
-GitHub 默认提供上传所需的 `GITHUB_TOKEN`，无需另配个人访问令牌。当前自动构建使用临时签名，尚未接入 Developer ID 证书和 Apple 公证；与本机固定签名不是同一个身份，更新后权限可能需要重新授权。
+GitHub 默认提供上传所需的 `GITHUB_TOKEN`，无需另配个人访问令牌。Release 工作流从仓库 Secret 导入固定的自签名证书（`OPENPASTE_SIGNING_P12_B64`、`OPENPASTE_SIGNING_P12_PASSWORD`、`OPENPASTE_SIGNING_IDENTITY`）签名，缺少任一 Secret 时直接失败，不会发布临时签名的包；尚未接入 Developer ID 证书和 Apple 公证。用其他身份（包括本机临时签名）构建的 App 与发布包不是同一个身份，替换后权限可能需要重新授权。
 
 如果开启 GitHub 的不可变 Release，须先创建草稿，再在 Actions 手动运行 **Build release**、填写该草稿标签，待附件上传完成后发布。不可变 Release 发布后不能追加或替换附件，工作流会明确报错。
 
-工作流配置见 [release.yml](../.github/workflows/release.yml) 和 [ci.yml](../.github/workflows/ci.yml)。Release 只公开安装包 ZIP 与 SHA-256 校验文件；调试符号单独保留在 Actions Artifacts，保存 14 天。此流程发布安装包。App 已支持正式 Release 检测和下载页入口；安装仍由用户手动替换，不自动下载或安装。
+工作流配置见 [release.yml](../.github/workflows/release.yml) 和 [ci.yml](../.github/workflows/ci.yml)。Release 只公开安装包 ZIP 与 SHA-256 校验文件；调试符号单独保留在 Actions Artifacts，保存 14 天。此流程发布安装包。App 支持正式 Release 检测；当前 App 使用固定证书签名、位于可写的应用目录时，可在应用内下载、校验并替换更新，否则提供下载页入口，由用户手动替换。
 
 ## 自动检查与 CLA
 
@@ -95,13 +95,14 @@ GitHub 默认提供上传所需的 `GITHUB_TOKEN`，无需另配个人访问令�
 
 逻辑检查使用临时数据和测试剪贴板。翻译检查需要 Python 3，并在 `127.0.0.1:18767` 启动本机模拟服务，使用虚构凭据，不访问你的翻译接口。
 
-窗口检查需要图形环境；先退出正常实例，再运行：
+窗口与键盘检查需要前台图形桌面；先退出正常实例，再运行：
 
 ```sh
 build/OpenPaste.app/Contents/MacOS/OpenPaste --layout-test
+build/OpenPaste.app/Contents/MacOS/OpenPaste --keyboard-test
 ```
 
-验证范围见 [验证说明](VALIDATION.md)。贡献方式见 [CONTRIBUTING.md](../CONTRIBUTING.md)，版本变化见 [CHANGELOG](CHANGELOG.md)。
+它们使用演示数据，通过 AppKit 事件分发验证本进程的窗口与按键处理，退出时恢复剪贴板，不向其他应用粘贴；未取得前台激活时会明确失败。这些检查不能代替真实全局快捷键、跨应用自动粘贴或多设备验收，后者按 [产品功能与边界验收](ACCEPTANCE.md) 实测。贡献方式见 [CONTRIBUTING.md](../CONTRIBUTING.md)，版本变化见 [GitHub Releases](https://github.com/SwallOwDili/OpenPaste/releases)。
 
 ## 数据存储实现
 
@@ -130,9 +131,9 @@ OpenPaste/
 ├── .github/workflows/    # 持续构建与 Release 发布
 ├── Assets/               # 应用图标；本机 Firebase 配置不提交
 ├── Sources/              # Swift 源码与检查入口
-├── Tests/                # 本机翻译模拟服务
+├── Tests/                # Python 单元检查与本机翻译模拟服务
 ├── scripts/              # 构建和检查脚本
-├── docs/                 # 变更与验证说明
+├── docs/                 # 验收流程、授权与开发说明
 ├── build.sh              # 构建入口
 ├── CONTRIBUTING.md
 └── README.md
