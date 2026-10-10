@@ -108,7 +108,6 @@ final class Store: ObservableObject {
     @Published var translating = false
     @Published var translationStatus = ""
     @Published var translationSelectionAuthorized = false
-    var selectionCaptureActive = false
     @Published var message = "所有内容仅保存在这台 Mac"
     /// Card whose title is being edited in place; nil when no inline rename is active.
     @Published var renamingID: UUID?
@@ -588,7 +587,6 @@ final class Store: ObservableObject {
         if freezeOnResume, !paused, wasPaused || persistedPauseExpiryPending { freezeCurrentPasteboardRevision() }
     }
     func capture(force: Bool = false, pasteboard pb: NSPasteboard = .general, sourceOverride: ClipboardCaptureSource? = nil) {
-        guard !selectionCaptureActive else { return }
         let observedChange = pb.changeCount
         let changed = observedChange != change
         guard !paused, force || changed else { return }
