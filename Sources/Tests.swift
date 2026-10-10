@@ -234,6 +234,90 @@ func runNavigationTests() {
     store.query = "Item 4999 "
     guard store.filtered.count == 1, store.selected == clips[4999].id else { print("FAIL: filtering keeps stale selection"); exit(1) }
     print(String(format: "PASS: 5000-item navigation, 2000 moves in %.3f s, no refilter; query selects valid result", elapsed))
+    let boards = [UUID(), UUID(), UUID()]
+    guard BoardNavigation.next(from: nil, boards: [], delta: 1) == nil,
+          BoardNavigation.next(from: nil, boards: boards, delta: 1) == .some(boards[0]),
+          BoardNavigation.next(from: boards[2], boards: boards, delta: 1) == .some(nil),
+          BoardNavigation.next(from: nil, boards: boards, delta: -1) == .some(boards[2]),
+          BoardNavigation.next(from: boards[1], boards: boards, delta: -1) == .some(boards[0]) else { print("FAIL: board cycling"); exit(1) }
+    guard HorizontalWheel.offset(current: 100, deltaX: 0, deltaY: -3, precise: false, contentWidth: 5000, viewportWidth: 1000) == 136,
+          HorizontalWheel.offset(current: 10, deltaX: 0, deltaY: 40, precise: true, contentWidth: 5000, viewportWidth: 1000) == 0,
+          HorizontalWheel.offset(current: 3990, deltaX: 0, deltaY: -50, precise: true, contentWidth: 5000, viewportWidth: 1000) == 4000,
+          HorizontalWheel.offset(current: 0, deltaX: 12, deltaY: 1, precise: true, contentWidth: 5000, viewportWidth: 1000) == nil,
+          HorizontalWheel.offset(current: 0, deltaX: 0, deltaY: 0, precise: false, contentWidth: 5000, viewportWidth: 1000) == nil else { print("FAIL: wheel conversion"); exit(1) }
+    var labelled = clips[7]; labelled.userLabel = "Gamma 名称"
+    store.archive.clips[7] = labelled
+    store.query = "gamma 名称"
+    guard store.filtered.map(\.id) == [labelled.id] else { print("FAIL: renamed label is searchable without changing title"); exit(1) }
+    store.query = ""
+    guard BoardPalette.names.count == 8, Set(BoardPalette.names).count == 8,
+          Set(BoardPalette.names.map { BoardPalette.nsColor($0).description }).count == 8 else { print("FAIL: board colour choices"); exit(1) }
+    let boardStore = Store(ephemeral: true)
+    boardStore.addBoard("Old name")
+    let boardID = boardStore.archive.boards[0].id
+    boardStore.renameBoard(boardID, to: "  New name ")
+    boardStore.renameBoard(boardID, to: "   ")
+    guard boardStore.archive.boards[0].name == "New name" else { print("FAIL: board rename"); exit(1) }
+    print("PASS: board cycling, preview paging, wheel conversion, label search and colour choices")
+    let red = NSAttributedString(string: "Styled", attributes: [.foregroundColor: NSColor.red, .font: NSFont.boldSystemFont(ofSize: 24)])
+    let plainAttributed = NSAttributedString(string: "Plain", attributes: [.foregroundColor: NSColor.black, .font: NSFont.systemFont(ofSize: 12)])
+    let rtfData = try! red.data(from: NSRange(location: 0, length: red.length), documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
+    let richClip = Clip(source: "Word", sourceID: "", kind: "文字", title: "Styled", text: "Styled", parts: [[ClipPart(type: "public.rtf", data: rtfData), ClipPart(type: "public.utf8-plain-text", data: Data("Styled".utf8))]])
+    let plainClip = Clip(source: "Fixture", sourceID: "", kind: "文字", title: "Plain", text: "Plain", parts: [[ClipPart(type: "public.utf8-plain-text", data: Data("Plain".utf8))]])
+    guard RichTextCache.hasRichPart(richClip), !RichTextCache.hasRichPart(plainClip),
+          RichTextCache.hasVisibleFormatting(red), !RichTextCache.hasVisibleFormatting(plainAttributed) else { print("FAIL: rich text detection"); exit(1) }
+    var loaded: NSAttributedString?; var done = false
+    RichTextCache.shared.load(richClip) { loaded = $0; done = true }
+    let deadline = Date().addingTimeInterval(5)
+    while !done && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+    guard loaded?.string == "Styled", RichTextCache.hasVisibleFormatting(loaded!), RichTextCache.shared.cached(richClip) != nil else { print("FAIL: rich text card cache"); exit(1) }
+    print("PASS: rich text cards detect formatting, load RTF and cache the result")
+    let defaults = UserDefaults(suiteName: "openpaste.shelf-shortcuts.\(UUID().uuidString)")!
+    guard ShelfShortcuts.load(from: defaults) == .standard,
+          ShelfChord.nextBoard.valid, ShelfChord.previousBoard.valid,
+          !ShelfChord(keyCode: 15, modifiers: NSEvent.ModifierFlags.command.rawValue, keyName: "R").valid,
+          !ShelfChord(keyCode: 18, modifiers: NSEvent.ModifierFlags.command.rawValue, keyName: "1").valid,
+          !ShelfChord(keyCode: 33, modifiers: NSEvent.ModifierFlags.shift.rawValue, keyName: "[").valid,
+          ShelfChord(keyCode: 33, modifiers: NSEvent.ModifierFlags.command.rawValue, keyName: "[").valid else { print("FAIL: shelf chord validation"); exit(1) }
+    var custom = ShelfShortcuts.standard.settingQuickPaste(.option)
+    guard custom.quickPaste == .option, custom.plainText == .shift,
+          custom.quickPasteMatch([.option]) == (true, false), custom.quickPasteMatch([.option, .shift]) == (true, true),
+          custom.quickPasteMatch([.command]) == (false, false), custom.quickPasteMatch([.option, .command]) == (false, false) else { print("FAIL: quick paste modifier matching"); exit(1) }
+    custom = custom.settingPlainText(.option)
+    guard custom.plainText == .option, custom.quickPaste == .command, custom.isConsistent else { print("FAIL: modifiers must stay distinct"); exit(1) }
+    custom.nextBoard = ShelfChord(keyCode: 30, modifiers: NSEvent.ModifierFlags.command.rawValue, keyName: "]")
+    custom.save(to: defaults)
+    guard ShelfShortcuts.load(from: defaults) == custom else { print("FAIL: shelf shortcuts persistence"); exit(1) }
+    ShelfShortcuts.standard.save(to: defaults)
+    guard ShelfShortcuts.load(from: defaults) == .standard, defaults.data(forKey: "shelfShortcuts") == nil else { print("FAIL: default shortcuts are not stored"); exit(1) }
+    print("PASS: customizable board, quick paste and plain-text shortcuts")
+    guard PreviewMetadata.colorSummary(hex: "#564326") == "RGB 86, 67, 38 · HSL 36, 39, 24 · HSB 36, 56, 34",
+          PreviewMetadata.colorSummary(hex: "#FFFFFF") == "RGB 255, 255, 255 · HSL 0, 0, 100 · HSB 0, 0, 100",
+          PreviewMetadata.colorSummary(hex: "not a colour") == nil,
+          PreviewMetadata.textSummary("hello world\nsecond line") == "23 个字符 · 4 个词 · 2 行",
+          PreviewMetadata.textSummary("") == "0 个字符 · 0 个词 · 0 行",
+          PreviewMetadata.imageSize(fixtureImage())?.width == 3200 else {
+        print("FAIL: preview metadata", PreviewMetadata.colorSummary(hex: "#564326") ?? "nil", PreviewMetadata.colorSummary(hex: "#FFFFFF") ?? "nil", PreviewMetadata.textSummary("hello world\nsecond line"), PreviewMetadata.textSummary(""), PreviewMetadata.imageSize(fixtureImage()) as Any); exit(1) }
+    print("PASS: preview footer metadata")
+    let screen = CGSize(width: 1512, height: 900)
+    let colorSize = PreviewLayout.size(for: Clip(source: "x", sourceID: "", kind: "颜色", title: "c", text: "#564326", parts: []), screen: screen)
+    let textSize = PreviewLayout.size(for: plainClip, screen: screen)
+    let linkSize = PreviewLayout.size(for: Clip(source: "x", sourceID: "", kind: "链接", title: "l", text: "https://example.com", parts: []), screen: screen)
+    let tall = PreviewLayout.size(for: { var c = fixtureImage(); c.parts = [[ClipPart(type: "public.png", data: { let r = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1080, pixelsHigh: 2403, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!; return r.representation(using: .png, properties: [:])! }())]]; return c }(), screen: screen)
+    guard colorSize.width == 390, colorSize.height < textSize.height, textSize.width == 650, linkSize.height > textSize.height,
+          tall.height <= 480, tall.width >= 430, tall.width < textSize.width,
+          PreviewLayout.size(for: plainClip, screen: CGSize(width: 500, height: 800)).width <= 476 else { print("FAIL: preview layout sizes", colorSize, textSize, linkSize, tall); exit(1) }
+    print("PASS: preview sizes follow content type")
+    let orangeTile = NSImage(size: NSSize(width: 64, height: 64), flipped: false) { rect in
+        NSColor.white.setFill(); rect.fill()
+        NSColor(srgbRed: 0.9, green: 0.4, blue: 0.2, alpha: 1).setFill(); NSBezierPath(roundedRect: rect.insetBy(dx: 10, dy: 10), xRadius: 8, yRadius: 8).fill()
+        return true
+    }
+    guard let accent = IconAccent.dominant(of: orangeTile)?.usingColorSpace(.sRGB),
+          accent.redComponent > 0.8, accent.greenComponent > 0.3, accent.greenComponent < 0.55, accent.blueComponent < 0.35 else { print("FAIL: icon accent colour"); exit(1) }
+    let whiteOnly = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { rect in NSColor.white.setFill(); rect.fill(); return true }
+    guard let light = IconAccent.dominant(of: whiteOnly)?.usingColorSpace(.sRGB), light.redComponent <= 0.63 else { print("FAIL: light icons must be darkened for white text"); exit(1) }
+    print("PASS: card header takes the source icon's dominant colour")
 }
 
 func fixtureImage() -> Clip {
