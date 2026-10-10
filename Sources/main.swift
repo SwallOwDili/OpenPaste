@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import Carbon
 import ApplicationServices
 
@@ -44,7 +45,7 @@ private func menuBarMark() -> NSImage {
 
 final class ShelfPanel: NSWindow { override var canBecomeKey: Bool { true }; override var canBecomeMain: Bool { true } }
 final class ShelfHost: NSHostingView<ShelfView> { override var acceptsFirstResponder: Bool { true } }
-final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopoverDelegate {
     static var shared: Controller!
     let preview = TestMode.translationWorkflow || TestMode.translationUI || TestMode.featureUI || TestMode.preview || TestMode.layout || TestMode.shortcut || TestMode.ui || TestMode.keyboard
     lazy var store = Store(ephemeral: preview, loadHistoryAsynchronously: !preview && !TestMode.active)
@@ -57,6 +58,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var handler: EventHandlerRef?
     var keyMonitor: Any?
     var outsideClickMonitor: Any?
+    var wheelMonitor: Any?
+    var pendingSearchKeys: [NSEvent] = []
+    var pendingSearchAttempts = 0
     var menuObservers: [NSObjectProtocol] = []
     var trackingMenus = Set<ObjectIdentifier>()
     var menuTransition = 0
@@ -64,7 +68,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var pendingOutsideClick = false
     var pendingApplicationSwitch = false
     var shelfPresentation = 0
-    var previewWindow: NSWindow?
+    /// The preview is a system popover anchored to the selected card.
+    var previewPopover: NSPopover?
+    var previewHost: NSHostingController<FullItemPreview>?
+    var previewSelectionObserver: AnyCancellable?
+    var previewWindow: NSWindow? { previewPopover?.isShown == true ? previewHost?.view.window : nil }
     var previewClipID: UUID?
     var previewClip: Clip? { store.archive.clips.first { $0.id == previewClipID } }
     var editorWindow: NSWindow?
@@ -252,15 +260,28 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
                 return nil
             }
+            if let target = self.store.recordingChord, self.settingsWindow?.isKeyWindow == true {
+                if event.keyCode == 53 { self.store.recordingChord = nil; self.store.chordNotice = "" }
+                else { self.recordChord(ShelfChord.from(event), for: target) }
+                return nil
+            }
             if self.store.settings, self.settingsWindow?.attachedSheet == nil, self.settingsWindow?.isKeyWindow == true, event.keyCode == 53 || (event.keyCode == 13 && event.modifierFlags.contains(.command)) { self.closeSettings(); return nil }
-            if self.previewWindow?.isKeyWindow == true, !(self.previewWindow?.firstResponder is NSTextView) {
-                if event.keyCode == 49 || event.keyCode == 53 { self.previewWindow?.close(); return nil }
+            // Read-only text in the preview may hold focus; only a text view being edited keeps the arrow keys.
+            if self.previewPopover?.isShown == true, !self.store.settings, (NSApp.keyWindow?.firstResponder as? NSTextView)?.isEditable != true {
+                let plain = event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
+                if event.keyCode == 49 || event.keyCode == 53 { self.closePreview(); return nil }
+                // The preview follows the shelf selection, so arrows simply move it.
+                if plain, event.keyCode == 123 || event.keyCode == 124 { self.store.searchFocused = false; self.store.moveSelection(event.keyCode == 124 ? 1 : -1); return nil }
                 if event.modifierFlags.contains(.command), let clip = self.previewClip {
                     switch event.charactersIgnoringModifiers?.lowercased() { case "e": self.edit(clip); return nil; case "r": self.rename(clip); return nil; case "o": self.openItem(clip); return nil; default: break }
                 }
             }
             guard !self.modalShowing, self.panel.isKeyWindow, !self.store.settings else { return event }
             if let editor = self.panel.firstResponder as? NSTextView, editor.hasMarkedText() { return event }
+            if self.store.renamingID != nil {
+                if event.keyCode == 53 { self.cancelInlineRename(); return nil }
+                return event
+            }
             if event.keyCode == 53 {
                 if self.store.searchExpanded {
                     self.store.resetFilters(preserveBoard: true); self.store.filtersExpanded = false
@@ -274,6 +295,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.store.reverseHistory = event.modifierFlags.contains(.shift)
                 self.store.deleteChosen()
                 return nil
+            }
+            for (chord, delta) in [(self.store.shelfShortcuts.nextBoard, 1), (self.store.shelfShortcuts.previousBoard, -1)] where chord.matches(event) {
+                if self.panel.firstResponder is NSTextView, chord.movesTextCursor { break }
+                self.switchBoard(delta); return nil
             }
             if !(self.panel.firstResponder is NSTextView) {
                 let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
@@ -293,11 +318,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if event.keyCode == 49, let clip = self.store.selectedClips.first { self.showPreview(clip); return nil }
                 if event.keyCode == 48 { self.store.searchFocused = true; return nil }
                 if !event.modifierFlags.intersection([.command, .control, .option]).isEmpty { }
-                else if let chars = event.characters, !chars.isEmpty, chars.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }), ![36,49,123,124,125,126,48,53,51,117].contains(event.keyCode) { self.store.searchFocused = true; self.store.query += chars; return nil }
+                else if let chars = event.characters, !chars.isEmpty, chars.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }), ![36,49,123,124,125,126,48,53,51,117].contains(event.keyCode) { self.beginTypeToSearch(event); return nil }
             } else if event.keyCode == 48 || event.keyCode == 125 { self.store.searchFocused = false; self.panel.makeFirstResponder(self.panel.contentView); return nil }
             if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" { if self.store.searchExpanded { self.store.filtersExpanded.toggle() }; self.store.searchFocused = true; return nil }
-            if event.modifierFlags.contains(.command), let n = Int(event.charactersIgnoringModifiers ?? ""), n >= 1, n <= 9, self.store.filtered.count >= n { self.paste(self.store.filtered[n - 1], plain: event.modifierFlags.contains(.shift)); return nil }
-            if event.keyCode == 36 || event.keyCode == 76, let clip = self.store.filtered.first(where: { $0.id == self.store.selected }) ?? self.store.filtered.first { self.pasteSelection(fallback: clip, plain: event.modifierFlags.contains(.shift)); return nil }
+            let quick = self.store.shelfShortcuts.quickPasteMatch(event.modifierFlags)
+            if quick.matches, let n = Int(event.charactersIgnoringModifiers ?? ""), n >= 1, n <= 9, self.store.filtered.count >= n { self.paste(self.store.filtered[n - 1], plain: quick.plain); return nil }
+            if event.keyCode == 36 || event.keyCode == 76, let clip = self.store.filtered.first(where: { $0.id == self.store.selected }) ?? self.store.filtered.first { self.pasteSelection(fallback: clip, plain: self.store.shelfShortcuts.isPlain(event.modifierFlags)); return nil }
             if [123, 124].contains(event.keyCode), self.panel.firstResponder is NSTextView { return event }
             if [123, 124, 125].contains(event.keyCode), !event.modifierFlags.contains(.command) {
                 self.store.searchFocused = false
@@ -310,6 +336,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 return nil
             }
             return event
+        }
+        wheelMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
+            guard let self, event.window === self.panel, !self.store.settings, let content = self.panel.contentView,
+                  let scroll = self.horizontalScrollView(in: content, at: event.locationInWindow), let document = scroll.documentView else { return event }
+            let clip = scroll.contentView
+            guard let target = HorizontalWheel.offset(current: clip.bounds.origin.x, deltaX: event.scrollingDeltaX, deltaY: event.scrollingDeltaY,
+                                                      precise: event.hasPreciseScrollingDeltas, contentWidth: document.frame.width, viewportWidth: clip.bounds.width) else { return event }
+            clip.scroll(to: NSPoint(x: target, y: clip.bounds.origin.y))
+            scroll.reflectScrolledClipView(clip)
+            return nil
         }
         finishApplicationSetup()
         #if OPENPASTE_TESTING
@@ -528,6 +564,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func hideShelf() {
         logInteraction("shelf.hide", reason: "explicit")
+        closePreview()
         cancelTranslation()
         store.reverseHistory = false
         panel.orderOut(nil)
@@ -671,7 +708,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store.shortcutNotice = "现在按下新的组合键，Esc 取消"
         settingsWindow?.makeFirstResponder(nil)
     }
+    func recordChord(_ chord: ShelfChord, for target: ShelfChordTarget) {
+        var updated = store.shelfShortcuts
+        if target == .nextBoard { updated.nextBoard = chord } else { updated.previousBoard = chord }
+        guard chord.valid else { store.chordNotice = "请使用 ⌘、⌃ 或 ⌥ 搭配一个未被占用的按键；Esc 取消"; return }
+        guard updated.nextBoard != updated.previousBoard else { store.chordNotice = "上一个与下一个收藏板不能使用同一组合键"; return }
+        store.shelfShortcuts = updated; store.recordingChord = nil; store.chordNotice = ""
+    }
     func cancelShortcutRecording() {
+        if store.recordingChord != nil { store.recordingChord = nil; store.chordNotice = "" }
         guard store.recordingShortcut else { return }
         store.recordingShortcut = false
         _ = installShortcut(shortcut, persist: false)
@@ -816,8 +861,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func windowWillClose(_ notification: Notification) {
         if let window = notification.object as? NSWindow, window === settingsWindow { cancelShortcutRecording(); store.settings = false }
-        if let window = notification.object as? NSWindow, window === previewWindow || window === editorWindow {
-            if window === previewWindow { previewClipID = nil; previewWindow = nil }
+        if let window = notification.object as? NSWindow, window === editorWindow {
             if window === editorWindow { editorWindow = nil }
             DispatchQueue.main.async { [weak self] in self?.restoreWorkingWindowFocus() }
         }
@@ -909,6 +953,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         _ = AXIsProcessTrustedWithOptions(options)
         openExternal(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
+    func renameBoard(_ board: Board) {
+        let alert = NSAlert(); alert.messageText = "重命名收藏板"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24)); field.stringValue = board.name
+        alert.accessoryView = field; alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消")
+        alert.window.initialFirstResponder = field
+        presentAlert(alert) { [weak self] response in if response == .alertFirstButtonReturn { self?.store.renameBoard(board.id, to: field.stringValue) } }
+    }
+    func confirmRemoveBoard(_ board: Board) {
+        let alert = NSAlert(); alert.messageText = "删除收藏板“\(board.name)”？"; alert.informativeText = "收藏板内的内容会保留在历史中。"
+        alert.addButton(withTitle: "删除"); alert.addButton(withTitle: "取消")
+        presentAlert(alert) { [weak self] response in if response == .alertFirstButtonReturn { self?.store.removeBoard(board.id) } }
+    }
     func newBoard() {
         let alert = NSAlert(); alert.messageText = "新建收藏板"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24)); field.placeholderString = "例如：常用文案"
@@ -917,6 +973,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         presentAlert(alert) { [weak self] response in if response == .alertFirstButtonReturn { self?.store.addBoard(field.stringValue) } }
     }
     func edit(_ clip: Clip) {
+        if clip.kind == "图片" { showPreview(clip); return }
+        if clip.kind == "文件" { showToast("文件不能直接编辑，按 ⌘O 打开原文件"); return }
         let editTarget = store.contentEditTarget(for: clip)
         if CapturedColor.parse(clip.text) != nil {
             editorWindow?.close(); let window = auxiliaryWindow("编辑颜色", size: NSSize(width: 400, height: 340)); editorWindow = window
@@ -1024,6 +1082,10 @@ struct ShelfView: View {
     @State private var renderedClipCount = ShelfRenderWindow.batchSize
     @ObservedObject var store: Store
     @FocusState private var searchFocused: Bool
+    /// Text typed in the field; committed to the store after a short pause so large
+    /// histories are not re-filtered per keystroke or during input-method composition.
+    @State private var draftQuery = ""
+    @State private var queryCommit: DispatchWorkItem?
     var body: some View {
         let renderedClips = Array(store.filtered.prefix(renderedClipCount))
         VStack(spacing: 0) {
@@ -1038,8 +1100,8 @@ struct ShelfView: View {
                 if store.searchExpanded {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass").foregroundStyle(searchFocused ? Color.blue : Color.secondary)
-                    TextField("搜索文字、链接或来源", text: $store.query).textFieldStyle(.plain).focused($searchFocused).frame(width: 250)
-                    if !store.query.isEmpty { Button { store.query = ""; store.searchFocused = true } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain).help("清空搜索") }
+                    TextField("搜索文字、链接或来源", text: $draftQuery).textFieldStyle(.plain).focused($searchFocused).frame(width: 250)
+                    if !draftQuery.isEmpty { Button { draftQuery = ""; store.query = ""; store.searchFocused = true } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain).help("清空搜索") }
                     else { Text("⌘F").font(.system(size: 10)).foregroundStyle(.tertiary) }
                     Button { resetSearch(); store.searchExpanded = false; store.searchFocused = false; Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) } label: { Image(systemName: "xmark").font(.system(size: 10)).foregroundStyle(.secondary) }.buttonStyle(.plain).help("退出搜索 · Esc")
                 }.padding(.horizontal, 12).padding(.vertical, 9)
@@ -1070,16 +1132,13 @@ struct ShelfView: View {
                                 DispatchQueue.main.async { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
                             }; return true
                         }
-                        .contextMenu {
-                            Menu("更改颜色") {
-                                ForEach(["红色", "橙色", "黄色", "绿色", "青色", "蓝色", "紫色", "灰色"], id: \.self) { color in
-                                    Button { store.setBoardColor(board.id, color: color) } label: {
-                                        Label((board.color ?? "红色") == color ? "✓ " + color : color, systemImage: "circle.fill").foregroundStyle(boardColor(color))
-                                    }
-                                }
+                        .overlay {
+                            RightClickMenu {
+                                BoardMenuBuilder.menu(for: board,
+                                                      rename: { Controller.shared.renameBoard(board) },
+                                                      delete: { Controller.shared.confirmRemoveBoard(board) },
+                                                      pick: { store.setBoardColor(board.id, color: $0) })
                             }
-                            Divider()
-                            Button("删除收藏板（保留内容）") { store.removeBoard(board.id) }
                         }
                 }
                 Button(action: { Controller.shared.newBoard() }) { Image(systemName: "plus") }.buttonStyle(.plain).help("新建收藏板")
@@ -1095,7 +1154,7 @@ struct ShelfView: View {
                         else { Controller.shared.togglePause() }
                     }.disabled(store.recordingPauseControl.action == .unavailable)
                     Divider()
-                    Text("← → 选择 · ↵ 粘贴 · ⌘1–9 快速粘贴")
+                    Text("← → 选择 · ↵ 粘贴 · \(store.shelfShortcuts.quickPasteLabel) 快速粘贴")
                     Button("关闭 · Esc") { Controller.shared.hideShelf() }
                 } label: { Image(systemName: "ellipsis").font(.system(size: 16)).foregroundStyle(.secondary) }.menuStyle(.borderlessButton).fixedSize().help("更多")
             }.padding(.horizontal, 20).padding(.vertical, 12)
@@ -1137,7 +1196,7 @@ struct ShelfView: View {
                         LazyHStack(spacing: 12) {
                             if store.translating { VStack(spacing: 12) { ProgressView(); Text("正在翻译…"); Text("原文保持不变").font(.caption).foregroundStyle(.secondary) }.frame(width: store.compact ? 180 : 240).frame(maxHeight: .infinity).background(.quaternary, in: RoundedRectangle(cornerRadius: 12)) }
                             ForEach(renderedClips) { clip in
-                                ClipCard(clip: clip, index: store.visibleIndex(of: clip.id) ?? 0, selected: store.selection.contains(clip.id) || clip.id == store.selected, current: clip.id == store.currentClipID, store: store).equatable().id(clip.id)
+                                ClipCard(clip: clip, index: store.visibleIndex(of: clip.id) ?? 0, selected: store.selection.contains(clip.id) || clip.id == store.selected, current: clip.id == store.currentClipID, renaming: store.renamingID == clip.id, store: store).equatable().id(clip.id)
                                     .onAppear { if clip.id == renderedClips.last?.id { growRenderWindow() } }
                             }
                         }.padding(.horizontal, 20).padding(.vertical, 8)
@@ -1151,7 +1210,23 @@ struct ShelfView: View {
         }
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.2)).frame(height: 1) }
-        .onChange(of: store.query) { _, query in resetRenderWindow(); if !query.isEmpty { store.indexImages() } }
+        .onChange(of: store.query) { _, query in
+            if draftQuery != query { draftQuery = query }
+            resetRenderWindow(); if !query.isEmpty { store.indexImages() }
+        }
+        .onChange(of: draftQuery) { _, value in
+            queryCommit?.cancel()
+            guard value != store.query else { return }
+            if value.isEmpty { store.query = value; return }
+            let work = DispatchWorkItem { [weak store] in
+                guard let store else { return }
+                // Wait until the input method has committed its marked text.
+                if let editor = Controller.shared?.panel.firstResponder as? NSTextView, editor.hasMarkedText() { return }
+                store.query = value
+            }
+            queryCommit = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+        }
         .onChange(of: store.board) { resetRenderWindow() }
         .onChange(of: store.kind) { resetRenderWindow() }
         .onChange(of: store.sourceFilter) { resetRenderWindow() }
@@ -1214,23 +1289,52 @@ struct ClipCard: View, Equatable {
     let index: Int
     let selected: Bool
     let current: Bool
+    let renaming: Bool
     @ObservedObject var store: Store
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.clip.id == rhs.clip.id && lhs.clip.cachedDigest == rhs.clip.cachedDigest && lhs.index == rhs.index && lhs.selected == rhs.selected && lhs.current == rhs.current && lhs.clip.title == rhs.clip.title && lhs.clip.userLabel == rhs.clip.userLabel && lhs.clip.text == rhs.clip.text && lhs.clip.kind == rhs.clip.kind && lhs.clip.boards == rhs.clip.boards && lhs.clip.created == rhs.clip.created && lhs.clip.source == rhs.clip.source && lhs.clip.ocrText == rhs.clip.ocrText && lhs.clip.linkTitle == rhs.clip.linkTitle
+        lhs.clip.id == rhs.clip.id && lhs.clip.cachedDigest == rhs.clip.cachedDigest && lhs.index == rhs.index && lhs.selected == rhs.selected && lhs.current == rhs.current && lhs.renaming == rhs.renaming && lhs.clip.title == rhs.clip.title && lhs.clip.userLabel == rhs.clip.userLabel && lhs.clip.text == rhs.clip.text && lhs.clip.kind == rhs.clip.kind && lhs.clip.boards == rhs.clip.boards && lhs.clip.created == rhs.clip.created && lhs.clip.source == rhs.clip.source && lhs.clip.ocrText == rhs.clip.ocrText && lhs.clip.linkTitle == rhs.clip.linkTitle
     }
     var color: Color { if clip.kind == "文字", CodeSyntax.language(clip.text) != nil { return .purple }; switch clip.kind { case "链接": return .blue; case "图片": return .purple; case "文件": return .orange; default: return .teal } }
+    /// Header colour: the source app icon's dominant colour, falling back to the content-type colour.
+    var headerFill: Color { PreviewCache.shared.accentColor(clip.sourceID).map { Color(nsColor: $0) } ?? color.opacity(0.85) }
+    /// Text copied with RTF/HTML formatting is drawn as a document page.
+    var richText: Bool { clip.kind == "文字" && CapturedColor.parse(clip.text) == nil && CodeSyntax.language(clip.text) == nil && RichTextCache.hasRichPart(clip) }
+    var characterCountLabel: String? {
+        guard clip.kind == "文字" else { return nil }
+        let bytes = clip.text.utf8.count
+        return bytes > 200_000 ? "20 万+ 字符" : "\(clip.text.count) 个字符"
+    }
     var icon: String { switch clip.kind { case "链接": return "link"; case "图片": return "photo"; case "文件": return "folder"; default: return "text.alignleft" } }
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 5) { Text(clip.cardTitle).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.tail).help(clip.cardTitle); if current { Text("当前").font(.system(size: 9)).opacity(0.75) }; if !clip.boards.isEmpty { Image(systemName: "pin.fill").font(.system(size: 9)) } }
-                    if !store.compact { TimelineView(.periodic(from: .now, by: 60)) { context in Text(ageLabel(clip.created, now: context.date)).font(.system(size: 10)).opacity(0.8) } }
+            // Header: a larger source icon bleeds off the top-right corner.
+            ZStack(alignment: .topTrailing) {
+                Rectangle().fill(headerFill)
+                if let sourceIcon = PreviewCache.shared.sourceIcon(clip.sourceID) {
+                    Image(nsImage: sourceIcon).resizable().scaledToFit()
+                        .frame(width: store.compact ? 44 : 64, height: store.compact ? 44 : 64)
+                        .offset(x: store.compact ? 8 : 10, y: store.compact ? -4 : -3).help(clip.source)
+                } else {
+                    Image(systemName: icon).font(.system(size: store.compact ? 24 : 32)).opacity(0.6).padding(.top, store.compact ? 6 : 10).padding(.trailing, 14).help(clip.source)
                 }
-                Spacer()
-                if let sourceIcon = PreviewCache.shared.sourceIcon(clip.sourceID) { Image(nsImage: sourceIcon).resizable().frame(width: store.compact ? 20 : 28, height: store.compact ? 20 : 28).help(clip.source) }
-                else { Image(systemName: icon).font(.system(size: 20)).opacity(0.6).help(clip.source) }
-            }.foregroundStyle(.white).padding(.horizontal, 12).padding(.vertical, store.compact ? 5 : 9).background { Rectangle().fill(color.opacity(0.85)) }
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 5) {
+                        if renaming { RenameField(initial: clip.cardTitle) { text in Controller.shared.commitInlineRename(clip.id, text: text) } }
+                        else {
+                            Text(clip.cardTitle).font(.system(size: store.compact ? 13 : 15, weight: .semibold)).lineLimit(1).truncationMode(.tail).help(clip.cardTitle)
+                                .onTapGesture {
+                                    // A click on an already selected card's title renames it.
+                                    if selected && store.selection.count <= 1 { Controller.shared.rename(clip) }
+                                    else { store.searchFocused = false; store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) }
+                                }
+                        }
+                        if current { Text("当前").font(.system(size: 10)).opacity(0.75) }; if !clip.boards.isEmpty { Image(systemName: "pin.fill").font(.system(size: 10)) } }
+                    if !store.compact { TimelineView(.periodic(from: .now, by: 60)) { context in Text(ageLabel(clip.created, now: context.date)).font(.system(size: 12)).opacity(0.85) } }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .padding(.leading, 14).padding(.trailing, store.compact ? 46 : 66)
+            }
+            .foregroundStyle(.white).frame(height: store.compact ? 38 : 60).clipped()
             VStack(alignment: .leading, spacing: 9) {
                 if clip.kind == "链接" { RichLinkCard(clip: clip, enabled: store.networkPreviews, store: store).id(clip.text) }
                 else if let color = CapturedColor.parse(clip.text) {
@@ -1238,6 +1342,7 @@ struct ClipCard: View, Equatable {
                     Text(color.hex).font(.system(size: 16, weight: .semibold, design: .monospaced)).textSelection(.enabled)
                 }
                 else if clip.kind == "文字", CodeSyntax.language(clip.text) != nil { CodeCardBody(text: clip.text, compact: store.compact) }
+                else if richText { RichTextCardBody(clip: clip, compact: store.compact) }
                 else if clip.kind == "图片" { ClipThumbnail(clip: clip).allowsHitTesting(false) }
                 else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first, ["png", "jpg", "jpeg", "tiff", "tif", "heic", "gif", "webp"].contains(URL(fileURLWithPath: path).pathExtension.lowercased()) {
                     ClipThumbnail(clip: clip)
@@ -1253,10 +1358,17 @@ struct ClipCard: View, Equatable {
                     Spacer(minLength: 0)
                 }
             }.padding(12).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).background { Rectangle().fill(clip.kind == "文字" && CodeSyntax.language(clip.text) != nil ? Color(white: 0.14) : Color.clear) }
-            if index < 9 { Text("\(index + 1)").font(.system(size: 10)).foregroundStyle(clip.kind == "文字" && CodeSyntax.language(clip.text) != nil ? Color.white.opacity(0.45) : Color.secondary).frame(maxWidth: .infinity, alignment: .trailing).padding(.trailing, 10).padding(.bottom, 7) }
+            if !store.compact || index < 9 {
+                let footerColor = clip.kind == "文字" && CodeSyntax.language(clip.text) != nil ? Color.white.opacity(0.45) : (richText ? Color.black.opacity(0.45) : Color.secondary)
+                HStack {
+                    if !store.compact, let label = characterCountLabel { Text(label) }
+                    Spacer(minLength: 0)
+                    if index < 9 { Text("\(index + 1)") }
+                }.font(.system(size: 10)).foregroundStyle(footerColor).padding(.horizontal, 12).padding(.bottom, 7)
+            }
         }
         .frame(width: store.compact ? 180 : 240).frame(maxHeight: .infinity)
-        .background(clip.kind == "文字" && CodeSyntax.language(clip.text) != nil ? Color(white: 0.14) : Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+        .background(clip.kind == "文字" && CodeSyntax.language(clip.text) != nil ? Color(white: 0.14) : (richText ? Color.white : Color(nsColor: .controlBackgroundColor)), in: RoundedRectangle(cornerRadius: 12))
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? Color.blue : Color.primary.opacity(0.08), lineWidth: selected ? 2 : 1))
         .shadow(color: .black.opacity(0.03), radius: 2, y: 1)
@@ -1269,12 +1381,12 @@ struct ClipCard: View, Equatable {
             Button("预览 · 空格") { Controller.shared.showPreview(clip) }
             Button("打开 · ⌘O") { Controller.shared.openItem(clip) }
             Button("重命名 · ⌘R") { Controller.shared.rename(clip) }
-            if clip.kind == "图片" { Button("旋转图片") { Controller.shared.rotate(clip) }; Button("提取文字") { Controller.shared.extractText(clip) } }
+            if clip.kind == "图片" { Button("编辑 · ⌘E") { Controller.shared.edit(clip) }; Button("旋转图片") { Controller.shared.rotate(clip) }; Button("提取文字") { Controller.shared.extractText(clip) } }
             if let map = MapLink.parse(clip.text) { Button("在地图中打开") { Controller.shared.openExternal(map.url) } }
             Button("仅复制") { _ = store.restore(clip, plain: false); store.message = "已复制" }
             if clip.kind == "文字" || clip.kind == "链接" || clip.kind == "颜色" {
                 Button("粘贴为纯文本") { Controller.shared.paste(clip, plain: true) }
-                Button("编辑文字…") { Controller.shared.edit(clip) }
+                Button("编辑 · ⌘E") { Controller.shared.edit(clip) }
             }
             Menu("收藏到") { ForEach(store.archive.boards) { b in Button((clip.boards.contains(b.id) ? "✓ " : "") + b.name) { store.pin(clip, to: b.id) } }; Button("新建收藏板…") { Controller.shared.newBoard() } }
             Divider()
@@ -1347,3 +1459,29 @@ let app = NSApplication.shared
 let delegate = Controller(); app.delegate = delegate
 app.run()
 #endif
+
+/// Title field shown on a card while it is being renamed in place.
+struct RenameField: View {
+    let initial: String
+    let commit: (String) -> Void
+    @State private var text = ""
+    @FocusState private var focused: Bool
+    var body: some View {
+        TextField("", text: $text)
+            .textFieldStyle(.plain)
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 4).padding(.vertical, 2)
+            .background(Color.white.opacity(0.9), in: RoundedRectangle(cornerRadius: 4))
+            .foregroundStyle(Color.black)
+            .focused($focused)
+            .onSubmit { commit(text) }
+            .onAppear {
+                text = initial
+                DispatchQueue.main.async {
+                    focused = true
+                    (Controller.shared.panel.firstResponder as? NSTextView)?.selectAll(nil)
+                }
+            }
+            .onChange(of: focused) { was, now in if was && !now { commit(text) } }
+    }
+}
