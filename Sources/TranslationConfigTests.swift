@@ -58,5 +58,12 @@ func runTranslationConfigTests() {
         check(request.url?.host == "different.example" && json["model"] as? String == "updated-model", "actual request uses saved endpoint and model")
         check(request.value(forHTTPHeaderField: "Authorization") == "Bearer replacement-key", "actual request uses the saved key from the same profile")
     } catch { print("FAIL: saved request construction: \(error)"); exit(1) }
+    // Finder selections arrive as file references plus the file name as text.
+    check(SelectionCapturePolicy.isFileSelection(types: [.fileURL, .string]), "file URL with a name string is a file selection")
+    check(SelectionCapturePolicy.isFileSelection(types: [.string, NSPasteboard.PasteboardType("NSFilenamesPboardType")]), "legacy filenames type is a file selection")
+    check(SelectionCapturePolicy.isFileSelection(types: [NSPasteboard.PasteboardType("com.apple.pasteboard.promised-file-url")]), "promised file URL is a file selection")
+    check(!SelectionCapturePolicy.isFileSelection(types: [.string]), "plain text is not a file selection")
+    check(!SelectionCapturePolicy.isFileSelection(types: [.string, .rtf, .html, .URL]), "rich text and web links stay translatable")
+    check(!SelectionCapturePolicy.isFileSelection(types: []), "empty pasteboard is not a file selection")
     print("Translation configuration: \(checks) checks passed")
 }
