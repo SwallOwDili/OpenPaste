@@ -174,13 +174,15 @@ extension Controller {
         let selectionAuthorized = AXIsProcessTrusted()
         store.translationSelectionAuthorized = selectionAuthorized
         guard selectionAuthorized else { refreshPermission(); showShelf(); return }
+        // Show the shelf first, without taking focus: the target app must stay frontmost for the copy fallback below.
+        showShelf(activating: false)
         let (text, noSelection) = selectedText(in: app)
-        if let text { showShelf(); translateSelection(text); return }
-        if noSelection { showShelf(); return }
+        if let text { activateShelf(); translateSelection(text); return }
+        if noSelection { activateShelf(); return }
         // Apps without selected-text accessibility support: copy selection, then restore all original clipboard types.
         let pb = NSPasteboard.general
         guard let original = ClipboardWrite.snapshot(pb) else {
-            showShelf(); store.translationStatus = "当前剪贴板无法完整暂存，已取消翻译"; return
+            activateShelf(); store.translationStatus = "当前剪贴板无法完整暂存，已取消翻译"; return
         }
         let before = original.changeCount; let generation = translationGeneration
         activeSelectionCaptureGeneration = generation
@@ -203,11 +205,13 @@ extension Controller {
             // Do not let the shelf's forced capture turn our synthetic Command-C
             // payload into a history item after a canceled fallback.
             if pb.changeCount != before { suppressCurrentCapture() }
-            self.showShelf(); self.store.translationStatus = message
+            self.activateShelf(); self.store.translationStatus = message
             endSelectionCapture()
         }
         func finish(_ attempt: Int) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            // Checks every 25 ms and gives up after 10 checks (about 250 ms): responsive applications change the
+            // pasteboard within a few tens of milliseconds, and "nothing selected" must not hold the keyboard for long.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) {
                 guard generation == self.translationGeneration else {
                     // Once canceled, the current board may be our synthetic copy or a
                     // newer external copy. Never overwrite it; suppress this one count
@@ -253,7 +257,7 @@ extension Controller {
                     } else {
                         suppressCurrentCapture()
                     }
-                    self.showShelf()
+                    self.activateShelf()
                     self.store.translationStatus = restoration == .superseded
                         ? "剪贴板已被其他内容更新，已取消翻译"
                         : "无法安全恢复原剪贴板，已取消翻译"
@@ -262,7 +266,7 @@ extension Controller {
                 }
                 self.store.recordRestoredClipboardChange(from: before, pasteboard: pb)
                 guard generation == self.translationGeneration else { endSelectionCapture(); return }
-                self.showShelf()
+                self.activateShelf()
                 endSelectionCapture()
                 if fileSelection { self.store.translationStatus = "选中的是文件，已跳过翻译"; return }
                 if !confidential, let copied, !copied.isEmpty { self.translateSelection(copied) }
