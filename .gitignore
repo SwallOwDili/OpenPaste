@@ -26,3 +26,6 @@ __pycache__/
 *.pyc
 .vscode/
 .idea/
+
+# Local agent instructions
+Claude.md
