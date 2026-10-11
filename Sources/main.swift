@@ -43,7 +43,9 @@ private func menuBarMark() -> NSImage {
     return image
 }
 
-final class ShelfPanel: NSWindow { override var canBecomeKey: Bool { true }; override var canBecomeMain: Bool { true } }
+/// Non-activating, so the shelf can take the keyboard even when the system refuses to activate the app
+/// (secure event input while a password field is focused).
+final class ShelfPanel: NSPanel { override var canBecomeKey: Bool { true }; override var canBecomeMain: Bool { true } }
 final class ShelfHost: NSHostingView<ShelfView> { override var acceptsFirstResponder: Bool { true } }
 final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopoverDelegate {
     static var shared: Controller!
@@ -200,7 +202,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         }
         #endif
         let finishPanelHost = AcceptanceMetrics.begin("launch.panel-host")
-        panel = ShelfPanel(contentRect: NSRect(x: 0, y: 0, width: 1100, height: max(180, AppEnvironment.current.defaults.double(forKey: "shelfHeight") == 0 ? 300 : AppEnvironment.current.defaults.double(forKey: "shelfHeight"))), styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
+        panel = ShelfPanel(contentRect: NSRect(x: 0, y: 0, width: 1100, height: max(180, AppEnvironment.current.defaults.double(forKey: "shelfHeight") == 0 ? 300 : AppEnvironment.current.defaults.double(forKey: "shelfHeight"))), styleMask: [.borderless, .resizable, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.becomesKeyOnlyIfNeeded = false; panel.hidesOnDeactivate = false
         panel.delegate = self
         panel.level = .statusBar; panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
         panel.minSize = NSSize(width: 760, height: 180)
@@ -531,13 +534,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         DispatchQueue.main.async { [weak self] in self?.restoreShelfKeyboardFocus() }
         verifyShelfActivation(attempt: 0)
     }
-    /// A delayed activation request can be dropped by the system while another app (a browser) stays frontmost,
-    /// leaving the visible shelf without the keyboard until the user clicks it. Check, retry, and record the result.
+    /// The system can drop an activation request while another app stays frontmost. The shelf is a non-activating
+    /// panel so it normally still becomes key; check that it did, retry otherwise, and record the result.
     func verifyShelfActivation(attempt: Int) {
         let presentation = shelfPresentation
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
             guard let self, self.shelfPresentation == presentation, self.panel.isVisible, !self.shelfAwaitingActivation else { return }
-            if self.panel.isKeyWindow && NSApp.isActive { if attempt > 0 { self.logInteraction("shelf.activate-recovered") }; return }
+            if self.panel.isKeyWindow { if attempt > 0 { self.logInteraction("shelf.activate-recovered") }; return }
             guard attempt < 3, !self.store.settings, !self.modalShowing, self.previewWindow?.isVisible != true, self.editorWindow?.isVisible != true else { return }
             self.logInteraction("shelf.activate-retry", reason: "attempt\(attempt + 1)")
             _ = NSRunningApplication.current.activate(options: [.activateAllWindows])
@@ -833,7 +836,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             "reason": reason, "visible": String(panel?.isVisible == true),
             "key": String(panel?.isKeyWindow == true), "active": String(NSApp.isActive),
             "external": String(externalApplicationActive), "menus": String(trackingMenus.count),
-            "finishing": String(menuFinishing), "settings": String(store.settings), "keyRole": keyRole
+            "finishing": String(menuFinishing), "settings": String(store.settings), "keyRole": keyRole,
+            "front": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "none",
+            "secure-input": String(IsSecureEventInputEnabled())
         ])
     }
     func observeMenuTracking() {
