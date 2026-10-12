@@ -1,15 +1,14 @@
 import AppKit
 import SwiftUI
 
-/// Caches the attributed form of rich clips (RTF / HTML) for shelf cards.
-/// RTF and attachment reads happen on a background queue; HTML import needs the
-/// main thread, so it is size-limited and done once per clip version.
+/// Shelf cards parse RTF / RTFD off the UI thread. HTML-only clips deliberately
+/// keep their text summary; active detail previews retain the original HTML.
 final class RichTextCache {
     static let shared = RichTextCache()
-    static let htmlByteLimit = 256 * 1024
     private let cache = NSCache<NSString, NSAttributedString>()
     private var failed = Set<String>()
     private var pending: [String: [(NSAttributedString?) -> Void]] = [:]
+    private var requests: [String: DeferredPreviewWork] = [:]
     private let queue = DispatchQueue(label: "openpaste.richtext", qos: .userInitiated)
     init() { cache.countLimit = 300 }
 
@@ -21,6 +20,11 @@ final class RichTextCache {
         guard clip.kind == "文字" else { return false }
         let known = Set(rtfTypes + rtfdTypes + htmlTypes)
         return clip.parts.lazy.flatMap { $0 }.contains { known.contains($0.type) }
+    }
+    static func hasShelfRichPart(_ clip: Clip) -> Bool {
+        guard clip.kind == "文字" else { return false }
+        let types = Set(rtfTypes + rtfdTypes)
+        return clip.parts.lazy.flatMap { $0 }.contains { types.contains($0.type) }
     }
     /// Characters beyond this are never drawn on a card, so they are not parsed either.
     static func truncated(_ text: NSAttributedString, limit: Int = 1200) -> NSAttributedString {
@@ -51,23 +55,33 @@ final class RichTextCache {
         if failed.contains(key) { completion(nil); return }
         if pending[key] != nil { pending[key]?.append(completion); return }
         pending[key] = [completion]
+        let request = DeferredPreviewWork(); requests[key] = request
         queue.async { [weak self] in
-            let parts = clip.exportParts().flatMap { $0 }
+            guard request.begin() else { return }
+            let parts = clip.parts.flatMap { $0 }
             var result: NSAttributedString?
             func data(_ types: [String]) -> Data? { types.lazy.compactMap { type in parts.first { $0.type == type }?.data }.first }
             if let rtf = data(Self.rtfTypes) { result = NSAttributedString(rtf: rtf, documentAttributes: nil) }
             if result == nil, let rtfd = data(Self.rtfdTypes) { result = NSAttributedString(rtfd: rtfd, documentAttributes: nil) }
-            let html = result == nil ? data(Self.htmlTypes) : nil
+            let prepared = result.flatMap { Self.hasVisibleFormatting($0) ? RichTextRendering.prepare(Self.truncated($0), scale: 1) : nil }
             DispatchQueue.main.async {
-                guard let self else { return }
-                if result == nil, let html, html.count <= Self.htmlByteLimit { result = NSAttributedString(html: html, documentAttributes: nil) }
-                if let result, result.length > 0 { self.cache.setObject(Self.truncated(result), forKey: key as NSString) } else { self.failed.insert(key) }
+                guard let self, self.requests[key] === request else { return }
+                self.requests.removeValue(forKey: key)
+                if let prepared, prepared.length > 0 { self.cache.setObject(prepared, forKey: key as NSString) } else { self.failed.insert(key) }
                 let callbacks = self.pending.removeValue(forKey: key) ?? []
                 let value = self.cache.object(forKey: key as NSString)
                 callbacks.forEach { $0(value) }
             }
         }
     }
+    func cancelQueued(_ clip: Clip) {
+        let key = key(clip)
+        guard let request = requests[key], request.cancelBeforeStart() else { return }
+        requests.removeValue(forKey: key)
+        let callbacks = pending.removeValue(forKey: key) ?? []
+        callbacks.forEach { $0(nil) }
+    }
+
 }
 
 /// Prepares attributed text for display on a light page.
@@ -141,6 +155,10 @@ struct RichTextView: NSViewRepresentable {
 struct RichTextCardBody: View {
     let clip: Clip
     let compact: Bool
+    var ready = true
+    var generation = 0
+    var store: Store? = nil
+    @State private var request: UUID?
     @State private var rendered: NSAttributedString?
     @State private var version = ""
 
@@ -155,16 +173,23 @@ struct RichTextCardBody: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .mask(LinearGradient(stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.82), .init(color: .clear, location: 1)], startPoint: .top, endPoint: .bottom))
-        .onAppear { if version != clip.fingerprint { load() } }
-        .onChange(of: clip.fingerprint) { _, _ in load() }
+        .task(id: ShelfPreviewIdentity(clip: clip, store: store, generation: generation, ready: ready)) {
+            request = nil
+            if version != clip.fingerprint { rendered = nil }
+            guard ready else { RichTextCache.shared.cancelQueued(clip); return }
+            load()
+        }
+        .onDisappear { request = nil; RichTextCache.shared.cancelQueued(clip) }
     }
     private func load() {
         let requested = clip.fingerprint
+        let token = UUID(); request = token
+        let directory = store?.storageCallbackGeneration
         version = requested
         RichTextCache.shared.load(clip) { value in
-            guard version == requested else { return }
-            guard let value, RichTextCache.hasVisibleFormatting(value) else { rendered = nil; return }
-            rendered = RichTextRendering.prepare(value, scale: 1)
+            guard request == token, version == requested,
+                  store == nil || (store?.storageCallbackGeneration == directory && store?.searchAppliedGeneration == generation && store?.searchPending == false && store?.searchInputIsComposing == false) else { return }
+            rendered = value
         }
     }
 }

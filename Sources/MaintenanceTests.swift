@@ -140,7 +140,7 @@ func runMaintenanceTests() {
         let result = LinkPreviewResult(title: "fresh", subtitle: "example.com", image: NSImage(size: NSSize(width: 2, height: 2)))
         var cancelled = 0, callbacks = 0
         let first = PreviewRequest(); first.usesNetworkSlot = true; first.add { cancelled += 1 }
-        cache.requests[key] = first; cache.pending[key] = [{ _ in callbacks += 1 }]; cache.active = 1
+        cache.requests[key] = first; cache.pending[key] = [UUID(): { _ in callbacks += 1 }]; cache.active = 1
         var nextStarted = false
         cache.jobs.append(("next", { nextStarted = true; cache.active += 1 }))
         cache.finish(key, result, request: first); drain()
@@ -159,7 +159,7 @@ func runMaintenanceTests() {
         check(!fm.fileExists(atPath: json.path), "expired preview removed")
         cache.results.removeValue(forKey: key); cache.savedAt.removeValue(forKey: key)
         let second = PreviewRequest(); second.usesNetworkSlot = true; second.add { cancelled += 1 }
-        cache.requests[key] = second; cache.pending[key] = [{ _ in callbacks += 1 }]; cache.active = 1
+        cache.requests[key] = second; cache.pending[key] = [UUID(): { _ in callbacks += 1 }]; cache.active = 1
         cache.finish(key, nil, request: first); drain()
         cache.finish(key, result, request: first); drain()
         check(cache.active == 1 && callbacks == 1 && cache.results[key] == nil, "old generation cannot finish or cache over new request")
@@ -171,7 +171,7 @@ func runMaintenanceTests() {
 
         let cancelledKey = "https://example.com/cancelled"
         let cancelledRequest = PreviewRequest(); cancelledRequest.usesNetworkSlot = true
-        cache.requests[cancelledKey] = cancelledRequest; cache.pending[cancelledKey] = [{ _ in }]; cache.active = 1
+        cache.requests[cancelledKey] = cancelledRequest; cache.pending[cancelledKey] = [UUID(): { _ in }]; cache.active = 1
         cache.finish(cancelledKey, result, request: cancelledRequest); drain()
         check(encodeStarted.wait(timeout: .now() + 1) == .success, "accepted preview begins asynchronous cache work")
         cache.enabled = false; allowEncode.signal()
@@ -180,7 +180,7 @@ func runMaintenanceTests() {
         check(encodeCount == 2 && !fm.fileExists(atPath: cancelledJSON.path) && cache.active == 0, "disable cancels pending cache write without holding network slot")
         cache.enabled = true
         let third = PreviewRequest(); third.usesNetworkSlot = true; third.add { cancelled += 1 }
-        cache.requests[key] = third; cache.pending[key] = [{ _ in callbacks += 1 }]; cache.active = 1
+        cache.requests[key] = third; cache.pending[key] = [UUID(): { _ in callbacks += 1 }]; cache.active = 1
         cache.enabled = false
         check(third.cancelled && cache.active == 0 && callbacks == 3, "disable cancels active previews")
         third.add { cancelled += 1 }
@@ -206,7 +206,7 @@ func runMaintenanceTests() {
         })
         func finishForCommitTest(_ key: String, title: String) {
             let request = PreviewRequest(); request.usesNetworkSlot = true
-            commitCache.requests[key] = request; commitCache.pending[key] = [{ _ in }]; commitCache.active = 1
+            commitCache.requests[key] = request; commitCache.pending[key] = [UUID(): { _ in }]; commitCache.active = 1
             commitCache.finish(key, LinkPreviewResult(title: title, subtitle: "fixture", image: NSImage(size: NSSize(width: 2, height: 2))), request: request)
             drain()
         }

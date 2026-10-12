@@ -49,10 +49,12 @@ enum CodeSyntax {
 struct CodeCardBody: View {
     let text: String
     let compact: Bool
+    var language: String? = nil
+    var highlighted: NSAttributedString? = nil
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text(CodeSyntax.language(text) ?? "Code").font(.system(size: 10, weight: .medium)).foregroundStyle(.gray)
-            Text(AttributedString(CodeSyntax.highlighted(String(text.prefix(3000))))).lineLimit(compact ? 3 : 9).frame(maxWidth: .infinity, alignment: .topLeading)
+            Text(language ?? CodeSyntax.language(text) ?? "Code").font(.system(size: 10, weight: .medium)).foregroundStyle(.gray)
+            Text(AttributedString(highlighted ?? CodeSyntax.highlighted(String(text.prefix(3000))))).lineLimit(compact ? 3 : 9).frame(maxWidth: .infinity, alignment: .topLeading)
             Spacer(minLength: 0)
         }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
