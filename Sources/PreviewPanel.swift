@@ -163,6 +163,12 @@ struct FullItemPreview: View {
     /// Rich clips keep their own typography (shown a little larger); plain text gets a readable document style.
     private func pageText(_ clip: Clip) -> NSAttributedString {
         if RichTextCache.hasRichPart(clip), CodeSyntax.language(clip.text) == nil {
+            // Only the preview is truncated: parsing a huge HTML-only clip here would block the main thread,
+            // while pasting, editing and merging keep the full rich content.
+            let parts = clip.exportParts().flatMap { $0 }
+            let hasRTF = parts.contains { $0.type == NSPasteboard.PasteboardType.rtf.rawValue }
+            let htmlBytes = parts.first { $0.type == NSPasteboard.PasteboardType.html.rawValue }?.data.count ?? 0
+            if !hasRTF, htmlBytes > RichTextCache.htmlByteLimit { return RichTextRendering.plain(clip.text, size: 16) }
             let rich = clip.attributedText
             if RichTextCache.hasVisibleFormatting(rich) { return RichTextRendering.prepare(rich, scale: 1.3) }
         }
