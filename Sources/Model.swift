@@ -95,7 +95,7 @@ private final class SaveGeneration {
     func isCurrent(_ generation: Int) -> Bool { lock.lock(); defer { lock.unlock() }; return generation == value }
 }
 final class Store: ObservableObject {
-    @Published var archive = Archive() { didSet { rebuildSources(); refreshResults() } }
+    @Published var archive = Archive() { didSet { archiveChanged() } }
     @Published var paused = false
     private var pauseReasons = RecordingPauseReasons()
     var userPaused: Bool { pauseReasons.userPaused }
@@ -113,7 +113,7 @@ final class Store: ObservableObject {
     /// Card whose title is being edited in place; nil when no inline rename is active.
     @Published var renamingID: UUID?
     @Published var query = "" { didSet { if query != oldValue { filterValueChanged() } } }
-    @Published var board: UUID? { didSet { if board != oldValue { filterValueChanged() } } }
+    @Published var board: UUID? { didSet { if board != oldValue { pendingSearchSelection = .first; filterValueChanged() } } }
     @Published var kind = "全部" { didSet { if kind != oldValue { filterValueChanged() } } }
     @Published var sourceFilter = "全部来源" { didSet { if sourceFilter != oldValue { filterValueChanged() } } }
     @Published var filtersExpanded = false
@@ -121,10 +121,20 @@ final class Store: ObservableObject {
     @Published var startDate = Date().addingTimeInterval(-7 * 86400) { didSet { if startDate != oldValue { filterValueChanged() } } }
     @Published var endDate = Date() { didSet { if endDate != oldValue { filterValueChanged() } } }
     @Published var todayOnly = false { didSet { if todayOnly != oldValue { filterValueChanged() } } }
-    @Published var reverseHistory = false { didSet { if reverseHistory != oldValue { selection.removeAll(); selectionAnchor = nil; filterValueChanged(); if reverseHistory { selected = filtered.first?.id } } } }
+    @Published var reverseHistory = false { didSet { if reverseHistory != oldValue { pendingSearchSelection = .first; filterValueChanged() } } }
     private(set) var visibleClips: [Clip] = []
     private var visibleIndexByID: [UUID: Int] = [:]
-    private(set) var sourceNames: [String] = []
+    @Published private(set) var sourceNames: [String] = []
+    @Published private(set) var searchPending = false
+    @Published private(set) var searchInputIsComposing = false
+    @Published private(set) var searchInputResetGeneration = 0
+    @Published private(set) var searchRequestGeneration = 0
+    @Published private(set) var searchAppliedGeneration = 0
+    private let searchPipeline: SearchPipeline
+    private var archiveRevision = 0
+    private var sourcesRevision = 0
+    private var nextArchiveSourcesChanged = true
+    private var pendingSearchSelection = SearchSelectionIntent.preserve
     private(set) var filterPasses = 0
     private(set) var sourcePasses = 0
     private var batchingFilterChanges = false
@@ -162,7 +172,7 @@ final class Store: ObservableObject {
     @Published var currentClipID: UUID?
     @Published var captureNotice = ""
     private let saveGeneration = SaveGeneration()
-    private(set) var storageCallbackGeneration = 0
+    private(set) var storageCallbackGeneration = 0 { didSet { refreshResults() } }
     let persistenceQueue = DispatchQueue(label: "openpaste.persistence", qos: .utility)
     let captureQueue = DispatchQueue(label: "openpaste.image-capture", qos: .userInitiated)
     private var captureGeneration = 0
@@ -195,9 +205,12 @@ final class Store: ObservableObject {
     private let configurationDefaults: UserDefaults?
     private let injectedDeviceID: String?
     private var deferredInitialStart: (source: ClipboardCaptureSource?, changeCount: Int?)?
+    private var imageIndexWorkItem: DispatchWorkItem?
     init(root: URL? = nil, ephemeral: Bool = false, defaults: UserDefaults? = nil, deviceID: String? = nil,
          loadHistoryAsynchronously: Bool = false,
-         initialHistoryLoader: ((URL) throws -> SyncSnapshot)? = nil) {
+         initialHistoryLoader: ((URL) throws -> SyncSnapshot)? = nil,
+         searchPipeline: SearchPipeline = SearchPipeline()) {
+        self.searchPipeline = searchPipeline
         let persistsPreferences = root == nil && !ephemeral
         self.ephemeral = ephemeral
         self.usePreferences = persistsPreferences
@@ -331,7 +344,55 @@ final class Store: ObservableObject {
     }
     private func rebuildSources() {
         sourcePasses += 1
-        sourceNames = Array(Set(archive.clips.map(\.source))).sorted()
+        sourcesRevision += 1
+    }
+    private func archiveChanged() {
+        archiveRevision += 1
+        if nextArchiveSourcesChanged { rebuildSources() }
+        nextArchiveSourcesChanged = true
+        refreshResults()
+    }
+    /// Metadata-only OCR/link title changes do not invalidate the source directory.
+    /// Callers must pass false only when clip membership and source names are unchanged.
+    func replaceArchive(_ value: Archive, sourcesChanged: Bool = true) {
+        nextArchiveSourcesChanged = sourcesChanged
+        archive = value
+    }
+    /// Every field-editor change invalidates old work immediately. Marked text is
+    /// never searched; committing identical marked/final text still submits once.
+    func setSearchInput(_ value: String, isComposing: Bool) {
+        let wasComposing = searchInputIsComposing
+        if searchInputIsComposing != isComposing { searchInputIsComposing = isComposing }
+        if isComposing {
+            searchPipeline.cancel()
+            searchRequestGeneration += 1
+            if !searchPending { searchPending = true }
+            return
+        }
+        if query != value { query = value }
+        else if wasComposing || searchPending { refreshResults() }
+    }
+    func cancelSearchInput() {
+        searchInputResetGeneration += 1
+        searchInputIsComposing = false
+        searchPipeline.cancel()
+        if query.isEmpty { refreshResults() }
+        else { query = "" }
+    }
+    func requestSearchSelection(_ intent: SearchSelectionIntent) {
+        pendingSearchSelection = intent
+        if !searchPending { applySearchSelection() }
+    }
+    /// Tests await the same asynchronous production path, including a newer
+    /// request submitted while waiting. Never blocks the main run loop.
+    @MainActor
+    func awaitLatestSearch(timeout: TimeInterval = 10) async -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        while searchPending || searchAppliedGeneration != searchRequestGeneration {
+            if ProcessInfo.processInfo.systemUptime >= deadline { return false }
+            do { try await Task.sleep(nanoseconds: 1_000_000) } catch { return false }
+        }
+        return true
     }
     /// Clears query, kind, source and today filters in one refresh. Board and the
     /// enabled date range are also cleared unless their preserve flags are set;
@@ -348,20 +409,86 @@ final class Store: ObservableObject {
         if filterRefreshPending { filterRefreshPending = false; refreshResults() }
     }
     private func refreshResults() {
+        precondition(Thread.isMainThread, "Search requests must be submitted from the main thread")
         filterPasses += 1
-        visibleClips = archive.clips.filter { c in
-            (board == nil || c.boards.contains(board!)) && (kind == "全部" || c.kind == kind) &&
-            (sourceFilter == "全部来源" || c.source == sourceFilter) && (!todayOnly || Calendar.current.isDateInToday(c.created)) && (!dateRangeEnabled || (c.created >= Calendar.current.startOfDay(for: startDate) && c.created < Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: endDate))!)) &&
-            (query.isEmpty || c.title.localizedCaseInsensitiveContains(query) || c.text.localizedCaseInsensitiveContains(query) || c.source.localizedCaseInsensitiveContains(query) || (c.ocrText?.localizedCaseInsensitiveContains(query) ?? false) || (c.linkTitle?.localizedCaseInsensitiveContains(query) ?? false) || (c.userLabel?.localizedCaseInsensitiveContains(query) ?? false))
+        searchRequestGeneration += 1
+        if !searchPending { searchPending = true }
+        if searchInputIsComposing { searchPipeline.cancel(); return }
+        let calendar = Calendar.current
+        let todayStart = todayOnly ? calendar.startOfDay(for: Date()) : nil
+        let todayEnd = todayStart.flatMap { calendar.date(byAdding: .day, value: 1, to: $0) }
+        let rangeStart = dateRangeEnabled ? calendar.startOfDay(for: startDate) : nil
+        let rangeEnd = dateRangeEnabled ? calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: endDate)) : nil
+        let criteria = SearchCriteria(query: query, board: board, kind: kind, source: sourceFilter,
+                                      todayStart: todayStart, todayEnd: todayEnd, rangeStart: rangeStart,
+                                      rangeEnd: rangeEnd, reversed: reverseHistory)
+        let request = SearchRequest(generation: searchRequestGeneration, archiveRevision: archiveRevision,
+                                    storageGeneration: storageCallbackGeneration, sourcesRevision: sourcesRevision,
+                                    clips: archive.clips, criteria: criteria, submittedAt: ProcessInfo.processInfo.systemUptime)
+        searchPipeline.submit(request) { [weak self] result in
+            guard let self, result.generation == self.searchRequestGeneration,
+                  result.archiveRevision == self.archiveRevision,
+                  result.storageGeneration == self.storageCallbackGeneration,
+                  !self.searchInputIsComposing else { return }
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            self.visibleClips = result.clips
+            self.visibleIndexByID = result.indexByID
+            if self.sourceNames != result.sources { self.sourceNames = result.sources }
+            self.applySearchSelection()
+            self.searchAppliedGeneration = result.generation
+            self.searchPending = false
+            self.scheduleImageIndexing()
+            AcceptanceMetrics.searchEvent("install", generation: result.generation, count: result.clips.count,
+                                          milliseconds: (ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
+            AcceptanceMetrics.searchEvent("complete", generation: result.generation, count: result.clips.count,
+                                          milliseconds: (ProcessInfo.processInfo.systemUptime - result.submittedAt) * 1000)
         }
-        if reverseHistory { visibleClips.reverse() }
-        visibleIndexByID.removeAll(keepingCapacity: true)
-        for (index, clip) in visibleClips.enumerated() where visibleIndexByID[clip.id] == nil { visibleIndexByID[clip.id] = index }
-        selection.formIntersection(Set(visibleIndexByID.keys))
-        if selected.flatMap({ visibleIndexByID[$0] }) == nil { selected = visibleClips.first?.id }
+    }
+
+    /// OCR is useful for search, but starting it on every keystroke creates
+    /// archive publications while the user is still typing. Wait for the
+    /// latest result to install and for a short idle period before starting.
+    private func scheduleImageIndexing() {
+        imageIndexWorkItem?.cancel()
+        guard !query.isEmpty, !indexingImages else { return }
+        let generation = searchAppliedGeneration
+        let item = DispatchWorkItem { [weak self] in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.searchAppliedGeneration == generation,
+                      !self.searchPending, !self.searchInputIsComposing else { return }
+                self.indexImages()
+            }
+        }
+        imageIndexWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
+    }
+    private func applySearchSelection() {
+        let retained = selection.filter { visibleIndexByID[$0] != nil }
+        if retained != selection { selection = retained }
+        let next: UUID?
+        switch pendingSearchSelection {
+        case .preserve:
+            next = selected.flatMap { visibleIndexByID[$0] == nil ? nil : $0 } ?? visibleClips.first?.id
+        case .first:
+            next = visibleClips.first?.id
+            if !selection.isEmpty { selection.removeAll() }
+            selectionAnchor = nil
+        case .preferred(let id):
+            next = id.flatMap { visibleIndexByID[$0] == nil ? nil : $0 } ?? visibleClips.first?.id
+        case .single(let id):
+            next = visibleIndexByID[id] != nil ? id : visibleClips.first?.id
+            selection = next.map { [$0] } ?? []
+            selectionAnchor = next
+        case .neighbor(let index):
+            next = visibleClips.isEmpty ? nil : visibleClips[max(0, min(index, visibleClips.count - 1))].id
+        }
+        if selected != next { selected = next }
+        if let anchor = selectionAnchor, visibleIndexByID[anchor] == nil { selectionAnchor = next }
+        pendingSearchSelection = .preserve
     }
     func moveSelection(_ delta: Int) {
-        guard !visibleClips.isEmpty else { return }
+        guard !searchPending, !visibleClips.isEmpty else { return }
         let index = selected.flatMap { visibleIndexByID[$0] } ?? 0
         selection.removeAll()
         selected = visibleClips[max(0, min(visibleClips.count - 1, index + delta))].id; selectionAnchor = selected
@@ -725,12 +852,11 @@ final class Store: ObservableObject {
             deletedCurrentID = id
             currentClipID = nil
         }
-        let before = filtered
-        let index = before.firstIndex(where: { $0.id == id })
+        let index = visibleIndex(of: id)
         let wasSelected = selected == id
+        if wasSelected, let index { pendingSearchSelection = .neighbor(index) }
         archive.clips.removeAll { $0.id == id }
         pasteQueue.removeAll { $0 == id }
-        if wasSelected, let index = index { let remaining = filtered; selected = remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)].id }
         save()
     }
     func pin(_ clip: Clip, to board: UUID) {

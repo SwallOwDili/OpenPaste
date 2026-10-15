@@ -288,7 +288,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             }
             if event.keyCode == 53 {
                 if self.store.searchExpanded {
-                    self.store.resetFilters(preserveBoard: true); self.store.filtersExpanded = false
+                    self.store.cancelSearchInput(); self.store.resetFilters(preserveBoard: true); self.store.filtersExpanded = false
                     self.store.searchFocused = false; self.store.searchExpanded = false
                     self.panel.makeFirstResponder(self.panel.contentView)
                 } else { self.hideShelf() }
@@ -296,7 +296,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             }
             if event.keyCode == 51, [NSEvent.ModifierFlags.command, [.command, .shift]].contains(event.modifierFlags.intersection([.command, .option, .control, .shift])) {
                 if self.panel.firstResponder is NSTextView { return event }
-                self.store.reverseHistory = event.modifierFlags.contains(.shift)
+                guard self.canUseShelfResults else { return nil }
                 self.store.deleteChosen()
                 return nil
             }
@@ -329,6 +329,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             if quick.matches, let n = Int(event.charactersIgnoringModifiers ?? ""), n >= 1, n <= 9, self.store.filtered.count >= n { self.paste(self.store.filtered[n - 1], plain: quick.plain); return nil }
             if event.keyCode == 36 || event.keyCode == 76, let clip = self.store.filtered.first(where: { $0.id == self.store.selected }) ?? self.store.filtered.first { self.pasteSelection(fallback: clip, plain: self.store.shelfShortcuts.isPlain(event.modifierFlags)); return nil }
             if [123, 124].contains(event.keyCode), self.panel.firstResponder is NSTextView { return event }
+            if !self.canUseShelfResults, [123, 124, 125, 36, 76].contains(event.keyCode) { return nil }
             if [123, 124, 125].contains(event.keyCode), !event.modifierFlags.contains(.command) {
                 self.store.searchFocused = false
                 self.panel.makeFirstResponder(self.panel.contentView)
@@ -498,7 +499,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         if TestMode.ui { target = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.SwallOwDili.OpenPaste.fixture").first }
         if TestMode.ui { print("UI show target: \(target?.bundleIdentifier ?? "none")"); fflush(stdout) }
         pasteGeneration += 1
-        store.resetFilters(); store.filtersExpanded = false
+        store.cancelSearchInput(); store.resetFilters(); store.filtersExpanded = false
         if !preview, AppEnvironment.current.defaults.bool(forKey: "recordingAccepted") { store.capture(force: true) }
         refreshPermission()
         store.searchFocused = false
@@ -509,7 +510,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         let h = min(max(panel.frame.height, 180), r.height * 0.75)
         panel.setFrame(NSRect(x: r.minX, y: r.minY, width: r.width, height: h), display: true)
         store.reverseHistory = false; store.selection.removeAll(); store.compact = h < 270
-        store.selected = store.currentClipID ?? store.filtered.first?.id
+        store.requestSearchSelection(.preferred(store.currentClipID))
         if activating {
             shelfAwaitingActivation = false
             NSApp.activate(); panel.makeKeyAndOrderFront(nil)
@@ -958,10 +959,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         return .terminateNow
     }
     func paste(_ clip: Clip, plain: Bool = false) {
+        guard canUseShelfResults else { return }
         guard store.restore(clip, plain: plain) else { store.message = "无法复制此内容"; return }
         pastePrepared()
     }
     func pasteSelection(fallback clip: Clip, plain: Bool = false) {
+        guard canUseShelfResults else { return }
         let selected = store.selectedClips
         guard store.restoreMany(selected.contains(where: { $0.id == clip.id }) ? selected : [clip], plain: plain) else { showToast("无法合并所选内容"); return }; pastePrepared()
     }
@@ -1052,7 +1055,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         alert.window.initialFirstResponder = field
         presentAlert(alert) { [weak self] response in if response == .alertFirstButtonReturn { self?.store.addBoard(field.stringValue) } }
     }
-    func edit(_ clip: Clip) {
+    func edit(_ clip: Clip, requiresCurrentResults: Bool = true) {
+        guard !requiresCurrentResults || canUseShelfResults else { return }
         if clip.kind == "图片" { showPreview(clip); return }
         if clip.kind == "文件" { showToast("文件不能直接编辑，按 ⌘O 打开原文件"); return }
         let editTarget = store.contentEditTarget(for: clip)
@@ -1159,15 +1163,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
 
 struct ShelfView: View {
     @State private var resizeStart: CGFloat?
-    @State private var renderedClipCount = ShelfRenderWindow.batchSize
     @ObservedObject var store: Store
-    @FocusState private var searchFocused: Bool
-    /// Text typed in the field; committed to the store after a short pause so large
-    /// histories are not re-filtered per keystroke or during input-method composition.
-    @State private var draftQuery = ""
-    @State private var queryCommit: DispatchWorkItem?
     var body: some View {
-        let renderedClips = Array(store.filtered.prefix(renderedClipCount))
         VStack(spacing: 0) {
             Rectangle().fill(Color.clear).frame(height: 6).contentShape(Rectangle())
                 .overlay(Capsule().fill(Color.secondary.opacity(0.25)).frame(width: 36, height: 2))
@@ -1178,15 +1175,7 @@ struct ShelfView: View {
                 Button { store.searchExpanded.toggle(); store.searchFocused = store.searchExpanded; if !store.searchExpanded { resetSearch() } } label: { Image(systemName: "magnifyingglass").font(.system(size: 15)).foregroundStyle(.secondary) }.buttonStyle(.plain).help("搜索 · ⌘F")
                 }
                 if store.searchExpanded {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(searchFocused ? Color.blue : Color.secondary)
-                    TextField("搜索文字、链接或来源", text: $draftQuery).textFieldStyle(.plain).focused($searchFocused).frame(width: 250)
-                    if !draftQuery.isEmpty { Button { draftQuery = ""; store.query = ""; store.searchFocused = true } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain).help("清空搜索") }
-                    else { Text("⌘F").font(.system(size: 10)).foregroundStyle(.tertiary) }
-                    Button { resetSearch(); store.searchExpanded = false; store.searchFocused = false; Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) } label: { Image(systemName: "xmark").font(.system(size: 10)).foregroundStyle(.secondary) }.buttonStyle(.plain).help("退出搜索 · Esc")
-                }.padding(.horizontal, 12).padding(.vertical, 9)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(searchFocused ? Color.blue.opacity(0.65) : Color.primary.opacity(0.1)))
+                ShelfSearchBar(store: store)
                 }
                 tab("历史", icon: "clock.arrow.circlepath", active: store.board == nil) { store.board = nil }
                 ForEach(store.archive.boards) { board in
@@ -1199,6 +1188,7 @@ struct ShelfView: View {
                             .foregroundStyle(Color.primary)
                     }.buttonStyle(.plain).help("右键更改收藏板颜色")
                         .onDrop(of: ["io.github.SwallOwDili.OpenPaste.clip-id"], isTargeted: nil) { providers in
+                            guard Controller.shared.canUseShelfResults else { return false }
                             if !store.draggingIDs.isEmpty, Date().timeIntervalSince(store.dragStartedAt) < 60 {
                                 let ids = store.draggingIDs; store.draggingIDs.removeAll()
                                 for id in ids { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
@@ -1206,10 +1196,12 @@ struct ShelfView: View {
                                 return true
                             }
                             guard let provider = providers.first else { return false }
+                            let dropGeneration = store.searchAppliedGeneration
+                            let directory = store.storageCallbackGeneration
                             provider.loadDataRepresentation(forTypeIdentifier: "io.github.SwallOwDili.OpenPaste.clip-id") { data, error in
                                 if TestMode.featureUI { print("UI drop data bytes=\(data?.count ?? -1) error=\(error?.localizedDescription ?? "none")"); fflush(stdout) }
                                 guard let data, let string = String(data: data, encoding: .utf8), let id = UUID(uuidString: string) else { return }
-                                DispatchQueue.main.async { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
+                                DispatchQueue.main.async { guard Controller.shared.canUseShelfResults, store.searchAppliedGeneration == dropGeneration, store.storageCallbackGeneration == directory else { return }; if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
                             }; return true
                         }
                         .overlay {
@@ -1256,7 +1248,7 @@ struct ShelfView: View {
                 Menu { Button("全部来源") { store.sourceFilter = "全部来源" }; ForEach(store.sources, id: \.self) { source in Button(source) { store.sourceFilter = source } } } label: { Label(store.sourceFilter, systemImage: "line.3.horizontal.decrease") }.menuStyle(.borderlessButton).fixedSize().font(.system(size: 12))
                 Button { store.todayOnly.toggle() } label: { Label("今天", systemImage: "calendar").foregroundStyle(store.todayOnly ? Color.blue : Color.secondary) }.buttonStyle(.plain).font(.system(size: 12))
                 Spacer()
-                Text(store.paused ? store.recordingPauseControl.status : (store.query.isEmpty ? "\(store.filtered.count) 条历史" : "找到 \(store.filtered.count) 条结果")).font(.system(size: 12)).foregroundStyle(store.paused ? .orange : .secondary)
+                Text(store.searchPending || store.searchInputIsComposing ? "正在搜索…" : store.paused ? store.recordingPauseControl.status : (store.query.isEmpty ? "\(store.filtered.count) 条历史" : "找到 \(store.filtered.count) 条结果")).font(.system(size: 12)).foregroundStyle(store.paused ? .orange : .secondary)
             }.padding(.horizontal, 20).padding(.vertical, 8)
             }
             if store.searchExpanded && !store.query.isEmpty {
@@ -1268,21 +1260,7 @@ struct ShelfView: View {
             if !store.pasteQueue.isEmpty { HStack { Text("粘贴队列剩余 \(store.pasteQueue.count) 条"); Button("下一条 · ⌘↵") { Controller.shared.pasteNext() }; Button("结束") { store.pasteQueue.removeAll() } }.font(.caption) }
             if !store.ocrProgress.isEmpty { Text(store.ocrProgress).font(.caption).foregroundStyle(.secondary) }
             if !store.captureNotice.isEmpty { Text(store.captureNotice).font(.system(size: 12)).foregroundStyle(.orange).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24).padding(.bottom, 4) }
-            if store.filtered.isEmpty {
-                VStack(spacing: 10) { Image(systemName: store.query.isEmpty ? "doc.on.clipboard" : "magnifyingglass").font(.system(size: 35)).foregroundStyle(.tertiary); Text(store.query.isEmpty ? "复制一些内容，它们会出现在这里" : "没有找到“\(store.query)”").foregroundStyle(.secondary); Text(store.query.isEmpty ? "\(store.shortcutLabel) 随时打开 · 所有数据保存在本机" : "搜索文字、链接和来源应用；图片文字将在后台识别后加入搜索").font(.system(size: 12)).foregroundStyle(.tertiary) }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollViewReader { proxy in
-                    ScrollView(.horizontal) {
-                        LazyHStack(spacing: 12) {
-                            if store.translating { VStack(spacing: 12) { ProgressView(); Text("正在翻译…"); Text("原文保持不变").font(.caption).foregroundStyle(.secondary) }.frame(width: store.compact ? 180 : 240).frame(maxHeight: .infinity).background(.quaternary, in: RoundedRectangle(cornerRadius: 12)) }
-                            ForEach(renderedClips) { clip in
-                                ClipCard(clip: clip, index: store.visibleIndex(of: clip.id) ?? 0, selected: store.selection.contains(clip.id) || clip.id == store.selected, current: clip.id == store.currentClipID, renaming: store.renamingID == clip.id, store: store).equatable().id(clip.id)
-                                    .onAppear { if clip.id == renderedClips.last?.id { growRenderWindow() } }
-                            }
-                        }.padding(.horizontal, 20).padding(.vertical, 8)
-                    }.onChange(of: store.selected) { _, id in if let id { revealAndScroll(to: id, proxy: proxy) } }
-                }
-            }
+            ShelfResultsView(store: store).equatable()
             if !store.translationStatus.isEmpty { Text(store.translationStatus).font(.system(size: 11)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 20).padding(.bottom, 6) }
             if !store.directPasteAuthorized {
                 HStack { Text("↵ 复制后按 ⌘V 粘贴").foregroundStyle(.secondary); Button("开启直接粘贴…") { Controller.shared.openSettings() }.buttonStyle(.plain).foregroundStyle(.blue); Spacer() }.font(.system(size: 11)).padding(.horizontal, 20).padding(.bottom, 8)
@@ -1290,56 +1268,12 @@ struct ShelfView: View {
         }
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.2)).frame(height: 1) }
-        .onChange(of: store.query) { _, query in
-            if draftQuery != query { draftQuery = query }
-            resetRenderWindow(); if !query.isEmpty { store.indexImages() }
-        }
-        .onChange(of: draftQuery) { _, value in
-            queryCommit?.cancel()
-            guard value != store.query else { return }
-            if value.isEmpty { store.query = value; return }
-            let work = DispatchWorkItem { [weak store] in
-                guard let store else { return }
-                // Wait until the input method has committed its marked text.
-                if let editor = Controller.shared?.panel.firstResponder as? NSTextView, editor.hasMarkedText() { return }
-                store.query = value
-            }
-            queryCommit = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
-        }
-        .onChange(of: store.board) { resetRenderWindow() }
-        .onChange(of: store.kind) { resetRenderWindow() }
-        .onChange(of: store.sourceFilter) { resetRenderWindow() }
-        .onChange(of: store.dateRangeEnabled) { resetRenderWindow() }
-        .onChange(of: store.startDate) { resetRenderWindow() }
-        .onChange(of: store.endDate) { resetRenderWindow() }
-        .onChange(of: store.todayOnly) { resetRenderWindow() }
-        .onChange(of: store.reverseHistory) { resetRenderWindow() }
         .onChange(of: store.searchFocused) { _, focused in
-            if focused { store.searchExpanded = true; DispatchQueue.main.async { searchFocused = true } } else { searchFocused = false; if store.query.isEmpty && store.kind == "全部" && store.sourceFilter == "全部来源" && !store.todayOnly { store.searchExpanded = false } }
-        }
-        .onChange(of: searchFocused) { _, focused in if store.searchFocused != focused { store.searchFocused = focused } }
-
-    }
-    func growRenderWindow() {
-        let next = ShelfRenderWindow.nextCount(current: renderedClipCount, total: store.filtered.count)
-        if next > renderedClipCount { renderedClipCount = next }
-    }
-    func resetRenderWindow() {
-        let selectedIndex = store.selected.flatMap { store.visibleIndex(of: $0) }
-        renderedClipCount = ShelfRenderWindow.resetCount(total: store.filtered.count, selectedIndex: selectedIndex)
-    }
-    func revealAndScroll(to id: UUID, proxy: ScrollViewProxy) {
-        guard let index = store.visibleIndex(of: id) else { return }
-        let required = ShelfRenderWindow.countIncluding(index: index, total: store.filtered.count)
-        if required > renderedClipCount {
-            renderedClipCount = required
-            DispatchQueue.main.async { proxy.scrollTo(id) }
-        } else {
-            proxy.scrollTo(id)
+            if focused { store.searchExpanded = true }
+            else if store.query.isEmpty && store.kind == "全部" && store.sourceFilter == "全部来源" && !store.todayOnly { store.searchExpanded = false }
         }
     }
-    func resetSearch() { store.resetFilters(preserveBoard: true, preserveDateRange: true) }
+    func resetSearch() { store.cancelSearchInput(); store.resetFilters(preserveBoard: true, preserveDateRange: true) }
     func tab(_ name: String, icon: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) { Label(name, systemImage: icon).font(.system(size: 13, weight: .medium)).padding(.horizontal, 10).padding(.vertical, 6).background(active ? Color.primary.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 8)).foregroundStyle(Color.primary) }.buttonStyle(.plain)
     }
@@ -1370,20 +1304,27 @@ struct ClipCard: View, Equatable {
     let selected: Bool
     let current: Bool
     let renaming: Bool
-    @ObservedObject var store: Store
+    let compact: Bool
+    let networkPreviews: Bool
+    let previewGeneration: Int
+    let previewsReady: Bool
+    let directoryGeneration: Int
+    let store: Store
+    @State private var presentation: CardPresentation?
+    private var hasDeferredPreview: Bool {
+        clip.kind == "链接" || clip.kind == "图片" || clip.kind == "文件" || RichTextCache.hasShelfRichPart(clip)
+    }
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.clip.id == rhs.clip.id && lhs.clip.cachedDigest == rhs.clip.cachedDigest && lhs.index == rhs.index && lhs.selected == rhs.selected && lhs.current == rhs.current && lhs.renaming == rhs.renaming && lhs.clip.title == rhs.clip.title && lhs.clip.userLabel == rhs.clip.userLabel && lhs.clip.text == rhs.clip.text && lhs.clip.kind == rhs.clip.kind && lhs.clip.boards == rhs.clip.boards && lhs.clip.created == rhs.clip.created && lhs.clip.source == rhs.clip.source && lhs.clip.ocrText == rhs.clip.ocrText && lhs.clip.linkTitle == rhs.clip.linkTitle
+        // Plain text, code, color and HTML-summary cards have no preview work to
+        // cancel/restart. Query generations must not rebuild their full subtree.
+        let samePreview = !lhs.hasDeferredPreview && !rhs.hasDeferredPreview ||
+            (lhs.previewGeneration == rhs.previewGeneration && lhs.previewsReady == rhs.previewsReady)
+        return samePreview && CardPresentationKey(clip: lhs.clip, directory: lhs.directoryGeneration) == CardPresentationKey(clip: rhs.clip, directory: rhs.directoryGeneration) && lhs.compact == rhs.compact && lhs.networkPreviews == rhs.networkPreviews && lhs.index == rhs.index && lhs.selected == rhs.selected && lhs.current == rhs.current && lhs.renaming == rhs.renaming && lhs.clip.title == rhs.clip.title && lhs.clip.userLabel == rhs.clip.userLabel && lhs.clip.boards == rhs.clip.boards && lhs.clip.created == rhs.clip.created && lhs.clip.source == rhs.clip.source && lhs.clip.sourceID == rhs.clip.sourceID && lhs.clip.ocrText == rhs.clip.ocrText && lhs.clip.linkTitle == rhs.clip.linkTitle
     }
-    var color: Color { if clip.kind == "文字", CodeSyntax.language(clip.text) != nil { return .purple }; switch clip.kind { case "链接": return .blue; case "图片": return .purple; case "文件": return .orange; default: return .teal } }
-    /// Header colour: the source app icon's dominant colour, falling back to the content-type colour.
+    var color: Color { if presentation?.language != nil { return .purple }; switch clip.kind { case "链接": return .blue; case "图片": return .purple; case "文件": return .orange; default: return .teal } }
     var headerFill: Color { PreviewCache.shared.accentColor(clip.sourceID).map { Color(nsColor: $0) } ?? color.opacity(0.85) }
-    /// Text copied with RTF/HTML formatting is drawn as a document page.
-    var richText: Bool { clip.kind == "文字" && CapturedColor.parse(clip.text) == nil && CodeSyntax.language(clip.text) == nil && RichTextCache.hasRichPart(clip) }
-    var characterCountLabel: String? {
-        guard clip.kind == "文字" else { return nil }
-        let bytes = clip.text.utf8.count
-        return bytes > 200_000 ? "20 万+ 字符" : "\(clip.text.count) 个字符"
-    }
+    var richText: Bool { presentation?.richText ?? false }
+    var cardTitle: String { clip.userLabel.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? (presentation?.isMap == true ? "地图" : (clip.source == "快速翻译" ? "翻译" : (presentation?.language != nil ? "代码" : clip.kind))) }
     var icon: String { switch clip.kind { case "链接": return "link"; case "图片": return "photo"; case "文件": return "folder"; default: return "text.alignleft" } }
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1392,85 +1333,93 @@ struct ClipCard: View, Equatable {
                 Rectangle().fill(headerFill)
                 if let sourceIcon = PreviewCache.shared.sourceIcon(clip.sourceID) {
                     Image(nsImage: sourceIcon).resizable().scaledToFit()
-                        .frame(width: store.compact ? 44 : 64, height: store.compact ? 44 : 64)
-                        .offset(x: store.compact ? 8 : 10, y: store.compact ? -4 : -3).help(clip.source)
+                        .frame(width: compact ? 44 : 64, height: compact ? 44 : 64)
+                        .offset(x: compact ? 8 : 10, y: compact ? -4 : -3).help(clip.source)
                 } else {
-                    Image(systemName: icon).font(.system(size: store.compact ? 24 : 32)).opacity(0.6).padding(.top, store.compact ? 6 : 10).padding(.trailing, 14).help(clip.source)
+                    Image(systemName: icon).font(.system(size: compact ? 24 : 32)).opacity(0.6).padding(.top, compact ? 6 : 10).padding(.trailing, 14).help(clip.source)
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 5) {
-                        if renaming { RenameField(initial: clip.cardTitle) { text in Controller.shared.commitInlineRename(clip.id, text: text) } }
+                        if renaming { RenameField(initial: cardTitle) { text in Controller.shared.commitInlineRename(clip.id, text: text) } }
                         else {
-                            Text(clip.cardTitle).font(.system(size: store.compact ? 13 : 15, weight: .semibold)).lineLimit(1).truncationMode(.tail).help(clip.cardTitle)
+                            Text(cardTitle).font(.system(size: compact ? 13 : 15, weight: .semibold)).lineLimit(1).truncationMode(.tail).help(cardTitle)
                                 .onTapGesture {
+                                    guard Controller.shared.canUseShelfResults else { return }
                                     // A click on an already selected card's title renames it.
                                     if selected && store.selection.count <= 1 { Controller.shared.rename(clip) }
                                     else { store.searchFocused = false; store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) }
                                 }
                         }
                         if current { Text("当前").font(.system(size: 10)).opacity(0.75) }; if !clip.boards.isEmpty { Image(systemName: "pin.fill").font(.system(size: 10)) } }
-                    if !store.compact { TimelineView(.periodic(from: .now, by: 60)) { context in Text(ageLabel(clip.created, now: context.date)).font(.system(size: 12)).opacity(0.85) } }
+                    if !compact { TimelineView(.periodic(from: .now, by: 60)) { context in Text(ageLabel(clip.created, now: context.date)).font(.system(size: 12)).opacity(0.85) } }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                .padding(.leading, 14).padding(.trailing, store.compact ? 46 : 66)
+                .padding(.leading, 14).padding(.trailing, compact ? 46 : 66)
             }
-            .foregroundStyle(.white).frame(height: store.compact ? 38 : 60).clipped()
+            .foregroundStyle(.white).frame(height: compact ? 38 : 60).clipped()
             VStack(alignment: .leading, spacing: 9) {
-                if clip.kind == "链接" { RichLinkCard(clip: clip, enabled: store.networkPreviews, store: store).id(clip.text) }
-                else if let color = CapturedColor.parse(clip.text) {
+                if clip.kind == "链接" { RichLinkCard(clip: clip, enabled: networkPreviews, ready: previewsReady, generation: previewGeneration, store: store).id(clip.text) }
+                else if let color = presentation?.color {
                     RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: color.nsColor)).frame(maxWidth: .infinity, maxHeight: .infinity)
                     Text(color.hex).font(.system(size: 16, weight: .semibold, design: .monospaced)).textSelection(.enabled)
                 }
-                else if clip.kind == "文字", CodeSyntax.language(clip.text) != nil { CodeCardBody(text: clip.text, compact: store.compact) }
-                else if richText { RichTextCardBody(clip: clip, compact: store.compact) }
-                else if clip.kind == "图片" { ClipThumbnail(clip: clip).allowsHitTesting(false) }
+                else if clip.kind == "文字", presentation?.language != nil { CodeCardBody(text: presentation?.summary ?? "", compact: compact, language: presentation?.language, highlighted: presentation?.highlighted) }
+                else if richText { RichTextCardBody(clip: clip, compact: compact, ready: previewsReady, generation: previewGeneration, store: store) }
+                else if clip.kind == "图片" { ClipThumbnail(clip: clip, ready: previewsReady, generation: previewGeneration, store: store).allowsHitTesting(false) }
                 else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first, ["png", "jpg", "jpeg", "tiff", "tif", "heic", "gif", "webp"].contains(URL(fileURLWithPath: path).pathExtension.lowercased()) {
-                    ClipThumbnail(clip: clip)
+                    ClipThumbnail(clip: clip, ready: previewsReady, generation: previewGeneration, store: store)
                     Text(clip.title).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle).onTapGesture { Controller.shared.rename(clip) }
                 }
                 else {
                     if clip.kind == "文字" {
-                        Text(String(clip.text.prefix(1500))).font(.system(size: 13)).lineLimit(store.compact ? 3 : 8).frame(maxWidth: .infinity, alignment: .leading)
+                        Text(presentation?.summary ?? String(clip.text.prefix(1500))).font(.system(size: 13)).lineLimit(compact ? 3 : 8).frame(maxWidth: .infinity, alignment: .leading)
                     } else {
                         Text(clip.title).font(.system(size: 13)).lineLimit(2).onTapGesture { Controller.shared.rename(clip) }
-                        if clip.text != clip.title { Text(String(clip.text.prefix(1500))).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(3).frame(maxWidth: .infinity, alignment: .leading) }
+                        if clip.text != clip.title { Text(presentation?.summary ?? String(clip.text.prefix(1500))).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(3).frame(maxWidth: .infinity, alignment: .leading) }
                     }
                     Spacer(minLength: 0)
                 }
-            }.padding(12).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).background { Rectangle().fill(clip.kind == "文字" && CodeSyntax.language(clip.text) != nil ? Color(white: 0.14) : Color.clear) }
-            if !store.compact || index < 9 {
-                let footerColor = clip.kind == "文字" && CodeSyntax.language(clip.text) != nil ? Color.white.opacity(0.45) : (richText ? Color.black.opacity(0.45) : Color.secondary)
+            }.padding(12).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).background { Rectangle().fill(clip.kind == "文字" && presentation?.language != nil ? Color(white: 0.14) : Color.clear) }
+            if !compact || index < 9 {
+                let footerColor = clip.kind == "文字" && presentation?.language != nil ? Color.white.opacity(0.45) : (richText ? Color.black.opacity(0.45) : Color.secondary)
                 HStack {
-                    if !store.compact, let label = characterCountLabel { Text(label) }
+                    if !compact, let label = presentation?.characterCountLabel { Text(label) }
                     Spacer(minLength: 0)
                     if index < 9 { Text("\(index + 1)") }
                 }.font(.system(size: 10)).foregroundStyle(footerColor).padding(.horizontal, 12).padding(.bottom, 7)
             }
         }
-        .frame(width: store.compact ? 180 : 240).frame(maxHeight: .infinity)
-        .background(clip.kind == "文字" && CodeSyntax.language(clip.text) != nil ? Color(white: 0.14) : (richText ? Color.white : Color(nsColor: .controlBackgroundColor)), in: RoundedRectangle(cornerRadius: 12))
+        .frame(width: compact ? 180 : 240).frame(maxHeight: .infinity)
+        .background(clip.kind == "文字" && presentation?.language != nil ? Color(white: 0.14) : (richText ? Color.white : Color(nsColor: .controlBackgroundColor)), in: RoundedRectangle(cornerRadius: 12))
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? Color.blue : Color.primary.opacity(0.08), lineWidth: selected ? 2 : 1))
         .shadow(color: .black.opacity(0.03), radius: 2, y: 1)
         .contentShape(Rectangle())
+        .task(id: CardPresentationKey(clip: clip, directory: directoryGeneration)) {
+            let directory = directoryGeneration
+            presentation = nil
+            let value = await CardPresentationCache.shared.value(for: clip, directory: directory)
+            guard !Task.isCancelled, store.storageCallbackGeneration == directory else { return }
+            presentation = value
+        }
         .onTapGesture(count: 2) { Controller.shared.pasteSelection(fallback: clip) }
-        .onDrag { let selected = store.selectedClips; store.draggingIDs = selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]; store.dragStartedAt = Date(); if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
-        .onTapGesture { store.searchFocused = false; store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) }
+        .onDrag { guard Controller.shared.canUseShelfResults else { return NSItemProvider() }; let selected = store.selectedClips; store.draggingIDs = selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]; store.dragStartedAt = Date(); if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
+        .onTapGesture { guard Controller.shared.canUseShelfResults else { return }; store.searchFocused = false; store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) }
         .contextMenu {
             Button("粘贴") { Controller.shared.pasteSelection(fallback: clip) }
             Button("预览 · 空格") { Controller.shared.showPreview(clip) }
             Button("打开 · ⌘O") { Controller.shared.openItem(clip) }
             Button("重命名 · ⌘R") { Controller.shared.rename(clip) }
             if clip.kind == "图片" { Button("编辑 · ⌘E") { Controller.shared.edit(clip) }; Button("旋转图片") { Controller.shared.rotate(clip) }; Button("提取文字") { Controller.shared.extractText(clip) } }
-            if let map = MapLink.parse(clip.text) { Button("在地图中打开") { Controller.shared.openExternal(map.url) } }
-            Button("仅复制") { _ = store.restore(clip, plain: false); store.message = "已复制" }
+            if let map = MapLink.parse(clip.text) { Button("在地图中打开") { guard Controller.shared.canUseShelfResults else { return }; Controller.shared.openExternal(map.url) } }
+            Button("仅复制") { guard Controller.shared.canUseShelfResults else { return }; _ = store.restore(clip, plain: false); store.message = "已复制" }
             if clip.kind == "文字" || clip.kind == "链接" || clip.kind == "颜色" {
                 Button("粘贴为纯文本") { Controller.shared.paste(clip, plain: true) }
                 Button("编辑 · ⌘E") { Controller.shared.edit(clip) }
             }
-            Menu("收藏到") { ForEach(store.archive.boards) { b in Button((clip.boards.contains(b.id) ? "✓ " : "") + b.name) { store.pin(clip, to: b.id) } }; Button("新建收藏板…") { Controller.shared.newBoard() } }
+            Menu("收藏到") { ForEach(store.archive.boards) { b in Button((clip.boards.contains(b.id) ? "✓ " : "") + b.name) { guard Controller.shared.canUseShelfResults else { return }; store.pin(clip, to: b.id) } }; Button("新建收藏板…") { Controller.shared.newBoard() } }
             Divider()
-            Button("删除 · ⌘⌫", role: .destructive) { store.delete(clip.id) }
+            Button("删除 · ⌘⌫", role: .destructive) { guard Controller.shared.canUseShelfResults else { return }; store.delete(clip.id) }
         }
     }
 }
@@ -1485,11 +1434,13 @@ if CommandLine.arguments.contains("--interaction-policy-test") {
 } else if CommandLine.arguments.contains("--permission-monitor-test") {
     runPermissionMonitorTests()
 } else if CommandLine.arguments.contains("--content-editing-test") {
-    runContentEditingTests()
+    Task { @MainActor in await runContentEditingTests(); exit(0) }
+    RunLoop.main.run()
 } else if CommandLine.arguments.contains("--capture-boundary-test") {
     runCaptureBoundaryTests()
 } else if CommandLine.arguments.contains("--filter-test") {
-    runFilterTests()
+    Task { @MainActor in await runFilterTests(); exit(0) }
+    RunLoop.main.run()
 } else if CommandLine.arguments.contains("--paste-queue-test") {
     runPasteQueueTests()
 } else if CommandLine.arguments.contains("--clipboard-write-test") {
@@ -1523,11 +1474,13 @@ if CommandLine.arguments.contains("--interaction-policy-test") {
 } else if CommandLine.arguments.contains("--preview-cache-test") {
     runPreviewTests()
 } else if CommandLine.arguments.contains("--navigation-test") {
-    runNavigationTests()
+    Task { @MainActor in await runNavigationTests(); exit(0) }
+    RunLoop.main.run()
 } else if CommandLine.arguments.contains("--shortcut-model-test") {
     runShortcutTests()
 } else if CommandLine.arguments.contains("--self-test") {
-    runTests()
+    Task { @MainActor in await runTests(); exit(0) }
+    RunLoop.main.run()
 } else {
     let app = NSApplication.shared
     let delegate = Controller(); app.delegate = delegate

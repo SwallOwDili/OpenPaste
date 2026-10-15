@@ -43,12 +43,11 @@ extension Store {
                 message = "内容为空，未创建"
                 return false
             }
-            guard let id = ingest(created) else { return false }
+            guard let id = ingestAndSelect(created) else { return false }
             if id == created.id {
                 undoItems.append(ItemUndo(clips: [], ids: [id], label: "新建"))
                 if undoItems.count > 10 { undoItems.removeFirst() }
             }
-            choose(id)
             return true
         }
     }

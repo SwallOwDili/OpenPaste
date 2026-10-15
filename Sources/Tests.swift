@@ -3,7 +3,16 @@ import Carbon
 import SQLite3
 import Compression
 import ImageIO
-func runTests() {
+@MainActor
+func settleTestSearch(_ store: Store) async {
+    guard await store.awaitLatestSearch(timeout: 10) else {
+        print("FAIL: asynchronous search did not settle at the latest generation")
+        exit(1)
+    }
+}
+
+@MainActor
+func runTests() async {
     var passed = 0
     func check(_ ok: @autoclosure () -> Bool, _ name: String) { if !ok() { print("FAIL: \(name)"); exit(1) }; passed += 1; print("PASS: \(name)") }
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("OpenPaste-test-\(UUID())")
@@ -16,8 +25,8 @@ func runTests() {
     store.addBoard("常用"); let b = store.archive.boards[0].id; store.pin(store.archive.clips[1], to: b)
     store.ingest(clip("你好 Swift"))
     check(store.archive.clips.count == 2 && store.archive.clips[0].id == id && store.archive.clips[0].boards == [b], "dedup preserves identity and pin")
-    store.query = "SWIFT"; check(store.filtered.count == 1, "case insensitive search")
-    store.query = ""; store.board = b; check(store.filtered.count == 1, "board filter")
+    store.query = "SWIFT"; await settleTestSearch(store); check(store.filtered.count == 1, "case insensitive search")
+    store.query = ""; store.board = b; await settleTestSearch(store); check(store.filtered.count == 1, "board filter")
     store.flush()
     let loaded = Store(root: root); check(loaded.archive.clips.count == 2 && loaded.archive.boards.count == 1, "disk round trip")
     let file = root.appendingPathComponent("history.json")
@@ -95,22 +104,29 @@ func runTests() {
     check(isolated.archive.clips[0].kind == "文件", "file reference classification")
     let deletion = Store(ephemeral: true)
     deletion.archive.clips = [clip("first"), clip("middle"), clip("last")]
+    await settleTestSearch(deletion)
     let lastID = deletion.archive.clips[2].id
     deletion.selected = deletion.archive.clips[1].id
     deletion.delete(deletion.selected!)
+    await settleTestSearch(deletion)
     check(deletion.archive.clips.count == 2 && deletion.selected == lastID, "delete selects adjacent remaining record")
     deletion.delete(lastID)
+    await settleTestSearch(deletion)
     check(deletion.selected == deletion.archive.clips.first?.id, "delete last selects previous record")
     deletion.delete(deletion.selected!)
+    await settleTestSearch(deletion)
     check(deletion.selected == nil && deletion.filtered.isEmpty, "delete final record clears selection")
     let reverse = Store(ephemeral: true)
     reverse.archive.clips = [clip("newest"), clip("middle"), clip("oldest")]
     let newestID = reverse.archive.clips[0].id
     reverse.reverseHistory = true
+    await settleTestSearch(reverse)
     check(reverse.filtered.map { $0.text } == ["oldest", "middle", "newest"] && reverse.selected == reverse.filtered.first?.id, "reverse selects oldest without changing archive order")
     reverse.delete(reverse.selected!)
+    await settleTestSearch(reverse)
     check(reverse.filtered.first?.text == "middle" && reverse.selected == reverse.filtered.first?.id, "reverse delete advances from oldest")
     reverse.reverseHistory = false
+    await settleTestSearch(reverse)
     check(reverse.filtered.first?.id == newestID && reverse.archive.clips.first?.id == newestID, "release restores normal history order")
     let unlimited = Store(ephemeral: true)
     unlimited.limit = 0
@@ -125,11 +141,13 @@ func runTests() {
     check(CapturedColor.parse("235442") == nil && CapturedColor.parse("#fff") == nil && CapturedColor.parse("rgb(0,0,0)") == nil, "numeric verification codes and shorthand remain text")
     let features = Store(ephemeral: true)
     features.archive.clips = [clip("one"), clip("two"), clip("three")]
+    await settleTestSearch(features)
     features.choose(features.archive.clips[0].id); features.choose(features.archive.clips[2].id, modifiers: .shift)
     check(features.selectedClips.count == 3, "shift selection covers range")
     features.choose(features.archive.clips[1].id, modifiers: .command)
     check(features.selectedClips.map(\.text) == ["one", "three"], "command toggles selected record")
     check(features.restoreMany(features.selectedClips, plain: false, pasteboard: pb) && pb.string(forType: .string) == "one\nthree" && pb.data(forType: .rtf) != nil, "batch text paste retains rich format")
+    await settleTestSearch(features)
     features.deleteChosen(); check(features.archive.clips.map(\.text) == ["two"], "batch delete removes only selected records")
     features.undoItemChange(); check(features.archive.clips.count == 3, "undo restores batch deletion")
     let styledSample = NSAttributedString(string: "Styled", attributes: [.font: NSFont.boldSystemFont(ofSize: 18), .foregroundColor: NSColor.red])
@@ -140,7 +158,7 @@ func runTests() {
     check(features.archive.clips[0].cardTitle == "Label" && features.archive.clips[0].text == "Styled", "renamed card shows label without changing original text")
     let decodedRename = try! JSONDecoder().decode(Clip.self, from: JSONEncoder().encode(features.archive.clips[0]))
     check(decodedRename.cardTitle == "Label", "saved rename survives serialization")
-    features.query = "Label"; check(features.filtered.count == 1, "renamed label is searchable"); features.query = ""
+    features.query = "Label"; await settleTestSearch(features); check(features.filtered.count == 1, "renamed label is searchable"); features.query = ""
     features.ingest(richClip)
     check(features.archive.clips.count == 1 && features.archive.clips[0].cardTitle == "Label" && features.archive.clips[0].title == "Label", "repeat capture retains custom name")
     check(features.restore(features.archive.clips[0], plain: true, pasteboard: pb) && pb.string(forType: .string) == "Styled", "renamed record pastes original content")
@@ -151,7 +169,7 @@ func runTests() {
     var unnamed = richClip; unnamed.userLabel = "   "
     check(unnamed.cardTitle == "文字", "empty rename falls back to content type")
     features.undoItemChange(); check(features.archive.clips[0].title == richClip.title && features.archive.clips[0].userLabel == nil, "undo restores item metadata")
-    var screenshot = fixtureImage(); screenshot.ocrText = "识别结果 OCR needle"; features.archive.clips = [screenshot]; features.query = "needle"; check(features.filtered.count == 1, "search indexes recognized image text")
+    var screenshot = fixtureImage(); screenshot.ocrText = "识别结果 OCR needle"; features.archive.clips = [screenshot]; features.query = "needle"; await settleTestSearch(features); check(features.filtered.count == 1, "search indexes recognized image text")
     check(!LinkPreviewCache.allowed(URL(string: "http://127.0.0.1/private")!) && !LinkPreviewCache.allowed(URL(string: "https://example.com/?token=secret")!) && LinkPreviewCache.allowed(URL(string: "https://www.apple.com/mac/")!), "preview policy rejects local and credential URLs")
     let rotatedPart = ImageTools.rotated(fixtureImage())!
     let rotatedSource = CGImageSourceCreateWithData(rotatedPart.data as CFData, nil)!
@@ -164,7 +182,7 @@ func runTests() {
     var favorite = expired; favorite.id = UUID(); favorite.boards = [UUID()]
     retention.archive.clips = [clip("today"), expired, favorite]; retention.prune()
     check(retention.archive.clips.count == 2 && retention.archive.clips.contains(where: { $0.id == favorite.id }), "time retention excludes favorites")
-    features.query = ""; features.archive.clips = [clip("one"), clip("two"), clip("three")]; features.choose(features.archive.clips[0].id); features.choose(features.archive.clips[1].id, modifiers: .shift); features.choose(features.archive.clips[2].id, modifiers: .shift)
+    features.query = ""; features.archive.clips = [clip("one"), clip("two"), clip("three")]; await settleTestSearch(features); features.choose(features.archive.clips[0].id); features.choose(features.archive.clips[1].id, modifiers: .shift); features.choose(features.archive.clips[2].id, modifiers: .shift)
     check(features.selectedClips.count == 3, "repeated shift selection keeps original anchor")
     pb.clearContents(); pb.setString("#FF0000", forType: .string); let colorCapture = Store(ephemeral: true); colorCapture.captureContents(pb, source: "Test", sourceID: "test")
     check(colorCapture.archive.clips.first?.kind == "颜色" && colorCapture.archive.clips.first?.text == "#FF0000", "actual clipboard capture creates color item without changing text")
@@ -219,19 +237,22 @@ func runShortcutTests() {
     check(GlobalShortcut.load(from: defaults) == .standard, "invalid saved shortcut falls back")
 }
 
-func runNavigationTests() {
+@MainActor
+func runNavigationTests() async {
     let store = Store(ephemeral: true)
     let clips = (0..<5000).map { index in
         let text = "Item \(index) " + String(repeating: "long preview text ", count: 500)
         return Clip(source: "Fixture", sourceID: "", kind: "文字", title: "Item \(index)", text: text, parts: [[ClipPart(type: "public.utf8-plain-text", data: Data(text.utf8))]])
     }
     store.archive.clips = clips
+    await settleTestSearch(store)
     let passes = store.filterPasses
     let start = CFAbsoluteTimeGetCurrent()
     for _ in 0..<2000 { store.moveSelection(1) }
     let elapsed = CFAbsoluteTimeGetCurrent() - start
     guard store.selected == clips[2000].id, store.filterPasses == passes else { print("FAIL: navigation recomputes results or loses selection"); exit(1) }
     store.query = "Item 4999 "
+    await settleTestSearch(store)
     guard store.filtered.count == 1, store.selected == clips[4999].id else { print("FAIL: filtering keeps stale selection"); exit(1) }
     print(String(format: "PASS: 5000-item navigation, 2000 moves in %.3f s, no refilter; query selects valid result", elapsed))
     let boards = [UUID(), UUID(), UUID()]
@@ -248,6 +269,7 @@ func runNavigationTests() {
     var labelled = clips[7]; labelled.userLabel = "Gamma 名称"
     store.archive.clips[7] = labelled
     store.query = "gamma 名称"
+    await settleTestSearch(store)
     guard store.filtered.map(\.id) == [labelled.id] else { print("FAIL: renamed label is searchable without changing title"); exit(1) }
     store.query = ""
     guard BoardPalette.names.count == 8, Set(BoardPalette.names).count == 8,
@@ -269,9 +291,24 @@ func runNavigationTests() {
     var loaded: NSAttributedString?; var done = false
     RichTextCache.shared.load(richClip) { loaded = $0; done = true }
     let deadline = Date().addingTimeInterval(5)
-    while !done && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+    while !done && Date() < deadline { try? await Task.sleep(nanoseconds: 1_000_000) }
     guard loaded?.string == "Styled", RichTextCache.hasVisibleFormatting(loaded!), RichTextCache.shared.cached(richClip) != nil else { print("FAIL: rich text card cache"); exit(1) }
     print("PASS: rich text cards detect formatting, load RTF and cache the result")
+    var htmlOnly = plainClip
+    let htmlBytes = Data("<html><body><b>Original HTML</b><img src='https://example.test/image.png'></body></html>".utf8)
+    htmlOnly.parts[0].append(ClipPart(type: "public.html", data: htmlBytes))
+    guard RichTextCache.hasRichPart(htmlOnly), !RichTextCache.hasShelfRichPart(htmlOnly) else {
+        print("FAIL: HTML-only history must use a text shelf summary while preserving rich detail capability"); exit(1)
+    }
+    let originalHTMLParts = htmlOnly.parts
+    done = false; loaded = nil
+    RichTextCache.shared.load(htmlOnly) { loaded = $0; done = true }
+    let htmlDeadline = Date().addingTimeInterval(5)
+    while !done && Date() < htmlDeadline { try? await Task.sleep(nanoseconds: 1_000_000) }
+    guard done, loaded == nil, htmlOnly.parts == originalHTMLParts else {
+        print("FAIL: shelf cache must not parse HTML or change original pasteboard bytes"); exit(1)
+    }
+    print("PASS: HTML-only shelf fallback leaves original rich clipboard formats intact")
     let defaults = UserDefaults(suiteName: "openpaste.shelf-shortcuts.\(UUID().uuidString)")!
     guard ShelfShortcuts.load(from: defaults) == .standard,
           ShelfChord.nextBoard.valid, ShelfChord.previousBoard.valid,
