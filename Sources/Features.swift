@@ -133,7 +133,7 @@ extension Clip {
     var attributedText: NSAttributedString {
         let parts = exportParts().flatMap { $0 }
         if let data = parts.first(where: { $0.type == NSPasteboard.PasteboardType.rtf.rawValue })?.data, let text = NSAttributedString(rtf: data, documentAttributes: nil) { return text }
-        if let data = parts.first(where: { $0.type == NSPasteboard.PasteboardType.html.rawValue })?.data, let text = NSAttributedString(html: data, documentAttributes: nil) { return text }
+        if let data = parts.first(where: { $0.type == NSPasteboard.PasteboardType.html.rawValue })?.data, data.count <= RichTextCache.htmlByteLimit, let text = NSAttributedString(html: data, documentAttributes: nil) { return text }
         return NSAttributedString(string: text)
     }
     func dragProvider() -> NSItemProvider {

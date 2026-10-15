@@ -99,6 +99,34 @@ enum RichTextRendering {
     }
 }
 
+/// Applies text once the view has a real width, and only limits lines for text without tables:
+/// NSTextTable laid out under maximumNumberOfLines never finishes and freezes the main thread
+/// (the card is clipped by its frame and fade mask instead).
+final class RichTextScrollView: NSScrollView {
+    var pending: NSAttributedString?
+    var maximumLines = 0
+    override func layout() { super.layout(); applyPending() }
+    static func containsTable(_ text: NSAttributedString) -> Bool {
+        var found = false
+        text.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: text.length), options: []) { value, _, stop in
+            if let style = value as? NSParagraphStyle, !style.textBlocks.isEmpty { found = true; stop.pointee = true }
+        }
+        return found
+    }
+    func applyPending() {
+        guard let text = pending, contentSize.width > 1, let view = documentView as? NSTextView else { return }
+        pending = nil
+        if view.frame.width < 1 { view.setFrameSize(NSSize(width: contentSize.width, height: max(view.frame.height, 1))) }
+        if maximumLines > 0, !Self.containsTable(text) {
+            view.textContainer?.maximumNumberOfLines = maximumLines; view.textContainer?.lineBreakMode = .byTruncatingTail
+        } else {
+            view.textContainer?.maximumNumberOfLines = 0; view.textContainer?.lineBreakMode = .byWordWrapping
+        }
+        view.textStorage?.setAttributedString(text)
+        view.scroll(.zero)
+    }
+}
+
 /// Read-only rich text, drawn by AppKit so paragraph spacing, line height and links survive
 /// (SwiftUI's Text drops paragraph styles). Always renders as a light page.
 struct RichTextView: NSViewRepresentable {
@@ -111,7 +139,7 @@ struct RichTextView: NSViewRepresentable {
     final class Coordinator { var identity = "" }
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSScrollView()
+        let scroll = RichTextScrollView()
         scroll.drawsBackground = false; scroll.borderType = .noBorder
         scroll.hasVerticalScroller = scrolls; scroll.hasHorizontalScroller = false
         scroll.scrollerStyle = .overlay; scroll.autohidesScrollers = true
@@ -123,16 +151,16 @@ struct RichTextView: NSViewRepresentable {
         view.autoresizingMask = [.width]
         view.textContainer?.widthTracksTextView = true
         view.textContainer?.lineFragmentPadding = 0
-        if maximumLines > 0 { view.textContainer?.maximumNumberOfLines = maximumLines; view.textContainer?.lineBreakMode = .byTruncatingTail }
+        scroll.maximumLines = maximumLines
         view.textContainerInset = inset
         scroll.documentView = view
         return scroll
     }
     func updateNSView(_ scroll: NSScrollView, context: Context) {
-        guard context.coordinator.identity != identity, let view = scroll.documentView as? NSTextView else { return }
+        guard context.coordinator.identity != identity, let scroll = scroll as? RichTextScrollView else { return }
         context.coordinator.identity = identity
-        view.textStorage?.setAttributedString(text)
-        view.scroll(.zero)
+        scroll.pending = text
+        scroll.applyPending()
     }
 }
 
