@@ -7,6 +7,10 @@
 <p align="center">macOS 原生应用 · 本机存储 · 个人及公司使用免费</p>
 
 <p align="center">
+<a href="https://www.producthunt.com/products/openpaste?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-openpaste" target="_blank" rel="noopener noreferrer"><img alt="OpenPaste - Open-source macOS clipboard manager with quick translation | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1287315&amp;theme=light&amp;t=1792549923566"></a>
+</p>
+
+<p align="center">
   <a href="https://github.com/SwallOwDili/OpenPaste/releases">下载安装包</a> ·
   <a href="#使用">使用指南</a> ·
   <a href="https://github.com/SwallOwDili/OpenPaste/issues">反馈问题</a>
