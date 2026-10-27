@@ -9,6 +9,7 @@ final class PreviewCache {
     let images = NSCache<NSString, NSImage>()
     let icons = NSCache<NSString, NSImage>()
     var pending: [String: [(NSImage?) -> Void]] = [:]
+    private var requests: [String: DeferredPreviewWork] = [:]
     var missingIcons = Set<String>()
     let queue: DispatchQueue
     private let decoder: Decoder
@@ -32,10 +33,14 @@ final class PreviewCache {
         let fileURL = clip.kind == "文件" ? clip.text.components(separatedBy: "\n").first.map { URL(fileURLWithPath: $0) } : nil
         guard data != nil || fileURL != nil else { completion(nil); return }
         pending[key] = [completion]
+        let request = DeferredPreviewWork(); requests[key] = request
         decodeCount += 1
         queue.async {
+            guard request.begin() else { return }
             let cg = self.decoder(data, fileURL)
             DispatchQueue.main.async {
+                guard self.requests[key] === request else { return }
+                self.requests.removeValue(forKey: key)
                 let image = cg.map { NSImage(cgImage: $0, size: NSSize(width: $0.width, height: $0.height)) }
                 if let image = image, let cg = cg { self.images.setObject(image, forKey: key as NSString, cost: cg.width * cg.height * 4) }
                 let callbacks = self.pending.removeValue(forKey: key) ?? []
@@ -43,13 +48,20 @@ final class PreviewCache {
             }
         }
     }
+    func cancelQueued(_ clip: Clip) {
+        let key = clip.id.uuidString + ":" + clip.fingerprint
+        guard let request = requests[key], request.cancelBeforeStart() else { return }
+        requests.removeValue(forKey: key)
+        let callbacks = pending.removeValue(forKey: key) ?? []
+        callbacks.forEach { $0(nil) }
+    }
     func sourceIcon(_ bundleID: String) -> NSImage? {
+        if let icon = icons.object(forKey: bundleID as NSString) { return icon }
         if bundleID == Bundle.main.bundleIdentifier, let url = Bundle.main.url(forResource: "OpenPaste-v2", withExtension: "icns"), let icon = NSImage(contentsOf: url) {
             icons.setObject(icon, forKey: bundleID as NSString)
             return icon
         }
         guard !bundleID.isEmpty, !missingIcons.contains(bundleID) else { return nil }
-        if let icon = icons.object(forKey: bundleID as NSString) { return icon }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { missingIcons.insert(bundleID); return nil }
         let icon = NSWorkspace.shared.icon(forFile: url.path)
         icons.setObject(icon, forKey: bundleID as NSString)
@@ -59,16 +71,28 @@ final class PreviewCache {
 
 struct ClipThumbnail: View {
     let clip: Clip
+    var ready = true
+    var generation = 0
+    var store: Store? = nil
+    @State private var request: UUID?
     @State private var image: NSImage?
     @State private var loaded = false
     @State private var requestedVersion = ""
     private var version: String { clip.fingerprint }
     private func load() {
+        AcceptanceMetrics.searchEvent("thumbnail.load", generation: generation, count: 1, milliseconds: 0)
         let requested = version
+        let token = UUID(); request = token
+        let directory = store?.storageCallbackGeneration
         requestedVersion = requested; image = nil; loaded = false
         PreviewCache.shared.load(clip) { result in
-            guard requestedVersion == requested else { return }
+            guard request == token, requestedVersion == requested,
+                  store == nil || (store?.storageCallbackGeneration == directory && store?.searchAppliedGeneration == generation && store?.searchPending == false && store?.searchInputIsComposing == false) else {
+                AcceptanceMetrics.searchEvent("thumbnail.stale", generation: generation, count: 1, milliseconds: 0)
+                return
+            }
             image = result; loaded = true
+            AcceptanceMetrics.searchEvent(result == nil ? "thumbnail.failed" : "thumbnail.installed", generation: generation, count: 1, milliseconds: 0)
         }
     }
     var body: some View {
@@ -78,8 +102,14 @@ struct ClipThumbnail: View {
             else { ProgressView().controlSize(.small) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear { if requestedVersion != version { load() } }
-        .onChange(of: version) { _, _ in load() }
+        .task(id: ShelfPreviewIdentity(clip: clip, store: store, generation: generation, ready: ready)) {
+            AcceptanceMetrics.searchEvent(ready ? "thumbnail.task-ready" : "thumbnail.task-pending", generation: generation, count: 1, milliseconds: 0)
+            request = nil
+            if requestedVersion != version { image = nil; loaded = false }
+            guard ready else { PreviewCache.shared.cancelQueued(clip); return }
+            load()
+        }
+        .onDisappear { request = nil; PreviewCache.shared.cancelQueued(clip) }
     }
 }
 
@@ -134,5 +164,36 @@ extension PreviewCache {
         guard let icon = sourceIcon(bundleID), let color = IconAccent.dominant(of: icon) else { Self.missingAccents.insert(bundleID); return nil }
         Self.accents[bundleID] = color
         return color
+    }
+}
+
+/// Includes the data directory epoch, even when an imported item reuses its UUID.
+struct ShelfPreviewIdentity: Equatable {
+    let id: UUID
+    let digest: String
+    let directory: Int
+    let generation: Int
+    let ready: Bool
+    init(clip: Clip, store: Store?, generation: Int, ready: Bool) {
+        id = clip.id; digest = clip.fingerprint; directory = store?.storageCallbackGeneration ?? 0
+        self.generation = generation; self.ready = ready
+    }
+}
+
+/// Cancels optional preview work before expensive parsing/decoding starts. Once a
+/// worker has started, it can populate the cache; view identity still gates display.
+final class DeferredPreviewWork {
+    private let lock = NSLock()
+    private enum State: Equatable { case queued, running, cancelled }
+    private var state = State.queued
+    func begin() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard state == .queued else { return false }
+        state = .running; return true
+    }
+    func cancelBeforeStart() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard state == .queued else { return false }
+        state = .cancelled; return true
     }
 }

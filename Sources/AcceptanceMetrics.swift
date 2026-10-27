@@ -2,6 +2,13 @@ import Foundation
 
 // Local acceptance only: records timing, never clipboard content or settings.
 enum AcceptanceMetrics {
+    /// Search diagnostics deliberately contain no query or clipboard content.
+    static func searchEvent(_ phase: String, generation: Int, count: Int, milliseconds: Double) {
+        guard AppEnvironment.current.acceptanceMode else { return }
+        print(String(format: "ACCEPTANCE search.%@ generation=%d count=%d elapsed-ms=%.3f uptime=%.3f", phase, generation, count, milliseconds, ProcessInfo.processInfo.systemUptime))
+        fflush(stdout)
+    }
+
     private static var timer: Timer?
     private static var observer: CFRunLoopObserver?
     private static var previous = 0.0

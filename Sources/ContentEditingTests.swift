@@ -1,6 +1,7 @@
 import AppKit
 
-func runContentEditingTests() {
+@MainActor
+func runContentEditingTests() async {
     var checks = 0
     func check(_ condition: @autoclosure () -> Bool, _ label: String) {
         guard condition() else { print("FAIL: \(label)"); exit(1) }
@@ -71,7 +72,103 @@ func runContentEditingTests() {
     duplicateStore.undoItems.removeAll()
     let duplicateDraft = clip("")
     check(duplicateStore.saveContentEdit(.text(NSAttributedString(string: "same text")), to: .new(duplicateDraft)), "duplicate new text follows ingest semantics")
+    await settleTestSearch(duplicateStore)
     check(duplicateStore.archive.clips.count == 1 && duplicateStore.selected == existingID && duplicateStore.undoItems.isEmpty, "deduplicated new text selects the existing record without a false undo")
+
+    // Begin with an established selection: an empty history can accidentally
+    // pass because result installation defaults to its only row.
+    for multiple in [false, true] {
+        for deduplicated in [false, true] {
+            let selectionStore = Store(ephemeral: true)
+            let previous = clip("previous selection"), other = clip("other selection")
+            selectionStore.archive.clips = [previous, other]
+            let existingDraft = clip("")
+            check(selectionStore.saveContentEdit(.text(NSAttributedString(string: "existing target")), to: .new(existingDraft)),
+                  "prepare a real edited-text deduplication target")
+            await settleTestSearch(selectionStore)
+            selectionStore.choose(previous.id)
+            if multiple { selectionStore.choose(other.id, modifiers: .command) }
+            let oldSelection = selectionStore.selection
+            let newDraft = clip("")
+            let expectedID = deduplicated ? existingDraft.id : newDraft.id
+            let text = deduplicated ? "existing target" : "new target"
+            check(selectionStore.saveContentEdit(.text(NSAttributedString(string: text)), to: .new(newDraft)),
+                  "save new text with previous selection: multi=\(multiple), dedup=\(deduplicated)")
+            check(selectionStore.searchPending && selectionStore.selection == oldSelection,
+                  "new-text choice waits for its real asynchronous snapshot")
+            await settleTestSearch(selectionStore)
+            check(selectionStore.selected == expectedID && selectionStore.selection == [expectedID] &&
+                  selectionStore.selectionAnchor == expectedID && selectionStore.selectedClips.map(\.id) == [expectedID],
+                  "new text replaces selected ID, selection and anchor: multi=\(multiple), dedup=\(deduplicated)")
+            selectionStore.deleteChosen()
+            await settleTestSearch(selectionStore)
+            check(!selectionStore.archive.clips.contains { $0.id == expectedID } &&
+                  selectionStore.archive.clips.contains { $0.id == previous.id } &&
+                  selectionStore.archive.clips.contains { $0.id == other.id },
+                  "deletion after creation affects the saved target, never the previous selection")
+        }
+    }
+
+    // The OCR completion and new-content editor use the same production ingest
+    // entry point. Supply dedicated recognized text here; this is not a Vision
+    // or real GUI test, and never accesses the system clipboard.
+    for multiple in [false, true] {
+        for deduplicated in [false, true] {
+            let extractionStore = Store(ephemeral: true)
+            var picture = clip("source picture"); picture.kind = "图片"
+            let other = clip("other old selection"), recognized = clip("recognized fixture")
+            extractionStore.archive.clips = [picture, other] + (deduplicated ? [recognized] : [])
+            await settleTestSearch(extractionStore)
+            extractionStore.choose(picture.id)
+            if multiple { extractionStore.choose(other.id, modifiers: .command) }
+            let oldSelection = extractionStore.selection
+            let extracted = clip(recognized.text)
+            let expectedID = deduplicated ? recognized.id : extracted.id
+            check(extractionStore.ingestAndSelect(extracted) == expectedID,
+                  "OCR insertion returns the actual retained ID: multi=\(multiple), dedup=\(deduplicated)")
+            check(extractionStore.searchPending && extractionStore.selection == oldSelection,
+                  "OCR selection is deferred until its result is installed")
+            await settleTestSearch(extractionStore)
+            check(extractionStore.selected == expectedID && extractionStore.selection == [expectedID] &&
+                  extractionStore.selectionAnchor == expectedID && extractionStore.selectedClips.map(\.id) == [expectedID],
+                  "OCR result becomes the sole action target: multi=\(multiple), dedup=\(deduplicated)")
+            extractionStore.deleteChosen()
+            await settleTestSearch(extractionStore)
+            check(extractionStore.archive.clips.map(\.id).contains(picture.id) &&
+                  extractionStore.archive.clips.map(\.id).contains(other.id) &&
+                  !extractionStore.archive.clips.contains { $0.id == expectedID },
+                  "deleting extracted text preserves the source image and old multi-selection")
+        }
+    }
+
+    let fallbackStore = Store(ephemeral: true)
+    let retained = clip("retained visible row")
+    fallbackStore.archive.clips = [retained]
+    await settleTestSearch(fallbackStore)
+    fallbackStore.choose(retained.id)
+    fallbackStore.setRecordingLoadFailure("isolated selection failure")
+    check(fallbackStore.ingestAndSelect(clip("rejected")) == nil && fallbackStore.selected == retained.id &&
+          fallbackStore.selection == [retained.id] && fallbackStore.selectionAnchor == retained.id,
+          "failed insertion preserves the complete previous selection")
+    fallbackStore.setRecordingLoadFailure(nil)
+    fallbackStore.query = "retained"
+    await settleTestSearch(fallbackStore)
+    _ = fallbackStore.ingestAndSelect(clip("excluded by filter"))
+    await settleTestSearch(fallbackStore)
+    check(fallbackStore.selected == retained.id && fallbackStore.selection == [retained.id] && fallbackStore.selectionAnchor == retained.id,
+          "filtered-out insertion resolves to a valid single fallback row")
+    fallbackStore.query = "no matching fixture"
+    _ = fallbackStore.ingestAndSelect(clip("also excluded"))
+    await settleTestSearch(fallbackStore)
+    check(fallbackStore.selected == nil && fallbackStore.selection.isEmpty && fallbackStore.selectionAnchor == nil,
+          "empty results clear all three programmatic selection fields")
+    fallbackStore.query = "retained"
+    let removed = clip("retained then deleted")
+    _ = fallbackStore.ingestAndSelect(removed)
+    fallbackStore.delete(removed.id)
+    await settleTestSearch(fallbackStore)
+    check(fallbackStore.selected == retained.id && fallbackStore.selection == [retained.id] && fallbackStore.selectionAnchor == retained.id,
+          "target deleted before installation cannot leave a stale selection or anchor")
 
     let formattedStore = Store(ephemeral: true)
     check(formattedStore.saveContentEdit(.text(NSAttributedString(string: "same text")), to: .new(clip(""))), "plain rich-text fixture is created")

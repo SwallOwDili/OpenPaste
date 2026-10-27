@@ -18,13 +18,23 @@ struct CapturedColor {
 struct ItemUndo { var clips: [Clip]; var ids: Set<UUID>; var label: String }
 extension Store {
     func enrichLink(_ clip: Clip) {
+        let directory = storageCallbackGeneration
         LinkPreviewCache.shared.load(clip.text) { [weak self] result in
-            guard let self, let result else { return }
+            guard let self, let result, self.storageCallbackGeneration == directory else { return }
             self.applyLinkPreview(result, to: clip)
         }
     }
     var selectedClips: [Clip] { filtered.filter { selection.contains($0.id) || (selection.isEmpty && $0.id == selected) } }
+    /// Preserve ingest's deduplicated identity and resolve the entire selection
+    /// only after its new result snapshot is installed.
+    @discardableResult
+    func ingestAndSelect(_ clip: Clip) -> UUID? {
+        guard let id = ingest(clip) else { return nil }
+        requestSearchSelection(.single(id))
+        return id
+    }
     func choose(_ id: UUID, modifiers: NSEvent.ModifierFlags = []) {
+        guard !searchPending, !searchInputIsComposing else { return }
         if modifiers.contains(.command) {
             if selection.isEmpty, let selected { selection.insert(selected) }
             if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
@@ -48,7 +58,15 @@ extension Store {
         guard let i = archive.clips.firstIndex(where: { $0.id == clip.id }), clip.byteCount <= 20 * 1024 * 1024 else { message = "内容超过单条 20 MB 上限"; return }
         remember([archive.clips[i]], label: label); var updated = clip; updated.cachedDigest = updated.fingerprint; archive.clips[i] = updated; save()
     }
-    func deleteChosen() { guard canModifyHistory else { return }; let clips = selectedClips; guard !clips.isEmpty else { return }; remember(clips, label: "删除"); for clip in clips { delete(clip.id, recordUndo: false) }; selection = selected.map { [$0] } ?? [] }
+    func deleteChosen() {
+        guard canModifyHistory, !searchPending, !searchInputIsComposing else { return }
+        let clips = selectedClips
+        guard !clips.isEmpty else { return }
+        let index = selected.flatMap { visibleIndex(of: $0) } ?? 0
+        remember(clips, label: "删除")
+        for clip in clips { delete(clip.id, recordUndo: false) }
+        requestSearchSelection(.neighbor(index))
+    }
     func restoreMany(_ clips: [Clip], plain: Bool, pasteboard: NSPasteboard = .general) -> Bool {
         guard !clips.isEmpty else { return false }
         if clips.count == 1 { return restore(clips[0], plain: plain, pasteboard: pasteboard) }
@@ -91,7 +109,9 @@ extension Store {
                 let text: String = autoreleasepool { Self.recognize(clip) }
                 batch.append((clip, text))
                 let isLast = index == images.count - 1
-                guard batch.count == 25 || isLast else { continue }
+                // Fewer metadata publications keep the shelf responsive while
+                // preserving incremental OCR progress and cancellation guards.
+                guard batch.count == 100 || isLast else { continue }
                 let items = batch
                 batch.removeAll()
                 DispatchQueue.main.async {
@@ -108,7 +128,8 @@ extension Store {
     func applyRecognizedText(_ text: String, to clip: Clip, storageGeneration: Int) -> Bool {
         applyRecognizedTexts([(clip, text)], storageGeneration: storageGeneration) == 1
     }
-    /// Applies several OCR results with one archive assignment. Returns how many still matched their clip.
+    /// Applies OCR metadata in one archive update without rebuilding unchanged source names.
+    /// Returns how many results still matched their clip and storage generation.
     @discardableResult
     func applyRecognizedTexts(_ results: [(clip: Clip, text: String)], storageGeneration: Int) -> Int {
         guard canModifyHistory, storageCallbackGeneration == storageGeneration, !results.isEmpty else { return 0 }
@@ -120,7 +141,10 @@ extension Store {
             clips[index].ocrText = text
             applied += 1
         }
-        if applied > 0 { archive.clips = clips }
+        if applied > 0 {
+            var updated = archive; updated.clips = clips
+            replaceArchive(updated, sourcesChanged: false)
+        }
         return applied
     }
     static func recognize(_ clip: Clip) -> String {
@@ -213,11 +237,14 @@ extension Store {
     }
 }
 extension Controller {
+    /// All shelf actions consult the live state, including callbacks from an already open menu.
+    var canUseShelfResults: Bool { !store.searchPending && !store.searchInputIsComposing && !store.changingDataDirectory }
     func auxiliaryWindow(_ title: String, size: NSSize) -> NSWindow {
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = title; window.level = NSWindow.Level(rawValue: panel.level.rawValue + 1); window.isReleasedWhenClosed = false; window.center(); window.delegate = self; return window
     }
     func showPreview(_ clip: Clip) {
+        guard canUseShelfResults else { return }
         closePreview()
         let popover = NSPopover()
         popover.behavior = .applicationDefined
@@ -286,10 +313,11 @@ extension Controller {
         for child in view.subviews { if let found = firstScrollView(in: child) { return found } }
         return nil
     }
-    func openItem(_ clip: Clip) { if let url = URL(string: clip.text), clip.kind == "链接" { openExternal(url) } else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first { openExternal(URL(fileURLWithPath: path)) } else { showPreview(clip) } }
+    func openItem(_ clip: Clip) { guard canUseShelfResults else { return }; if let url = URL(string: clip.text), clip.kind == "链接" { openExternal(url) } else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first { openExternal(URL(fileURLWithPath: path)) } else { showPreview(clip) } }
     /// Renames the card title in place on the shelf; a dialog is only
     /// used when the shelf card is not the target, e.g. from the preview window.
     func rename(_ clip: Clip) {
+        guard canUseShelfResults else { return }
         if previewPopover?.isShown != true, panel.isVisible, !store.settings, store.visibleIndex(of: clip.id) != nil {
             store.searchFocused = false
             store.choose(clip.id)
@@ -327,7 +355,7 @@ extension Controller {
         guard let target = BoardNavigation.next(from: store.board, boards: store.archive.boards.map(\.id), delta: delta) else { return }
         store.searchFocused = false
         store.board = target
-        if let first = store.filtered.first { store.choose(first.id) }
+        store.requestSearchSelection(.first)
         panel.makeFirstResponder(panel.contentView)
     }
     func horizontalScrollView(in root: NSView, at location: NSPoint) -> NSScrollView? {
@@ -361,8 +389,9 @@ extension Controller {
             }
         }
     }
-    func createText() { var clip = Clip(source: "OpenPaste", sourceID: Bundle.main.bundleIdentifier ?? "", kind: "文字", title: "新建文字", text: "", parts: []); clip.parts = [[ClipPart(type: "public.utf8-plain-text", data: Data())]]; edit(clip) }
+    func createText() { var clip = Clip(source: "OpenPaste", sourceID: Bundle.main.bundleIdentifier ?? "", kind: "文字", title: "新建文字", text: "", parts: []); clip.parts = [[ClipPart(type: "public.utf8-plain-text", data: Data())]]; edit(clip, requiresCurrentResults: false) }
     func rotate(_ clip: Clip) {
+        guard canUseShelfResults else { return }
         let expectedFingerprint = clip.fingerprint
         store.captureQueue.async { [weak self] in
             guard let part = ImageTools.rotated(clip) else { return }
@@ -370,6 +399,7 @@ extension Controller {
         }
     }
     func extractText(_ clip: Clip) {
+        guard canUseShelfResults else { return }
         showToast("正在识别图片文字…")
         store.ocrQueue.async { [weak self] in
             let text = Store.recognize(clip)
@@ -377,12 +407,16 @@ extension Controller {
                 guard let self else { return }
                 if text.isEmpty { self.showToast("没有识别到文字"); return }
                 var extracted = Clip(source: clip.source, sourceID: clip.sourceID, kind: "文字", title: String(text.prefix(100)), text: text, parts: [[ClipPart(type: "public.utf8-plain-text", data: Data(text.utf8))]])
-                extracted.boards = clip.boards; _ = self.store.ingest(extracted); self.store.choose(extracted.id); self.edit(extracted)
+                extracted.boards = clip.boards
+                guard let id = self.store.ingestAndSelect(extracted),
+                      let saved = self.store.archive.clips.first(where: { $0.id == id }) else { return }
+                self.edit(saved, requiresCurrentResults: false)
             }
         }
     }
-    func enqueueSelection() { store.pasteQueue = store.selectedClips.map(\.id) }
+    func enqueueSelection() { guard canUseShelfResults else { return }; store.pasteQueue = store.selectedClips.map(\.id) }
     func pasteNext() {
+        guard canUseShelfResults else { return }
         switch store.prepareNextQueuedPaste() {
         case .ready: pastePrepared()
         case .empty: showToast("粘贴队列已完成")

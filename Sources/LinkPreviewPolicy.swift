@@ -35,7 +35,9 @@ extension Store {
               let index = archive.clips.firstIndex(where: { $0.id == clip.id && $0.text == clip.text }) else { return }
         let metadata = result.title + "\n" + result.subtitle
         guard archive.clips[index].linkTitle != metadata else { return }
-        archive.clips[index].linkTitle = metadata
+        var updated = archive
+        updated.clips[index].linkTitle = metadata
+        replaceArchive(updated, sourcesChanged: false)
         save()
     }
 }

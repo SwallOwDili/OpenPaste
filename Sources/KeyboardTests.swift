@@ -1,4 +1,128 @@
 import AppKit
+import SwiftUI
+
+/// Runs the actual lazy shelf/preview task hierarchy. A cache assertion alone
+/// without hosting the shelf would miss a ready flag lost at the ForEach boundary.
+@MainActor
+func runShelfPreviewHostTests() async -> Int {
+    _ = NSApplication.shared
+    let store = Store(ephemeral: true)
+    let plain = Clip(source: "Fixture", sourceID: "", kind: "文字", title: "initial plain fixture", text: "initial plain fixture", parts: [])
+    let png = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jXioAAAAASUVORK5CYII=")!
+    let picture = Clip(source: "Fixture", sourceID: "", kind: "图片", title: "unique preview fixture", text: "unique preview fixture", parts: [[ClipPart(type: "public.png", data: png)]])
+    store.archive.clips = [plain, picture]
+    store.query = "initial plain fixture"
+    var checks = 0
+    func check(_ value: Bool, _ label: String) {
+        guard value else { print("FAIL: \(label)"); exit(1) }
+        checks += 1; print("PASS: \(label)")
+    }
+    check(await store.awaitLatestSearch(), "host fixture initially installs the plain-text result")
+    let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 360, height: 260),
+                          styleMask: [.borderless], backing: .buffered, defer: false)
+    let host = NSHostingView(rootView: ShelfResultsView(store: store).equatable())
+    window.contentView = host
+    // Offscreen and never key/active: exercise real SwiftUI appearance/tasks
+    // without replacing the user's focus or touching their clipboard.
+    window.orderFront(nil)
+    host.layoutSubtreeIfNeeded()
+    defer { window.orderOut(nil); window.contentView = nil }
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let key = picture.id.uuidString + ":" + picture.fingerprint
+    check(PreviewCache.shared.images.object(forKey: key as NSString) == nil,
+          "offscreen image result has not been eagerly decoded")
+    store.query = "unique preview fixture"
+    check(await store.awaitLatestSearch(), "host fixture switches through the production asynchronous search")
+    let deadline = ProcessInfo.processInfo.systemUptime + 3
+    while PreviewCache.shared.images.object(forKey: key as NSString) == nil && ProcessInfo.processInfo.systemUptime < deadline {
+        try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    check(PreviewCache.shared.images.object(forKey: key as NSString) != nil,
+          "result installation propagates preview readiness through the lazy shelf and starts actual image decoding")
+    return checks
+}
+
+/// Exercises AppKit's real editing notifications in a hidden window; it does not
+/// pretend to drive a system IME or replace the separate desktop acceptance.
+@MainActor
+func runShelfSearchEditorTests() async -> Int {
+    _ = NSApplication.shared
+    let store = Store(ephemeral: true)
+    let coordinator = CommittedSearchField.Coordinator(store: store)
+    let field = CommittedSearchField.makeField(coordinator: coordinator)
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 60),
+                          styleMask: [.titled], backing: .buffered, defer: false)
+    field.frame = NSRect(x: 0, y: 0, width: 250, height: 30)
+    window.contentView?.addSubview(field)
+    var checks = 0
+    func check(_ value: Bool, _ label: String) {
+        guard value else { print("FAIL: \(label)"); exit(1) }
+        checks += 1; print("PASS: \(label)")
+    }
+    check(window.makeFirstResponder(field), "native search field becomes the hidden window's editor")
+    guard let editor = field.currentEditor() as? NSTextView else {
+        check(false, "native search field supplies an actual AppKit field editor"); return checks
+    }
+    // A first marked-text update emits begin-editing but not change-editing on
+    // AppKit. The editor's text-state callback must start composition tracking.
+    editor.setMarkedText("l", selectedRange: NSRange(location: 1, length: 0),
+                         replacementRange: NSRange(location: NSNotFound, length: 0))
+    check(editor.hasMarkedText() && store.searchInputIsComposing && store.searchPending && store.query.isEmpty,
+          "first native marked-text update blocks stale results before any change notification")
+    editor.unmarkText()
+    check(!store.searchInputIsComposing && store.query == "l",
+          "unmarking the unchanged first candidate submits its query")
+    check(await store.awaitLatestSearch(), "native unmarked candidate settles through asynchronous production search")
+    editor.insertText("tail", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+    check(store.query == "tail", "native committed replacement reaches Store through the editing notification chain")
+    editor.setMarkedText("か\u{3099}", selectedRange: NSRange(location: 2, length: 0),
+                         replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+    check(store.searchInputIsComposing && store.query == "tail", "native composition preserves the last committed query")
+    editor.insertText("か\u{3099}", replacementRange: NSRange(location: NSNotFound, length: 0))
+    check(!store.searchInputIsComposing && Array(store.query.utf16) == [0x304B, 0x3099],
+          "native candidate confirmation preserves decomposed Unicode without rewriting")
+    check(await store.awaitLatestSearch(), "confirmed native candidate installs current asynchronous results")
+    CommittedSearchField.dismantleNSView(field, coordinator: coordinator)
+    window.makeFirstResponder(nil)
+    return checks
+}
+
+@MainActor
+func runShelfRenderingPolicyTests() -> Int {
+    let store = Store(ephemeral: true)
+    var checks = 0
+    func check(_ value: Bool, _ label: String) {
+        guard value else { print("FAIL: \(label)"); exit(1) }
+        checks += 1; print("PASS: \(label)")
+    }
+    func card(_ clip: Clip, generation: Int = 1, ready: Bool = true, directory: Int = 0, selected: Bool = false) -> ClipCard {
+        ClipCard(clip: clip, index: 0, selected: selected, current: false, renaming: false,
+                 compact: false, networkPreviews: false, previewGeneration: generation,
+                 previewsReady: ready, directoryGeneration: directory, store: store)
+    }
+    let plain = Clip(source: "Fixture", sourceID: "", kind: "文字", title: "Fixture", text: "query fixture", parts: [])
+    for (label, text, parts) in [
+        ("plain", "query fixture", [ClipPart]()),
+        ("code", "let answer = 42", [ClipPart]()),
+        ("HTML summary", "query fixture", [ClipPart(type: "public.html", data: Data("<b>query fixture</b>".utf8))])
+    ] {
+        var clip = plain; clip.text = text; clip.parts = [parts]
+        check(card(clip) == card(clip, generation: 2, ready: false), "\(label) card ignores unrelated query preview invalidations")
+    }
+    for kind in ["链接", "图片", "文件"] {
+        var clip = plain; clip.kind = kind
+        check(card(clip) != card(clip, generation: 2), "\(kind) card preserves query-version callback guards")
+        check(card(clip) != card(clip, ready: false), "\(kind) card still cancels pending preview subscriptions")
+    }
+    var rich = plain; rich.parts = [[ClipPart(type: "public.rtf", data: Data("{\\rtf1 fixture}".utf8))]]
+    check(card(rich) != card(rich, generation: 2) && card(rich) != card(rich, ready: false), "RTF card preserves preview version and readiness")
+    check(card(plain) != card(plain, directory: 1), "plain card invalidates presentation after data-directory replacement")
+    check(card(plain) != card(rich), "representation changes without a digest still invalidate a card")
+    var edited = plain; edited.text = "edited fixture"
+    check(card(plain) != card(edited), "content edits still invalidate card presentation")
+    check(card(plain) != card(plain, selected: true), "selection still redraws a plain card")
+    return checks
+}
 
 // Run in a foreground desktop session with --keyboard-test. Uses demo history,
 // restores the pasteboard on exit, and never pastes into an external application.
@@ -6,7 +130,7 @@ import AppKit
 func runKeyboardTests(controller: Controller) async {
     let panel = controller.panel!
     let store = controller.store
-    var checks = 0
+    var checks = runShelfRenderingPolicyTests() + (await runShelfSearchEditorTests()) + (await runShelfPreviewHostTests())
     func check(_ value: Bool, _ label: String) {
         guard value else {
             print("FAIL: \(label)")
@@ -82,12 +206,29 @@ func runKeyboardTests(controller: Controller) async {
     check(NSApp.isActive, "keyboard tests require an active foreground desktop session; OpenPaste did not become active within 10 seconds")
     controller.showShelf()
     check(panel.isKeyWindow, "first shelf opening receives keyboard focus")
+    await settleTestSearch(store)
     let ids = store.filtered.map(\.id)
     check(ids.count >= 3, "demo history has enough cards")
+    // This is in-process routing coverage, not a replacement for real IME or
+    // cross-application paste acceptance. The pending state is deterministic.
+    let pendingPasteGeneration = controller.pasteGeneration
+    let pendingPasteboardChange = NSPasteboard.general.changeCount
+    store.setSearchInput("pending keyboard fixture", isComposing: true)
+    send(36, "\r")
+    send(36, "\r", modifiers: .shift)
+    send(18, "1", modifiers: .command)
+    check(panel.isVisible && controller.pasteGeneration == pendingPasteGeneration &&
+          NSPasteboard.general.changeCount == pendingPasteboardChange,
+          "Return, plain Return and quick paste cannot take stale results while search is pending")
+    store.cancelSearchInput()
+    await settleTestSearch(store)
+    check(controller.pasteGeneration == pendingPasteGeneration,
+          "finishing search does not replay a rejected pending paste command")
     let reopenClip = store.filtered[0]
     store.query = reopenClip.source
     store.kind = reopenClip.kind
     store.sourceFilter = reopenClip.source
+    await settleTestSearch(store)
     store.selected = reopenClip.id
     store.selection = [reopenClip.id]
     store.pasteQueue = [reopenClip.id]
@@ -101,6 +242,7 @@ func runKeyboardTests(controller: Controller) async {
     store.pasteQueue.removeAll()
     store.resetFilters()
     store.selection.removeAll()
+    await settleTestSearch(store)
     store.choose(ids[0])
     send(124, "\u{F703}")
     check(store.selected == ids[1], "right arrow selects next card through local monitor")
@@ -113,6 +255,7 @@ func runKeyboardTests(controller: Controller) async {
     check(NSApp.keyWindow == nil && panel.isVisible, "reproduce visible shelf without key window")
     controller.applicationDidBecomeActive(Notification(name: NSApplication.didBecomeActiveNotification))
     check(panel.isKeyWindow, "activation callback recovers key window")
+    await settleTestSearch(store)
     store.choose(ids[0])
     loseKeyboardFocus()
     send(124, "\u{F703}")
@@ -141,6 +284,7 @@ func runKeyboardTests(controller: Controller) async {
     check(NSApp.keyWindow == nil, "recovery does not steal modal focus")
     controller.modalShowing = false
     controller.restoreShelfKeyboardFocus()
+    await settleTestSearch(store)
     store.choose(ids[0])
     loseKeyboardFocus()
     var checkedTracking = false
@@ -175,6 +319,14 @@ func runKeyboardTests(controller: Controller) async {
     send(3, "f", modifiers: .command)
     await drain()
     check(store.searchFocused && panel.firstResponder is NSTextView, "search receives text focus")
+    if let editor = panel.firstResponder as? NSTextView {
+        check(!editor.isContinuousSpellCheckingEnabled && !editor.isGrammarCheckingEnabled &&
+              !editor.isAutomaticSpellingCorrectionEnabled && !editor.isAutomaticTextCompletionEnabled &&
+              !editor.isAutomaticQuoteSubstitutionEnabled && !editor.isAutomaticDashSubstitutionEnabled &&
+              !editor.isAutomaticTextReplacementEnabled && !editor.isAutomaticLinkDetectionEnabled &&
+              !editor.isAutomaticDataDetectionEnabled,
+              "search field disables linguistic services without sharing the rename/editor field editor")
+    }
     let selected = store.selected
     send(123, "\u{F702}")
     check(store.selected == selected, "left arrow in search does not move card selection")
@@ -188,6 +340,7 @@ func runKeyboardTests(controller: Controller) async {
     send(7, "x")
     send(16, "y")
     await waitUntil { store.query == "xy" }
+    await settleTestSearch(store)
     check(store.query == "xy" && panel.firstResponder is NSTextView, "typing from the list lands in the search field in order, after the debounce")
     store.resetFilters(); store.searchFocused = false; store.searchExpanded = false
     panel.makeFirstResponder(panel.contentView)
@@ -220,6 +373,7 @@ func runKeyboardTests(controller: Controller) async {
     store.resetFilters()
 
     // Issue #10: rename in place changes only the label.
+    await settleTestSearch(store)
     let renameTarget = store.filtered[1]
     store.choose(renameTarget.id)
     send(15, "r", modifiers: .command)
@@ -235,6 +389,7 @@ func runKeyboardTests(controller: Controller) async {
     check(store.archive.clips.first { $0.id == renameTarget.id }?.userLabel == nil, "empty rename restores the default title")
 
     // Issue #10: Command-E on the shelf edits the selected card.
+    await settleTestSearch(store)
     if let textClip = store.filtered.first(where: { $0.kind == "文字" && CapturedColor.parse($0.text) == nil }) {
         store.choose(textClip.id)
         panel.makeFirstResponder(panel.contentView)
@@ -272,6 +427,7 @@ func runKeyboardTests(controller: Controller) async {
     let afterPreview = store.filtered[3].id
     store.choose(previewClip.id)
     // Regression: a selectable text view inside the popover holding focus must not swallow the arrows.
+    await settleTestSearch(store)
     if let textClip = store.filtered.first(where: { $0.kind == "文字" && CapturedColor.parse($0.text) == nil && CodeSyntax.language($0.text) == nil }),
        let index = store.visibleIndex(of: textClip.id), index + 1 < store.filtered.count {
         store.choose(textClip.id)
@@ -372,6 +528,7 @@ func runKeyboardTests(controller: Controller) async {
 
     for code: UInt16 in [36, 76] {
         controller.showShelf()
+        await settleTestSearch(store)
         store.choose(ids[1])
         let expected = store.selectedClips[0].text
         controller.target = nil

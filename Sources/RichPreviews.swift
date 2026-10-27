@@ -11,6 +11,11 @@ struct LinkPreviewResult {
     var image: NSImage?
     var coordinate: CLLocationCoordinate2D?
 }
+/// Identifies one consumer, not the shared URL request. Accessed on the main thread.
+struct LinkPreviewSubscription {
+    fileprivate let key: String
+    fileprivate let id = UUID()
+}
 final class PreviewRequest {
     // Accessed only by the cache on the main thread, independently of cancellation.
     var usesNetworkSlot = false
@@ -50,7 +55,7 @@ final class LinkPreviewCache {
     static let shared = LinkPreviewCache()
     var results: [String: LinkPreviewResult] = [:]
     var failures: [String: Date] = [:]
-    var pending: [String: [(LinkPreviewResult?) -> Void]] = [:]
+    var pending: [String: [UUID: (LinkPreviewResult?) -> Void]] = [:]
     var jobs: [(String, () -> Void)] = []
     var active = 0
     var enabled = true { didSet { if !enabled { cancelAll() } } }
@@ -118,8 +123,20 @@ final class LinkPreviewCache {
         requests.values.forEach { $0.cancel() }; requests.removeAll()
         let writes = cacheWrites; cacheWrites.removeAll()
         for (key, write) in writes { cancel(write, for: key) }
-        let callbacks = pending.values.flatMap { $0 }; pending.removeAll(); active = 0
+        let callbacks = pending.values.flatMap { $0.values }; pending.removeAll(); active = 0
         callbacks.forEach { $0(nil) }
+    }
+    /// Detach only this consumer. Cancel queued work only after the last consumer
+    /// leaves; active system requests may still finish into the cache.
+    func cancel(_ subscription: LinkPreviewSubscription?) {
+        guard let subscription else { return }
+        let key = subscription.key
+        guard pending[key]?.removeValue(forKey: subscription.id) != nil else { return }
+        guard pending[key]?.isEmpty == true else { return }
+        pending.removeValue(forKey: key)
+        guard let request = requests[key], !request.usesNetworkSlot else { return }
+        request.cancel(); requests.removeValue(forKey: key)
+        jobs.removeAll { $0.0 == key }
     }
     struct Saved: Codable {
         var title: String
@@ -131,16 +148,19 @@ final class LinkPreviewCache {
     }
     static func allowed(_ url: URL) -> Bool { LinkPreviewPolicy.automatic(url) }
     func fileKey(_ text: String) -> String { HistoryStorage.hex(SHA256.hash(data: Data(("v2:" + text).utf8))) }
-    func load(_ text: String, userInitiated: Bool = false, completion: @escaping (LinkPreviewResult?) -> Void) {
-        guard enabled, let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)), LinkPreviewPolicy.canLoad(url), userInitiated || Self.allowed(url) else { completion(nil); return }
+    @discardableResult
+    func load(_ text: String, userInitiated: Bool = false, completion: @escaping (LinkPreviewResult?) -> Void) -> LinkPreviewSubscription? {
+        guard enabled, let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)), LinkPreviewPolicy.canLoad(url), userInitiated || Self.allowed(url) else { completion(nil); return nil }
         let key = url.absoluteString
         if userInitiated { failures.removeValue(forKey: key) }
-        else if let failed = failures[key], Date().timeIntervalSince(failed) < 600 { completion(nil); return }
-        if let value = results[key], let date = savedAt[key], Date().timeIntervalSince(date) < ttl { completion(value); return }
+        else if let failed = failures[key], Date().timeIntervalSince(failed) < 600 { completion(nil); return nil }
+        if let value = results[key], let date = savedAt[key], Date().timeIntervalSince(date) < ttl { completion(value); return nil }
         results.removeValue(forKey: key); savedAt.removeValue(forKey: key)
         if let write = cacheWrites.removeValue(forKey: key) { cancel(write, for: key) }
-        if pending[key] != nil { pending[key]?.append(completion); return }
-        pending[key] = [completion]
+        let subscription = LinkPreviewSubscription(key: key)
+        pending[key, default: [:]][subscription.id] = completion
+        // An active request can outlive its last subscriber and be joined again.
+        if requests[key] != nil { return subscription }
         let request = PreviewRequest(); requests[key] = request
         let file = root.appendingPathComponent(fileKey(key))
         scheduleCleanup()
@@ -169,9 +189,10 @@ final class LinkPreviewCache {
                 self.runNext()
             }
         }
+        return subscription
     }
 
-    func runNext() { guard enabled else { let queued = jobs; jobs.removeAll(); for (key, _) in queued { let callbacks = pending.removeValue(forKey: key) ?? []; callbacks.forEach { $0(nil) } }; return }; while active < 2 && !jobs.isEmpty { let job = jobs.removeFirst(); job.1() } }
+    func runNext() { guard enabled else { let queued = jobs; jobs.removeAll(); for (key, _) in queued { let callbacks = pending.removeValue(forKey: key) ?? [:]; callbacks.values.forEach { $0(nil) } }; return }; while active < 2 && !jobs.isEmpty { let job = jobs.removeFirst(); job.1() } }
     private func imageURL(for saved: Saved, file: URL) -> URL? {
         if let name = saved.imageFile, URL(fileURLWithPath: name).lastPathComponent == name { return root.appendingPathComponent(name) }
         return saved.generation == nil ? file.appendingPathExtension("png") : nil
@@ -249,9 +270,9 @@ final class LinkPreviewCache {
                 if cachedAt == nil { self.save(result, for: key) }
             }
             if result == nil { if self.failures.count > 1000 { self.failures.removeAll() }; self.failures[key] = Date() }
-            let callbacks = self.pending.removeValue(forKey: key) ?? []
+            let callbacks = self.pending.removeValue(forKey: key) ?? [:]
             if request.usesNetworkSlot { request.usesNetworkSlot = false; self.active -= 1 }
-            callbacks.forEach { $0(result) }; self.runNext()
+            callbacks.values.forEach { $0(result) }; self.runNext()
         }
     }
     func loadWeb(_ url: URL, request: PreviewRequest, completion: @escaping (LinkPreviewResult?) -> Void) {
@@ -338,13 +359,88 @@ final class LinkPreviewCache {
     }
 }
 
+private struct LinkCardContent: Equatable {
+    let id: UUID
+    let text: String
+    let digest: String
+    let directory: Int
+    init(_ clip: Clip, store: Store) {
+        id = clip.id; text = clip.text; digest = clip.fingerprint
+        directory = store.storageCallbackGeneration
+    }
+}
+
+/// Main-thread state shared by the card's automatic and explicit load paths.
+/// A result belongs to content, not a search generation. Only in-flight callbacks
+/// are tied to the current query; keeping a result never grants a new network load.
+final class LinkCardPreview: ObservableObject {
+    @Published private(set) var result: LinkPreviewResult?
+    @Published private(set) var finished = false
+    @Published private(set) var userRequested = false
+    private let cache: LinkPreviewCache
+    private var content: LinkCardContent?
+    private var requestID: UUID?
+    private var subscription: LinkPreviewSubscription?
+    init(cache: LinkPreviewCache = .shared) { self.cache = cache }
+
+    func suspend() {
+        requestID = nil
+        cache.cancel(subscription); subscription = nil
+        if result == nil { userRequested = false }
+    }
+
+    func update(clip: Clip, store: Store, enabled: Bool, ready: Bool, generation: Int, userInitiated: Bool = false) {
+        let currentContent = LinkCardContent(clip, store: store)
+        suspend()
+        if content != currentContent || !enabled {
+            content = currentContent
+            result = nil; userRequested = false; finished = !enabled
+        }
+        guard enabled, ready, !store.searchPending, !store.searchInputIsComposing else { return }
+        // In particular, the metadata write following a manual success refreshes
+        // search results. Keep the successful preview without reauthorizing a fetch.
+        guard result == nil else { return }
+        let token = UUID(); requestID = token
+        userRequested = userInitiated; finished = false
+        let handle = cache.load(clip.text, userInitiated: userInitiated) { [weak self, weak store] preview in
+            guard let self, let store, self.requestID == token else { return }
+            self.requestID = nil; self.subscription = nil
+            guard self.content == currentContent, store.storageCallbackGeneration == currentContent.directory,
+                  store.searchAppliedGeneration == generation, !store.searchPending,
+                  !store.searchInputIsComposing, store.networkPreviews else { return }
+            self.result = preview; self.finished = true
+            if preview == nil { self.userRequested = false }
+            if let preview {
+                // A shared request invokes all subscribers in one main-queue turn.
+                // Defer the metadata write until that turn is complete; otherwise
+                // the first card starts a search refresh and makes later visible
+                // cards reject the same valid result as "stale".
+                DispatchQueue.main.async { [weak self, weak store] in
+                    guard let self, let store, self.content == currentContent,
+                          store.storageCallbackGeneration == currentContent.directory,
+                          store.networkPreviews else { return }
+                    store.applyLinkPreview(preview, to: clip)
+                }
+            }
+        }
+        // Memory hits and policy rejections complete synchronously.
+        if requestID == token { subscription = handle }
+    }
+}
+
+private struct LinkCardTaskIdentity: Equatable {
+    let preview: ShelfPreviewIdentity
+    let text: String
+    let enabled: Bool
+}
+
 struct RichLinkCard: View {
     let clip: Clip
     let enabled: Bool
+    var ready = true
+    var generation = 0
     let store: Store
-    @State var result: LinkPreviewResult?
-    @State var finished = false
-    @State private var userRequested = false
+    @StateObject private var preview = LinkCardPreview()
     private var needsExplicitLoad: Bool {
         guard let url = URL(string: clip.text.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
         return LinkPreviewPolicy.canLoad(url) && !LinkPreviewPolicy.automatic(url)
@@ -352,32 +448,25 @@ struct RichLinkCard: View {
     var body: some View {
         GeometryReader { geometry in
         VStack(alignment: .leading, spacing: 8) {
-            if let image = result?.image { Image(nsImage: image).resizable().scaledToFill().frame(maxWidth: .infinity).frame(height: max(28, geometry.size.height - 58)).clipped() }
-            else if !finished && enabled { ProgressView("加载预览…").font(.caption).frame(maxWidth: .infinity, maxHeight: .infinity) }
+            if let image = preview.result?.image { Image(nsImage: image).resizable().scaledToFill().frame(maxWidth: .infinity).frame(height: max(28, geometry.size.height - 58)).clipped() }
+            else if !preview.finished && enabled { ProgressView("加载预览…").font(.caption).frame(maxWidth: .infinity, maxHeight: .infinity) }
             else if MapLink.parse(clip.text) != nil { Image(systemName: "map").font(.system(size: 30)).foregroundStyle(.green) }
-            Text(clip.userLabel ?? result?.title ?? MapLink.parse(clip.text)?.name ?? clip.title).font(.system(size: 13, weight: .semibold)).lineLimit(1).onTapGesture { Controller.shared.rename(clip) }
-            Text(result?.subtitle ?? MapLink.parse(clip.text)?.coordinate ?? URL(string: clip.text)?.host ?? clip.text).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-            if enabled && needsExplicitLoad && !userRequested {
-                Button("点击加载预览") { userRequested = true; reload(userInitiated: true) }
+            Text(clip.userLabel ?? preview.result?.title ?? MapLink.parse(clip.text)?.name ?? clip.title).font(.system(size: 13, weight: .semibold)).lineLimit(1).onTapGesture { Controller.shared.rename(clip) }
+            Text(preview.result?.subtitle ?? MapLink.parse(clip.text)?.coordinate ?? URL(string: clip.text)?.host ?? clip.text).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+            if enabled && needsExplicitLoad && !preview.userRequested {
+                Button("点击加载预览") { guard ready, Controller.shared.canUseShelfResults else { return }; reload(userInitiated: true) }
                     .buttonStyle(.borderless).font(.system(size: 11))
                     .help("此链接可能属于内网或携带验证信息。点击会访问原网址。")
-            } else if finished && result == nil {
+            } else if preview.finished && preview.result == nil {
                 Text(enabled ? "预览不可用 · 原链接仍可使用" : "联网预览已关闭").font(.system(size: 10)).foregroundStyle(.tertiary)
             }
             Spacer(minLength: 0)
         }
-        }.onAppear { reload() }
-            .onChange(of: enabled) { _, _ in userRequested = false; reload() }
-            .onChange(of: clip.text) { _, _ in userRequested = false; result = nil; reload() }
+        }
+        .task(id: LinkCardTaskIdentity(preview: ShelfPreviewIdentity(clip: clip, store: store, generation: generation, ready: ready), text: clip.text, enabled: enabled)) { reload() }
+        .onDisappear { preview.suspend() }
     }
     func reload(userInitiated: Bool = false) {
-        guard enabled else { result = nil; finished = true; return }
-        finished = false
-        LinkPreviewCache.shared.load(clip.text, userInitiated: userInitiated) { preview in
-            guard store.networkPreviews else { result = nil; finished = true; return }
-            result = preview; finished = true
-            if preview == nil { userRequested = false }
-            if let preview { store.applyLinkPreview(preview, to: clip) }
-        }
+        preview.update(clip: clip, store: store, enabled: enabled, ready: ready, generation: generation, userInitiated: userInitiated)
     }
 }
