@@ -180,6 +180,10 @@ final class Store: ObservableObject {
     var syncStamp = ""
     var initialDirectoryLoadFailed = false
     private var storageRetryInFlight = false
+    // Recording stays paused after a failed save, and only a save can clear that pause. Retry on a
+    // growing delay so a transient failure (such as a momentarily full disk) cannot pause recording for good.
+    private var storageRetryTimer: Timer?
+    private var storageRetryDelay: TimeInterval = 1
     var syncChecking = false
     var directoryMutation = 0
     var syncTimer: Timer?
@@ -433,10 +437,12 @@ final class Store: ObservableObject {
                     self.storageRetryInFlight = false
                     let recovered = self.pauseReasons.saveFailure != nil
                     self.setRecordingSaveFailure(nil)
-                    if recovered { self.message = self.storageDescription }
+                    if recovered { AppDiagnostics.record("storage.save-recovered"); self.message = self.storageDescription }
                 }
             } catch {
                 let detail = error.localizedDescription
+                // Only the error code is recorded (no paths or content), so a later report can tell a full disk from other failures.
+                AppDiagnostics.record("storage.save-failed", ["code": String((error as NSError).code), "cloud": cloud ? "1" : "0"])
                 DispatchQueue.main.async {
                     guard let self, gate.isCurrent(generation), self.root == folder, self.directoryMutation == mutation, !self.changingDataDirectory else { return }
                     self.storageRetryInFlight = false
@@ -505,8 +511,25 @@ final class Store: ObservableObject {
     }
     func setRecordingSaveFailure(_ detail: String?) {
         pauseReasons.setSaveFailure(detail)
-        if let detail { message = "历史保存失败：\(detail)。内存中的更改仍保留，请修复后重试保存。" }
+        if let detail { message = "历史保存失败：\(detail)。内存中的更改仍保留，将自动重试，也可手动重试保存。" }
+        if detail == nil {
+            storageRetryTimer?.invalidate(); storageRetryTimer = nil; storageRetryDelay = 1
+        } else {
+            scheduleStorageRetry()
+        }
         refreshPauseState()
+    }
+    private func scheduleStorageRetry() {
+        guard !ephemeral, storageRetryTimer == nil, pauseReasons.saveFailure != nil else { return }
+        let delay = storageRetryDelay
+        storageRetryDelay = min(storageRetryDelay * 2, 30)
+        storageRetryTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.storageRetryTimer = nil
+            self.retryRecordingStorage()
+            // A retry skipped by its guards (for example during a directory change) must not end the schedule.
+            self.scheduleStorageRetry()
+        }
     }
     func retryRecordingStorage() {
         guard !ephemeral, !storageRetryInFlight, !changingDataDirectory, !importingPaste else { return }
@@ -762,6 +785,7 @@ final class Store: ObservableObject {
         }
         let originalChangeCount = pb.changeCount
         let outcome = ClipboardWrite.attempt(objects, to: pb)
+        AppDiagnostics.record("clipboard.restore", ["outcome": "\(outcome)", "items": "\(objects.count)"])
         let ok = outcome.succeeded
         if outcome == .restoredPrevious { recordRestoredClipboardChange(from: originalChangeCount, pasteboard: pb) }
         else if outcome != .superseded { change = pb.changeCount }

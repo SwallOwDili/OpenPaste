@@ -564,6 +564,22 @@ func runStorageRecoveryTests() {
         check(try HistoryStorage.read(from: switchedRoot.appendingPathComponent("history.json")).clips.contains { $0.id == switchedClip.id },
               "directory switch preserves the in-memory archive")
 
+        // A transient write failure (for example a momentarily full disk) must not keep recording
+        // paused until the user presses 重试保存: nothing else retries, so capture stays off for good.
+        let transientRoot = sandbox.appendingPathComponent("transient-save-failure")
+        let transient = Store(root: transientRoot)
+        let transientBlobs = transientRoot.appendingPathComponent("blobs")
+        try Data("transient write failure".utf8).write(to: transientBlobs)
+        _ = transient.ingest(clip("written while saving fails"))
+        drain(transient)
+        check(transient.recordingSafetyPaused && transient.recordingPauseControl.action == .retrySave, "transient write failure pauses recording")
+        try fm.removeItem(at: transientBlobs)
+        check(wait(10) { !transient.recordingSafetyPaused }, "recording resumes by itself once the write succeeds")
+        check(transient.recordingPauseControl.action == .pause, "automatic recovery does not require a manual retry")
+        drain(transient)
+        check(try HistoryStorage.read(from: transientRoot.appendingPathComponent("history.json")).clips.contains { $0.title == "written while saving fails" },
+              "automatic recovery persists the archive retained in memory")
+
         print("Storage recovery: \(checks) checks passed")
     } catch { print("FAIL: \(error)"); exit(1) }
 }
