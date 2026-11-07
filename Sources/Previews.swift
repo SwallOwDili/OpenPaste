@@ -44,12 +44,16 @@ final class PreviewCache {
         }
     }
     func sourceIcon(_ bundleID: String) -> NSImage? {
-        if bundleID == Bundle.main.bundleIdentifier, let url = Bundle.main.url(forResource: "OpenPaste-v2", withExtension: "icns"), let icon = NSImage(contentsOf: url) {
-            icons.setObject(icon, forKey: bundleID as NSString)
-            return icon
+        if let icon = icons.object(forKey: bundleID as NSString) { return icon }
+        if bundleID == Bundle.main.bundleIdentifier {
+            let finishTiming = AcceptanceMetrics.begin("preview.icon.self"); defer { finishTiming() }
+            if let url = Bundle.main.url(forResource: "OpenPaste-v2", withExtension: "icns"), let icon = NSImage(contentsOf: url) {
+                icons.setObject(icon, forKey: bundleID as NSString)
+                return icon
+            }
         }
         guard !bundleID.isEmpty, !missingIcons.contains(bundleID) else { return nil }
-        if let icon = icons.object(forKey: bundleID as NSString) { return icon }
+        let finishTiming = AcceptanceMetrics.begin("preview.icon.load"); defer { finishTiming() }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { missingIcons.insert(bundleID); return nil }
         let icon = NSWorkspace.shared.icon(forFile: url.path)
         icons.setObject(icon, forKey: bundleID as NSString)
@@ -131,6 +135,7 @@ extension PreviewCache {
     func accentColor(_ bundleID: String) -> NSColor? {
         if let cached = Self.accents[bundleID] { return cached }
         guard !Self.missingAccents.contains(bundleID) else { return nil }
+        let finishTiming = AcceptanceMetrics.begin("preview.icon.accent"); defer { finishTiming() }
         guard let icon = sourceIcon(bundleID), let color = IconAccent.dominant(of: icon) else { Self.missingAccents.insert(bundleID); return nil }
         Self.accents[bundleID] = color
         return color

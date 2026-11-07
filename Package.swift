@@ -16,6 +16,7 @@ let testOnlySources = [
     "PermissionMonitorTests.swift",
     "RecordingPauseTests.swift",
     "StorageRecoveryTests.swift",
+    "StartupPerformanceTests.swift",
     "Tests.swift",
     "TranslationConfigTests.swift",
     "UpdateTests.swift"
