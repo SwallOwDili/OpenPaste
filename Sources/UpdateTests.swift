@@ -15,6 +15,24 @@ private final class UpdateMockProtocol: URLProtocol {
     }
     override func stopLoading() {}
 }
+private final class UpdateSweepFileManager: FileManager, @unchecked Sendable {
+    let enumerationStarted = DispatchSemaphore(value: 0)
+    let enumerationAllowed = DispatchSemaphore(value: 0)
+    let enumerationReturned = DispatchSemaphore(value: 0)
+    let enumeratedOnMain = DispatchSemaphore(value: 0)
+    let removed = DispatchSemaphore(value: 0)
+    override func contentsOfDirectory(atPath path: String) throws -> [String] {
+        if Thread.isMainThread { enumeratedOnMain.signal() }
+        enumerationStarted.signal()
+        _ = enumerationAllowed.wait(timeout: .now() + 3)
+        defer { enumerationReturned.signal() }
+        return try super.contentsOfDirectory(atPath: path)
+    }
+    override func removeItem(at URL: URL) throws {
+        try super.removeItem(at: URL)
+        removed.signal()
+    }
+}
 func runUpdateTests() {
     var count = 0
     func expect(_ condition: @autoclosure () -> Bool, _ label: String) {
@@ -149,6 +167,48 @@ func runUpdateTests() {
     try! FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: readOnlyDir.path)
     expect(UpdateInstaller(bundleURL: lockedApp).blockingReason(requirement: signed) == .notWritable, "unwritable parent refused")
     try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: readOnlyDir.path)
+    // Startup cleanup must remain responsive while the app's parent directory is unavailable.
+    func waitForSweepSignal(_ signal: DispatchSemaphore) -> Bool {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if signal.wait(timeout: .now()) == .success { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        return false
+    }
+    let sweepDir = scratch.appendingPathComponent("Sweep", isDirectory: true)
+    let sweepApp = sweepDir.appendingPathComponent("OpenPaste.app", isDirectory: true)
+    let stale = sweepDir.appendingPathComponent(".OpenPaste-update-stale", isDirectory: true)
+    let backup = sweepDir.appendingPathComponent(".OpenPaste-backup-original", isDirectory: true)
+    let unrelated = sweepDir.appendingPathComponent("Other.app", isDirectory: true)
+    for directory in [sweepApp, stale, backup, unrelated] { try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+    let sweepManager = UpdateSweepFileManager()
+    let sweepInstaller = UpdateInstaller(bundleURL: sweepApp, fileManager: sweepManager)
+    let sweepStarted = Date()
+    sweepInstaller.sweepStaleStaging()
+    expect(Date().timeIntervalSince(sweepStarted) < 0.2, "staging sweep returns before slow enumeration completes")
+    expect(waitForSweepSignal(sweepManager.enumerationStarted), "staging sweep begins directory enumeration")
+    expect(sweepManager.enumeratedOnMain.wait(timeout: .now()) == .timedOut, "staging enumeration runs off the main thread")
+    let mainResponded = DispatchSemaphore(value: 0)
+    DispatchQueue.main.async { mainResponded.signal() }
+    expect(waitForSweepSignal(mainResponded), "main queue responds while staging enumeration is blocked")
+    expect(FileManager.default.fileExists(atPath: stale.path), "blocked enumeration has not removed staging")
+    sweepManager.enumerationAllowed.signal()
+    expect(waitForSweepSignal(sweepManager.removed), "staging sweep eventually removes an abandoned directory")
+    expect(!FileManager.default.fileExists(atPath: stale.path), "abandoned staging is removed")
+    expect(FileManager.default.fileExists(atPath: backup.path) && FileManager.default.fileExists(atPath: unrelated.path), "staging sweep preserves backups and unrelated apps")
+    let cancelledStale = sweepDir.appendingPathComponent(".OpenPaste-update-cancelled-sweep", isDirectory: true)
+    try! FileManager.default.createDirectory(at: cancelledStale, withIntermediateDirectories: true)
+    let cancelledManager = UpdateSweepFileManager()
+    let cancelledInstaller = UpdateInstaller(bundleURL: sweepApp, fileManager: cancelledManager)
+    cancelledInstaller.sweepStaleStaging()
+    expect(waitForSweepSignal(cancelledManager.enumerationStarted), "competing generation test pauses enumeration")
+    // cancel and prepare increment the same generation; this exercises the guard without downloading an update.
+    cancelledInstaller.cancel()
+    cancelledManager.enumerationAllowed.signal()
+    expect(waitForSweepSignal(cancelledManager.enumerationReturned), "cancelled sweep enumeration returns")
+    RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+    expect(cancelledManager.removed.wait(timeout: .now()) == .timedOut && FileManager.default.fileExists(atPath: cancelledStale.path), "generation change safely skips the entire staging sweep")
     // Candidate identity and signature
     func candidate(id: String, version: String) -> URL {
         let app = scratch.appendingPathComponent("Candidate-\(UUID().uuidString).app", isDirectory: true)
