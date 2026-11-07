@@ -111,7 +111,7 @@ final class UpdateInstaller: NSObject, ObservableObject, URLSessionDownloadDeleg
     var onReady: (() -> Void)?
     private(set) var preparedRelease: GitHubRelease?
     private let bundleURL: URL
-    private let fileManager = FileManager.default
+    private let fileManager: FileManager
     private var session: URLSession?
     private var task: URLSessionDownloadTask?
     private var continuation: CheckedContinuation<URL, Error>?
@@ -120,8 +120,9 @@ final class UpdateInstaller: NSObject, ObservableObject, URLSessionDownloadDeleg
     private var stagedApp: URL?
     private var generation = 0
 
-    init(bundleURL: URL = Bundle.main.bundleURL) {
+    init(bundleURL: URL = Bundle.main.bundleURL, fileManager: FileManager = .default) {
         self.bundleURL = bundleURL.standardizedFileURL
+        self.fileManager = fileManager
         super.init()
     }
     var busy: Bool { phase != .idle && phase != .ready }
@@ -209,10 +210,23 @@ final class UpdateInstaller: NSObject, ObservableObject, URLSessionDownloadDeleg
     /// Removes staging folders a crashed run left next to the app. Backups are never touched here.
     func sweepStaleStaging() {
         let parent = bundleURL.deletingLastPathComponent()
-        guard bundleURL.pathExtension == "app", stagingDirectory == nil,
-              let names = try? fileManager.contentsOfDirectory(atPath: parent.path) else { return }
-        for name in names where name.hasPrefix(".OpenPaste-update-") {
-            try? fileManager.removeItem(at: parent.appendingPathComponent(name))
+        guard bundleURL.pathExtension == "app", !busy, stagingDirectory == nil else { return }
+        let current = generation
+        let fileManager = fileManager
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let names = try? fileManager.contentsOfDirectory(atPath: parent.path) else { return }
+            DispatchQueue.main.async {
+                // A new prepare may create its directory before registering it on the main thread.
+                guard let self, self.generation == current else { return }
+                let active = self.stagingDirectory
+                DispatchQueue.global(qos: .utility).async {
+                    for name in names where name.hasPrefix(".OpenPaste-update-") {
+                        let directory = parent.appendingPathComponent(name)
+                        guard directory.standardizedFileURL != active?.standardizedFileURL else { continue }
+                        try? fileManager.removeItem(at: directory)
+                    }
+                }
+            }
         }
     }
 
