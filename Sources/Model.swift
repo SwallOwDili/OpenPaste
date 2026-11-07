@@ -143,6 +143,7 @@ final class Store: ObservableObject {
     @Published var chordNotice = ""
     @Published var recordingShortcut = false
     @Published var shortcutNotice = ""
+    @Published var pasteOnReturn: Bool { didSet { if usePreferences { configurationDefaults?.set(pasteOnReturn, forKey: "pasteOnReturn") } } }
     @Published var directPasteAuthorized = false
     @Published var permissionStatus = "未授权"
     @Published var searchFocused = false
@@ -211,6 +212,7 @@ final class Store: ObservableObject {
         storageLimitMB = max(200, configurationDefaults?.integer(forKey: "storageLimitMB") ?? 0)
         shortcutLabel = (configurationDefaults.map { GlobalShortcut.load(from: $0) } ?? .standard).label
         shelfShortcuts = ShelfShortcuts.load(from: configurationDefaults)
+        pasteOnReturn = configurationDefaults?.object(forKey: "pasteOnReturn") as? Bool ?? true
         networkPreviews = configurationDefaults?.object(forKey: "networkPreviews") as? Bool ?? true
         retentionDays = configurationDefaults?.integer(forKey: "retentionDays") ?? 0
         limit = configurationDefaults?.object(forKey: "historyLimit") as? Int ?? 1000

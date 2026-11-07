@@ -282,9 +282,10 @@ struct SettingsPageView: View {
         VStack(alignment: .leading, spacing: 22) {
             group("辅助功能") {
                 HStack { Label("直接粘贴", systemImage: "keyboard"); Spacer(); Label(store.permissionStatus, systemImage: store.directPasteAuthorized ? "checkmark.circle.fill" : "exclamationmark.circle").font(.caption).foregroundStyle(store.directPasteAuthorized ? Color.green : Color.orange) }
-                note("授权后可返回原输入框自动粘贴。未授权时，取用内容后手动按 ⌘V。")
+                HStack { Text("按回车直接粘贴"); Spacer(); Toggle("按回车直接粘贴", isOn: $store.pasteOnReturn).labelsHidden().toggleStyle(.switch) }
+                note("开启且系统已授权时，按回车会粘贴到原输入框。关闭或未授权时，按回车只复制，可手动按 ⌘V 粘贴。")
                 Button("打开辅助功能设置…") { Controller.shared.requestAccessibility() }
-                if !store.directPasteAuthorized { note("开关已打开但未生效时，退出并重开 OpenPaste；仍无效时移除旧条目，重新添加 /Applications/OpenPaste.app。") }
+                if !store.directPasteAuthorized { note("如果系统辅助功能授权已开启，退出并重新打开 OpenPaste。若仍未生效，请移除旧条目，重新添加当前运行的 OpenPaste.app。") }
             }
             group("排除应用") {
                 note("这些应用的复制内容不会记录，也不会执行快速翻译。每行填写一个 Bundle ID。")

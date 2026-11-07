@@ -327,7 +327,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" { if self.store.searchExpanded { self.store.filtersExpanded.toggle() }; self.store.searchFocused = true; return nil }
             let quick = self.store.shelfShortcuts.quickPasteMatch(event.modifierFlags)
             if quick.matches, let n = Int(event.charactersIgnoringModifiers ?? ""), n >= 1, n <= 9, self.store.filtered.count >= n { self.paste(self.store.filtered[n - 1], plain: quick.plain); return nil }
-            if event.keyCode == 36 || event.keyCode == 76, let clip = self.store.filtered.first(where: { $0.id == self.store.selected }) ?? self.store.filtered.first { self.pasteSelection(fallback: clip, plain: self.store.shelfShortcuts.isPlain(event.modifierFlags)); return nil }
+            if event.keyCode == 36 || event.keyCode == 76, let clip = self.store.filtered.first(where: { $0.id == self.store.selected }) ?? self.store.filtered.first {
+                if !event.isARepeat {
+                    self.pasteSelection(fallback: clip, plain: self.store.shelfShortcuts.isPlain(event.modifierFlags), automaticallyPaste: self.store.pasteOnReturn)
+                }
+                return nil
+            }
             if [123, 124].contains(event.keyCode), self.panel.firstResponder is NSTextView { return event }
             if [123, 124, 125].contains(event.keyCode), !event.modifierFlags.contains(.command) {
                 self.store.searchFocused = false
@@ -709,6 +714,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             self.openSettings()
         }
     }
+    func openPrivacySettings() {
+        openSettings()
+        DispatchQueue.main.async { [weak self] in
+            guard self?.store.settings == true else { return }
+            NotificationCenter.default.post(name: SettingsView.privacyNotification, object: nil)
+        }
+    }
     @objc func checkUpdatesFromMenu() {
         guard !modalShowing else { return }
         if UpdateChecker.shared.available != nil { showUpdateDetails(); return }
@@ -961,11 +973,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         guard store.restore(clip, plain: plain) else { store.message = "无法复制此内容"; return }
         pastePrepared()
     }
-    func pasteSelection(fallback clip: Clip, plain: Bool = false) {
-        let selected = store.selectedClips
-        guard store.restoreMany(selected.contains(where: { $0.id == clip.id }) ? selected : [clip], plain: plain) else { showToast("无法合并所选内容"); return }; pastePrepared()
+    func pasteSelection(fallback clip: Clip, plain: Bool = false, previousSelection: Set<UUID>? = nil, automaticallyPaste: Bool = true) {
+        let selected = previousSelection.map { ids in store.filtered.filter { ids.contains($0.id) } } ?? store.selectedClips
+        guard store.restoreMany(selected.contains(where: { $0.id == clip.id }) ? selected : [clip], plain: plain) else { showToast("无法合并所选内容"); return }
+        pastePrepared(automaticallyPaste: automaticallyPaste)
     }
-    func pastePrepared() {
+    func pastePrepared(automaticallyPaste: Bool = true) {
         cancelTranslation()
         refreshPermission()
         logInteraction("shelf.hide", reason: "paste")
@@ -976,6 +989,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         if TestMode.ui { print("UI paste target: \(target.bundleIdentifier ?? "none"), AX: \(AXIsProcessTrusted()), event access: \(CGPreflightPostEventAccess())"); fflush(stdout) }
         NSApp.yieldActivation(to: target)
         _ = target.activate(options: [])
+        guard automaticallyPaste else { showToast("已复制，请按 ⌘V 粘贴"); return }
         // The background permission state is for display only. It may still be
         // unknown at startup; finishPaste checks live permission before sending.
         finishPaste(target: target, generation: generation, attempt: 0)
@@ -1158,6 +1172,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
 }
 
 struct ShelfView: View {
+    private static let isDevelopmentBuild: Bool = {
+        let source = Bundle.main.object(forInfoDictionaryKey: "OpenPasteVersionSource") as? String
+        return source == "git" || source == "draft"
+    }()
+
     @State private var resizeStart: CGFloat?
     @State private var renderedClipCount = ShelfRenderWindow.batchSize
     @ObservedObject var store: Store
@@ -1284,8 +1303,22 @@ struct ShelfView: View {
                 }
             }
             if !store.translationStatus.isEmpty { Text(store.translationStatus).font(.system(size: 11)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 20).padding(.bottom, 6) }
-            if !store.directPasteAuthorized {
-                HStack { Text("↵ 复制后按 ⌘V 粘贴").foregroundStyle(.secondary); Button("开启直接粘贴…") { Controller.shared.openSettings() }.buttonStyle(.plain).foregroundStyle(.blue); Spacer() }.font(.system(size: 11)).padding(.horizontal, 20).padding(.bottom, 8)
+            if !store.pasteOnReturn || !store.directPasteAuthorized || Self.isDevelopmentBuild {
+                HStack {
+                    if !store.pasteOnReturn || !store.directPasteAuthorized {
+                        Text("↵ 复制后按 ⌘V 粘贴").foregroundStyle(.secondary)
+                        Button("开启直接粘贴…") { Controller.shared.openPrivacySettings() }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.blue)
+                    }
+                    Spacer()
+                    if Self.isDevelopmentBuild {
+                        Text("开发版").foregroundStyle(.secondary)
+                    }
+                }
+                .font(.system(size: 11))
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
             }
         }
         .background(.ultraThinMaterial)
@@ -1371,6 +1404,7 @@ struct ClipCard: View, Equatable {
     let current: Bool
     let renaming: Bool
     @ObservedObject var store: Store
+    @State private var previousClick: (timestamp: TimeInterval, selection: Set<UUID>)?
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.clip.id == rhs.clip.id && lhs.clip.cachedDigest == rhs.clip.cachedDigest && lhs.index == rhs.index && lhs.selected == rhs.selected && lhs.current == rhs.current && lhs.renaming == rhs.renaming && lhs.clip.title == rhs.clip.title && lhs.clip.userLabel == rhs.clip.userLabel && lhs.clip.text == rhs.clip.text && lhs.clip.kind == rhs.clip.kind && lhs.clip.boards == rhs.clip.boards && lhs.clip.created == rhs.clip.created && lhs.clip.source == rhs.clip.source && lhs.clip.ocrText == rhs.clip.ocrText && lhs.clip.linkTitle == rhs.clip.linkTitle
     }
@@ -1453,9 +1487,8 @@ struct ClipCard: View, Equatable {
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? Color.blue : Color.primary.opacity(0.08), lineWidth: selected ? 2 : 1))
         .shadow(color: .black.opacity(0.03), radius: 2, y: 1)
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) { Controller.shared.pasteSelection(fallback: clip) }
         .onDrag { let selected = store.selectedClips; store.draggingIDs = selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]; store.dragStartedAt = Date(); if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
-        .onTapGesture { store.searchFocused = false; store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) }
+        .onTapGesture(perform: handleClick)
         .contextMenu {
             Button("粘贴") { Controller.shared.pasteSelection(fallback: clip) }
             Button("预览 · 空格") { Controller.shared.showPreview(clip) }
@@ -1472,6 +1505,23 @@ struct ClipCard: View, Equatable {
             Divider()
             Button("删除 · ⌘⌫", role: .destructive) { store.delete(clip.id) }
         }
+    }
+
+    private func handleClick() {
+        let event = NSApp.currentEvent
+        if let event, event.type == .leftMouseUp {
+            if event.clickCount == 2, let previousClick,
+               event.timestamp - previousClick.timestamp <= NSEvent.doubleClickInterval {
+                self.previousClick = nil
+                Controller.shared.pasteSelection(fallback: clip, previousSelection: previousClick.selection)
+                return
+            }
+            // The first click can collapse a multi-selection before the second click arrives.
+            previousClick = event.clickCount == 1 ? (event.timestamp, store.selection) : nil
+        }
+        store.searchFocused = false
+        store.choose(clip.id, modifiers: event?.modifierFlags ?? NSEvent.modifierFlags)
+        Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView)
     }
 }
 
