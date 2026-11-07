@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 
 // Run in a foreground desktop session with --keyboard-test. Uses demo history,
 // restores the pasteboard on exit, and never pastes into an external application.
@@ -124,7 +125,7 @@ func runKeyboardTests(controller: Controller) async {
     check(preview.isKeyWindow, "recovery preserves preview focus")
     controller.closePreview()
     loseKeyboardFocus()
-    await drain()
+    await waitUntil { controller.previewPopover == nil && panel.isKeyWindow }
     check(panel.isKeyWindow, "closing preview restores shelf focus")
     controller.edit(store.filtered[0])
     let editor = controller.editorWindow!
@@ -308,6 +309,7 @@ func runKeyboardTests(controller: Controller) async {
     await drain()
     check(controller.previewClipID == store.filtered[0].id && store.selected == store.filtered[0].id, "preview Left arrow stops at the first card")
     send(49, " ", to: controller.previewWindow)
+    await waitUntil { controller.previewWindow == nil && controller.previewClipID == nil }
     check(controller.previewWindow == nil && controller.previewClipID == nil, "Space closes the preview")
     controller.showPreview(previewClip)
     await drain()
@@ -356,7 +358,7 @@ func runKeyboardTests(controller: Controller) async {
               "\(name) keeps the visible preview when no editor is open")
     }
     controller.closePreview()
-    await drain()
+    await waitUntil { controller.previewClipID == nil && controller.previewClip == nil }
     check(controller.previewClipID == nil && controller.previewClip == nil,
           "closing preview clears the tracked preview identity")
 
@@ -427,4 +429,190 @@ func runKeyboardTests(controller: Controller) async {
     check(panel.isKeyWindow, "shelf regains keyboard focus after settings")
     print("PASS: \(checks) keyboard focus and event routing checks")
     NSApp.terminate(nil)
+}
+
+
+@MainActor
+func runPreviewToggleTests(controller: Controller) async {
+    let store = controller.store
+    let panel = controller.panel!
+    var checks = 0
+    var failures = 0
+    var closingObservations = 0
+    var synchronousCloses = 0
+    var stage = "setup"
+    func check(_ value: Bool, _ label: String) {
+        checks += 1
+        guard !value else { return }
+        failures += 1
+        print("FAIL: preview-toggle stage=\(stage) check=\(label) closing=\(controller.previewClosing) popoverShown=\(controller.previewPopover?.isShown == true) tracked=\(controller.previewPopover != nil) active=\(NSApp.isActive) panelVisible=\(panel.isVisible) panelKey=\(panel.isKeyWindow) settings=\(store.settings) editorVisible=\(controller.editorWindow?.isVisible == true)")
+        fflush(stdout)
+    }
+    func pause(_ milliseconds: UInt64) async {
+        try? await Task.sleep(nanoseconds: milliseconds * 1_000_000)
+    }
+    func waitUntil(_ condition: () -> Bool) async {
+        for _ in 0..<100 {
+            if condition() { return }
+            await pause(20)
+        }
+    }
+    func send(_ type: NSEvent.EventType, code: UInt16 = 49, characters: String = " ", repeating: Bool = false) {
+        let window: NSWindow?
+        if controller.previewClosing {
+            window = panel.isVisible ? panel : nil
+        } else if let current = NSApp.keyWindow, current.isVisible {
+            window = current
+        } else {
+            window = panel.isVisible ? panel : nil
+        }
+        guard let window, let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, characters: characters, charactersIgnoringModifiers: characters,
+            isARepeat: repeating, keyCode: code) else {
+            check(false, "visible event destination exists")
+            return
+        }
+        NSApp.sendEvent(event)
+    }
+    func tap(_ code: UInt16 = 49, _ characters: String = " ") {
+        send(.keyDown, code: code, characters: characters)
+        send(.keyUp, code: code, characters: characters)
+    }
+    func observeClose() {
+        if controller.previewClosing { closingObservations += 1 }
+        else { synchronousCloses += 1 }
+    }
+    func verifyOpen(_ expected: Bool, _ label: String) {
+        check(!controller.previewClosing && (controller.previewPopover?.isShown == true) == expected &&
+              (expected || controller.previewPopover == nil), label)
+    }
+    func reset(_ name: String) async {
+        stage = name
+        controller.closePreview(animated: false)
+        controller.editorWindow?.close()
+        if store.settings { controller.closeSettings() }
+        controller.showShelf()
+        await waitUntil { NSApp.isActive && panel.isVisible && panel.isKeyWindow }
+        if let first = store.filtered.first { store.choose(first.id) }
+        panel.makeFirstResponder(panel.contentView)
+        check(NSApp.isActive && panel.isKeyWindow, "shelf owns keyboard focus")
+    }
+    func settle(_ expected: Bool) async {
+        await pause(650)
+        verifyOpen(expected, "final preview state")
+        let identity = controller.previewClipID
+        await pause(350)
+        verifyOpen(expected, "late close callbacks preserve final state")
+        check(controller.previewClipID == identity, "late callbacks preserve preview identity")
+    }
+    func pendingOpen(_ name: String) async {
+        await reset(name)
+        tap()
+        check(controller.previewPopover?.isShown == true, "first press opens native popover")
+        tap()
+        observeClose()
+        tap()
+    }
+    defer {
+        controller.closePreview(animated: false)
+        controller.editorWindow?.close()
+        controller.settingsWindow?.close()
+        panel.orderOut(nil)
+        print("\(failures == 0 ? "PASS" : "FAIL"): preview-toggle summary checks=\(checks) failures=\(failures) nativeClosing=\(closingObservations) synchronousCloses=\(synchronousCloses)")
+        fflush(stdout)
+        NSApp.terminate(nil)
+    }
+    guard store.ephemeral, !store.networkPreviews, store.archive.clips.count == 1_000,
+          store.archive.clips.allSatisfy({ $0.kind == "文字" }) else {
+        check(false, "prepared ephemeral text-only fixture with network previews disabled")
+        return
+    }
+    if let observer = controller.activationObserver {
+        NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        controller.activationObserver = nil
+    }
+    if let monitor = controller.outsideClickMonitor {
+        NSEvent.removeMonitor(monitor)
+        controller.outsideClickMonitor = nil
+    }
+    if let hotkey = controller.hotkey { UnregisterEventHotKey(hotkey); controller.hotkey = nil }
+    if let handler = controller.handler { RemoveEventHandler(handler); controller.handler = nil }
+    store.timer?.invalidate(); store.timer = nil
+    store.syncTimer?.invalidate(); store.syncTimer = nil
+    controller.pauseTimer?.invalidate(); controller.pauseTimer = nil
+    controller.permissionTimer?.invalidate(); controller.permissionTimer = nil
+    controller.target = nil
+    controller.lastExternalApp = nil
+    NSApp.setActivationPolicy(.regular)
+    NSApp.activate()
+    await pause(100)
+
+    for interval: UInt64 in [30, 60, 100] {
+        for count in [3, 4, 5] {
+            await reset("\(count)-press-\(interval)ms")
+            for index in 0..<count {
+                if index > 0 { await pause(interval) }
+                tap()
+                if index == 1 { observeClose() }
+            }
+            await settle(count % 2 == 1)
+        }
+    }
+
+    await reset("held-space-opens-once")
+    send(.keyDown)
+    for _ in 0..<4 { await pause(30); send(.keyDown, repeating: true) }
+    verifyOpen(true, "repeat keyDown does not close opened preview")
+    send(.keyUp)
+    tap()
+    observeClose()
+    await settle(false)
+
+    await reset("held-space-closes-once")
+    tap()
+    send(.keyDown)
+    observeClose()
+    for _ in 0..<4 { await pause(30); send(.keyDown, repeating: true) }
+    send(.keyUp)
+    await settle(false)
+    tap()
+    await settle(true)
+
+    await pendingOpen("pending-open-escape")
+    tap(53, "\u{1b}")
+    await settle(false)
+    check(panel.isVisible && panel.isKeyWindow, "escape cancels pending open without hiding shelf")
+
+    await pendingOpen("pending-open-settings")
+    controller.openSettings()
+    await settle(false)
+    check(store.settings && controller.settingsWindow?.isKeyWindow == true && !panel.isVisible,
+          "late callbacks preserve settings focus")
+
+    await pendingOpen("pending-open-hide")
+    controller.hideShelf()
+    await settle(false)
+    check(!panel.isVisible, "late callbacks leave shelf hidden")
+
+    await pendingOpen("pending-open-editor")
+    if let clip = store.filtered.first {
+        controller.edit(clip)
+        await settle(false)
+        check(controller.editorWindow?.isKeyWindow == true, "late callbacks preserve editor focus")
+    } else { check(false, "isolated edit fixture exists") }
+
+    await reset("closing-arrow-pending-open")
+    let ids = store.filtered.prefix(2).map(\.id)
+    guard ids.count == 2 else { check(false, "two isolated selection fixtures exist"); return }
+    tap()
+    tap()
+    observeClose()
+    tap(124, "\u{F703}")
+    tap()
+    await settle(true)
+    check(store.selected == ids[1] && controller.previewClipID == ids[1],
+          "pending open follows latest arrow selection")
+    print("Preview-toggle native close observations: asynchronous=\(closingObservations) synchronous=\(synchronousCloses)")
+    check(closingObservations > 0, "native animated close exposes the pending-input path")
 }

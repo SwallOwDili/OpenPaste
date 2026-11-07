@@ -76,7 +76,7 @@ struct Clip: Codable, Identifiable {
         return nil
     }
 }
-struct Board: Codable, Identifiable { var id = UUID(); var name: String; var color: String? = nil }
+struct Board: Codable, Identifiable, Equatable { var id = UUID(); var name: String; var color: String? = nil }
 struct Archive: Codable { var clips: [Clip] = []; var boards: [Board] = [] }
 struct ClipboardCaptureSource: Equatable {
     let name: String
