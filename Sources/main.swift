@@ -4,45 +4,6 @@ import Combine
 import Carbon
 import ApplicationServices
 
-// A small template drawing keeps the menu-bar mark crisp at either display scale.
-private func menuBarMark() -> NSImage {
-    let image = NSImage(size: NSSize(width: 20, height: 20), flipped: false) { _ in
-        NSColor.black.setStroke()
-        let outline = NSBezierPath()
-        outline.lineWidth = 1.45
-        outline.lineJoinStyle = .round
-        outline.lineCapStyle = .round
-        outline.move(to: NSPoint(x: 12.5, y: 17))
-        outline.line(to: NSPoint(x: 6, y: 17))
-        outline.curve(to: NSPoint(x: 4, y: 15), controlPoint1: NSPoint(x: 4.7, y: 17), controlPoint2: NSPoint(x: 4, y: 16.3))
-        outline.line(to: NSPoint(x: 4, y: 5))
-        outline.curve(to: NSPoint(x: 6, y: 3), controlPoint1: NSPoint(x: 4, y: 3.7), controlPoint2: NSPoint(x: 4.7, y: 3))
-        outline.line(to: NSPoint(x: 14, y: 3))
-        outline.curve(to: NSPoint(x: 16, y: 5), controlPoint1: NSPoint(x: 15.3, y: 3), controlPoint2: NSPoint(x: 16, y: 3.7))
-        outline.line(to: NSPoint(x: 16, y: 13.5))
-        outline.line(to: NSPoint(x: 12.5, y: 17))
-        outline.close()
-        outline.stroke()
-        let fold = NSBezierPath()
-        fold.lineWidth = 1.15
-        fold.lineJoinStyle = .round
-        fold.move(to: NSPoint(x: 12.5, y: 16.5))
-        fold.line(to: NSPoint(x: 12.5, y: 13.5))
-        fold.line(to: NSPoint(x: 15.5, y: 13.5))
-        fold.stroke()
-        let lines = NSBezierPath()
-        lines.lineWidth = 1.25
-        lines.lineCapStyle = .round
-        lines.move(to: NSPoint(x: 7, y: 10)); lines.line(to: NSPoint(x: 12.5, y: 10))
-        lines.move(to: NSPoint(x: 7, y: 7)); lines.line(to: NSPoint(x: 10.5, y: 7))
-        lines.stroke()
-        return true
-    }
-    image.isTemplate = true
-    image.accessibilityDescription = "OpenPaste"
-    return image
-}
-
 /// Non-activating, so the shelf can take the keyboard even when the system refuses to activate the app
 /// (secure event input while a password field is focused).
 final class ShelfPanel: NSPanel { override var canBecomeKey: Bool { true }; override var canBecomeMain: Bool { true } }
@@ -61,6 +22,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     var keyMonitor: Any?
     var outsideClickMonitor: Any?
     var wheelMonitor: Any?
+    /// Position of the shelf's card strip (focus, magnification, pan). Shared with the preview popover's anchor.
+    let stripDriver = FocusDriver()
     var shelfAwaitingActivation = false
     var pendingSearchKeys: [NSEvent] = []
     var pendingSearchAttempts = 0
@@ -208,7 +171,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         panel.level = .statusBar; panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
         panel.minSize = NSSize(width: 760, height: 180)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.contentView = ShelfHost(rootView: ShelfView(store: store))
+        panel.contentView = ShelfHost(rootView: ShelfView(store: store, driver: stripDriver))
         finishPanelHost()
         observeMenuTracking()
         let finishApplicationSetup = AcceptanceMetrics.begin("launch.application-setup")
@@ -223,7 +186,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             self.dismissShelfForExternalInteraction(reason: .outsideClick)
         }
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        status.button?.image = menuBarMark()
+        status.button?.image = MenuBarMark.image()
         status.button?.image?.isTemplate = true
         let menu = NSMenu()
         menu.addItem(withTitle: "打开剪贴板  \(shortcut.label)", action: #selector(show), keyEquivalent: "")
@@ -287,7 +250,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                 return event
             }
             if event.keyCode == 53 {
-                if self.store.searchExpanded {
+                if self.store.filtersExpanded { withFilterCardAnimation { self.store.filtersExpanded = false } }
+                else if self.store.searchExpanded {
                     self.store.resetFilters(preserveBoard: true); self.store.filtersExpanded = false
                     self.store.searchFocused = false; self.store.searchExpanded = false
                     self.panel.makeFirstResponder(self.panel.contentView)
@@ -324,7 +288,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                 if !event.modifierFlags.intersection([.command, .control, .option]).isEmpty { }
                 else if let chars = event.characters, !chars.isEmpty, chars.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }), ![36,49,123,124,125,126,48,53,51,117].contains(event.keyCode) { self.beginTypeToSearch(event); return nil }
             } else if event.keyCode == 48 || event.keyCode == 125 { self.store.searchFocused = false; self.panel.makeFirstResponder(self.panel.contentView); return nil }
-            if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" { if self.store.searchExpanded { self.store.filtersExpanded.toggle() }; self.store.searchFocused = true; return nil }
+            if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" { if self.store.searchExpanded { withFilterCardAnimation { self.store.filtersExpanded.toggle() } }; self.store.searchFocused = true; return nil }
             let quick = self.store.shelfShortcuts.quickPasteMatch(event.modifierFlags)
             if quick.matches, let n = Int(event.charactersIgnoringModifiers ?? ""), n >= 1, n <= 9, self.store.filtered.count >= n { self.paste(self.store.filtered[n - 1], plain: quick.plain); return nil }
             if event.keyCode == 36 || event.keyCode == 76, let clip = self.store.filtered.first(where: { $0.id == self.store.selected }) ?? self.store.filtered.first { self.pasteSelection(fallback: clip, plain: self.store.shelfShortcuts.isPlain(event.modifierFlags)); return nil }
@@ -334,7 +298,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                 self.panel.makeFirstResponder(self.panel.contentView)
                 if event.keyCode != 125 {
                     let delta = event.keyCode == 124 ? 1 : -1
-                    if event.modifierFlags.contains(.shift), let selected = self.store.selected, let index = self.store.visibleIndex(of: selected), !self.store.filtered.isEmpty { let id = self.store.filtered[max(0, min(self.store.filtered.count - 1, index + delta))].id; self.store.choose(id, modifiers: .shift) }
+                    if event.modifierFlags.contains(.shift), let selected = self.store.selected, let index = self.store.visibleIndex(of: selected), !self.store.filtered.isEmpty { let id = self.store.filtered[max(0, min(self.store.filtered.count - 1, index + delta))].id; if id != selected { self.store.keyboardNavigated = true }; self.store.choose(id, modifiers: .shift) }
                     else { self.store.moveSelection(delta) }
                 }
                 return nil
@@ -342,13 +306,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             return event
         }
         wheelMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
-            guard let self, event.window === self.panel, !self.store.settings, let content = self.panel.contentView,
-                  let scroll = self.horizontalScrollView(in: content, at: event.locationInWindow), let document = scroll.documentView else { return event }
-            let clip = scroll.contentView
-            guard let target = HorizontalWheel.offset(current: clip.bounds.origin.x, deltaX: event.scrollingDeltaX, deltaY: event.scrollingDeltaY,
-                                                      precise: event.hasPreciseScrollingDeltas, contentWidth: document.frame.width, viewportWidth: clip.bounds.width) else { return event }
-            clip.scroll(to: NSPoint(x: target, y: clip.bounds.origin.y))
-            scroll.reflectScrolledClipView(clip)
+            // The card strip has no scroll view of its own: trackpad and wheel scrolling over it pan the strip. While the
+            // filter card is open it floats over the strip and may scroll itself (a short shelf), so its events pass through.
+            guard let self, event.window === self.panel, !self.store.settings, let strip = self.stripDriver.hostView, strip.window === self.panel,
+                  HorizontalWheel.pansStrip(pointerOverStrip: strip.bounds.contains(strip.convert(event.locationInWindow, from: nil)),
+                                            filterCardOpen: self.store.filtersExpanded),
+                  let delta = HorizontalWheel.panDelta(deltaX: event.scrollingDeltaX, deltaY: event.scrollingDeltaY, precise: event.hasPreciseScrollingDeltas) else { return event }
+            self.stripDriver.scroll(by: delta)
             return nil
         }
         finishApplicationSetup()
@@ -510,6 +474,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         panel.setFrame(NSRect(x: r.minX, y: r.minY, width: r.width, height: h), display: true)
         store.reverseHistory = false; store.selection.removeAll(); store.compact = h < 270
         store.selected = store.currentClipID ?? store.filtered.first?.id
+        // A fresh shelf starts on the selection, without any pan left over from the last time it was open.
+        stripDriver.snap(to: store.selected.flatMap { store.visibleIndex(of: $0) } ?? 0)
         if activating {
             shelfAwaitingActivation = false
             NSApp.activate(); panel.makeKeyAndOrderFront(nil)
@@ -609,6 +575,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         closePreview()
         cancelTranslation()
         store.reverseHistory = false
+        // Close the filter card with the shelf (no animation), so the next show does not briefly play its closing.
+        store.filtersExpanded = false
         panel.orderOut(nil)
         if NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier, let target = target { NSApp.yieldActivation(to: target); _ = target.activate(options: []) }
     }
@@ -889,6 +857,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         logInteraction("shelf.hide", reason: reason.rawValue)
         cancelTranslation()
         store.reverseHistory = false
+        store.filtersExpanded = false
         panel.orderOut(nil)
     }
     func windowDidResignKey(_ notification: Notification) {
@@ -1159,15 +1128,17 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
 
 struct ShelfView: View {
     @State private var resizeStart: CGFloat?
-    @State private var renderedClipCount = ShelfRenderWindow.batchSize
+    @State private var lastRevealed: UUID?
     @ObservedObject var store: Store
+    /// Position of the card strip. Held as a plain reference, so the shelf itself does not re-render on every animation
+    /// frame; only the strip observes it.
+    let driver: FocusDriver
     @FocusState private var searchFocused: Bool
     /// Text typed in the field; committed to the store after a short pause so large
     /// histories are not re-filtered per keystroke or during input-method composition.
     @State private var draftQuery = ""
     @State private var queryCommit: DispatchWorkItem?
     var body: some View {
-        let renderedClips = Array(store.filtered.prefix(renderedClipCount))
         VStack(spacing: 0) {
             Rectangle().fill(Color.clear).frame(height: 6).contentShape(Rectangle())
                 .overlay(Capsule().fill(Color.secondary.opacity(0.25)).frame(width: 36, height: 2))
@@ -1180,11 +1151,14 @@ struct ShelfView: View {
                 if store.searchExpanded {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass").foregroundStyle(searchFocused ? Color.blue : Color.secondary)
-                    TextField("搜索文字、链接或来源", text: $draftQuery).textFieldStyle(.plain).focused($searchFocused).frame(width: 250)
+                    TextField("搜索文字、链接或来源", text: $draftQuery).textFieldStyle(.plain).focused($searchFocused).frame(width: 190)
                     if !draftQuery.isEmpty { Button { draftQuery = ""; store.query = ""; store.searchFocused = true } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain).help("清空搜索") }
-                    else { Text("⌘F").font(.system(size: 10)).foregroundStyle(.tertiary) }
+                    else { Text("⌘F").font(.system(size: 10)).foregroundStyle(.tertiary).frame(height: 14) }
+                    Text(store.paused ? store.recordingPauseControl.status : (store.query.isEmpty && !store.filtersActive ? "\(store.filtered.count) 条" : "\(store.filtered.count) 条结果"))
+                        .font(.system(size: 11)).foregroundStyle(store.paused ? Color.orange : Color.secondary).lineLimit(1).fixedSize()
+                    filterButton
                     Button { resetSearch(); store.searchExpanded = false; store.searchFocused = false; Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) } label: { Image(systemName: "xmark").font(.system(size: 10)).foregroundStyle(.secondary) }.buttonStyle(.plain).help("退出搜索 · Esc")
-                }.padding(.horizontal, 12).padding(.vertical, 9)
+                }.padding(.horizontal, 12).padding(.vertical, 7)
                     .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
                     .overlay(RoundedRectangle(cornerRadius: 10).stroke(searchFocused ? Color.blue.opacity(0.65) : Color.primary.opacity(0.1)))
                 }
@@ -1237,62 +1211,39 @@ struct ShelfView: View {
                     Text("← → 选择 · ↵ 粘贴 · \(store.shelfShortcuts.quickPasteLabel) 快速粘贴")
                     Button("关闭 · Esc") { Controller.shared.hideShelf() }
                 } label: { Image(systemName: "ellipsis").font(.system(size: 16)).foregroundStyle(.secondary) }.menuStyle(.borderlessButton).fixedSize().help("更多")
-            }.padding(.horizontal, 20).padding(.vertical, 12)
-            if store.searchExpanded {
-            HStack(spacing: 12) {
-                ForEach(["全部", "文字", "链接", "图片", "文件", "颜色"], id: \.self) { kind in
-                    Button { store.kind = kind } label: { Text(kind).font(.system(size: 11, weight: .medium)).padding(.horizontal, 10).padding(.vertical, 5).foregroundStyle(store.kind == kind ? Color.white : Color.secondary).background(store.kind == kind ? Color.blue : Color.clear, in: Capsule()) }.buttonStyle(.plain)
-                }
-                Button { store.filtersExpanded.toggle() } label: { Image(systemName: "line.3.horizontal.decrease.circle") }.buttonStyle(.plain).popover(isPresented: $store.filtersExpanded) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("筛选历史").font(.headline)
-                        Picker("来源", selection: $store.sourceFilter) { Text("全部来源").tag("全部来源"); ForEach(store.sources, id: \.self) { Text($0).tag($0) } }
-                        Toggle("按日期范围", isOn: $store.dateRangeEnabled)
-                        if store.dateRangeEnabled { DatePicker("开始", selection: $store.startDate, displayedComponents: .date); DatePicker("结束", selection: $store.endDate, in: store.startDate..., displayedComponents: .date) }
-                        Button("清除筛选") { resetSearch(); store.dateRangeEnabled = false }
-                    }.padding(20).frame(width: 300)
-                }
-                Divider().frame(height: 12)
-                Menu { Button("全部来源") { store.sourceFilter = "全部来源" }; ForEach(store.sources, id: \.self) { source in Button(source) { store.sourceFilter = source } } } label: { Label(store.sourceFilter, systemImage: "line.3.horizontal.decrease") }.menuStyle(.borderlessButton).fixedSize().font(.system(size: 12))
-                Button { store.todayOnly.toggle() } label: { Label("今天", systemImage: "calendar").foregroundStyle(store.todayOnly ? Color.blue : Color.secondary) }.buttonStyle(.plain).font(.system(size: 12))
-                Spacer()
-                Text(store.paused ? store.recordingPauseControl.status : (store.query.isEmpty ? "\(store.filtered.count) 条历史" : "找到 \(store.filtered.count) 条结果")).font(.system(size: 12)).foregroundStyle(store.paused ? .orange : .secondary)
-            }.padding(.horizontal, 20).padding(.vertical, 8)
-            }
-            if store.searchExpanded && !store.query.isEmpty {
-                HStack(spacing: 8) {
-                    ForEach(Array(store.sources.filter { $0.localizedCaseInsensitiveContains(store.query) }.prefix(3)), id: \.self) { source in Button("应用：" + source) { store.sourceFilter = source; store.query = "" }.buttonStyle(.bordered).controlSize(.small) }
-                    if ["今天", "本周", "本月"].contains(store.query) { Button("日期：" + store.query) { let days = store.query == "今天" ? 0 : (store.query == "本周" ? 7 : 30); store.startDate = Date().addingTimeInterval(-Double(days * 86400)); store.endDate = Date(); store.dateRangeEnabled = true; store.query = "" }.buttonStyle(.bordered).controlSize(.small) }
-                }.padding(.horizontal, 20)
-            }
+            }.frame(height: 34).padding(.horizontal, 20).padding(.vertical, 12)
             if !store.pasteQueue.isEmpty { HStack { Text("粘贴队列剩余 \(store.pasteQueue.count) 条"); Button("下一条 · ⌘↵") { Controller.shared.pasteNext() }; Button("结束") { store.pasteQueue.removeAll() } }.font(.caption) }
             if !store.ocrProgress.isEmpty { Text(store.ocrProgress).font(.caption).foregroundStyle(.secondary) }
             if !store.captureNotice.isEmpty { Text(store.captureNotice).font(.system(size: 12)).foregroundStyle(.orange).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24).padding(.bottom, 4) }
+            Group {
             if store.filtered.isEmpty {
                 VStack(spacing: 10) { Image(systemName: store.query.isEmpty ? "doc.on.clipboard" : "magnifyingglass").font(.system(size: 35)).foregroundStyle(.tertiary); Text(store.query.isEmpty ? "复制一些内容，它们会出现在这里" : "没有找到“\(store.query)”").foregroundStyle(.secondary); Text(store.query.isEmpty ? "\(store.shortcutLabel) 随时打开 · 所有数据保存在本机" : "搜索文字、链接和来源应用；图片文字将在后台识别后加入搜索").font(.system(size: 12)).foregroundStyle(.tertiary) }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView(.horizontal) {
-                        LazyHStack(spacing: 12) {
-                            if store.translating { VStack(spacing: 12) { ProgressView(); Text("正在翻译…"); Text("原文保持不变").font(.caption).foregroundStyle(.secondary) }.frame(width: store.compact ? 180 : 240).frame(maxHeight: .infinity).background(.quaternary, in: RoundedRectangle(cornerRadius: 12)) }
-                            ForEach(renderedClips) { clip in
-                                ClipCard(clip: clip, index: store.visibleIndex(of: clip.id) ?? 0, selected: store.selection.contains(clip.id) || clip.id == store.selected, current: clip.id == store.currentClipID, renaming: store.renamingID == clip.id, store: store).equatable().id(clip.id)
-                                    .onAppear { if clip.id == renderedClips.last?.id { growRenderWindow() } }
-                            }
-                        }.padding(.horizontal, 20).padding(.vertical, 8)
-                    }.onChange(of: store.selected) { _, id in if let id { revealAndScroll(to: id, proxy: proxy) } }
-                }
+                GeometryReader { geometry in DockStrip(store: store, driver: driver, size: geometry.size) }
+                    .onAppear { driver.snap(to: focusIndex); lastRevealed = store.selected }
+                    .onChange(of: store.selected) { _, id in if let id { reveal(id) } }
+                    // The selected card's index changed under the same selection (a clip was inserted or removed before it).
+                    .onChange(of: focusIndex) { _, index in
+                        guard store.selected == lastRevealed, Int(driver.target) != index else { return }
+                        driver.follow(index: index)
+                    }
             }
-            if !store.translationStatus.isEmpty { Text(store.translationStatus).font(.system(size: 11)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 20).padding(.bottom, 6) }
+            }
+            // Both overlays float above the cards and take no layout space, so searching or a status message never changes
+            // the card height. Cards are full height at rest, so they are drawn as a deliberate floating layer (material,
+            // hairline, shadow) instead of bare controls sitting on the card headers.
+            .overlay(alignment: .top) { searchSuggestions }
+            .overlay(alignment: .bottom) { translationBadge }
             if !store.directPasteAuthorized {
                 HStack { Text("↵ 复制后按 ⌘V 粘贴").foregroundStyle(.secondary); Button("开启直接粘贴…") { Controller.shared.openSettings() }.buttonStyle(.plain).foregroundStyle(.blue); Spacer() }.font(.system(size: 11)).padding(.horizontal, 20).padding(.bottom, 8)
             }
         }
+        .overlayPreferenceValue(FunnelAnchorKey.self) { anchor in filterLayer(anchor) }
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.2)).frame(height: 1) }
         .onChange(of: store.query) { _, query in
             if draftQuery != query { draftQuery = query }
-            resetRenderWindow(); if !query.isEmpty { store.indexImages() }
+            if !query.isEmpty { store.indexImages() }
         }
         .onChange(of: draftQuery) { _, value in
             queryCommit?.cancel()
@@ -1307,37 +1258,195 @@ struct ShelfView: View {
             queryCommit = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
         }
-        .onChange(of: store.board) { resetRenderWindow() }
-        .onChange(of: store.kind) { resetRenderWindow() }
-        .onChange(of: store.sourceFilter) { resetRenderWindow() }
-        .onChange(of: store.dateRangeEnabled) { resetRenderWindow() }
-        .onChange(of: store.startDate) { resetRenderWindow() }
-        .onChange(of: store.endDate) { resetRenderWindow() }
-        .onChange(of: store.todayOnly) { resetRenderWindow() }
-        .onChange(of: store.reverseHistory) { resetRenderWindow() }
         .onChange(of: store.searchFocused) { _, focused in
-            if focused { store.searchExpanded = true; DispatchQueue.main.async { searchFocused = true } } else { searchFocused = false; if store.query.isEmpty && store.kind == "全部" && store.sourceFilter == "全部来源" && !store.todayOnly { store.searchExpanded = false } }
+            if focused { store.searchExpanded = true; DispatchQueue.main.async { searchFocused = true } }
+            else {
+                searchFocused = false
+                // Pressing the filter button blurs the field before the mouse is released. Collapsing at once would remove the
+                // button mid-click, so the empty search is only closed if it is still idle shortly afterwards.
+                collapseIdleSearchSoon()
+            }
         }
+        // Closing the filter card without choosing anything leaves an empty, unfocused search: close it as well.
+        .onChange(of: store.filtersExpanded) { _, expanded in if !expanded { collapseIdleSearchSoon() } }
         .onChange(of: searchFocused) { _, focused in if store.searchFocused != focused { store.searchFocused = focused } }
 
     }
-    func growRenderWindow() {
-        let next = ShelfRenderWindow.nextCount(current: renderedClipCount, total: store.filtered.count)
-        if next > renderedClipCount { renderedClipCount = next }
-    }
-    func resetRenderWindow() {
-        let selectedIndex = store.selected.flatMap { store.visibleIndex(of: $0) }
-        renderedClipCount = ShelfRenderWindow.resetCount(total: store.filtered.count, selectedIndex: selectedIndex)
-    }
-    func revealAndScroll(to id: UUID, proxy: ScrollViewProxy) {
-        guard let index = store.visibleIndex(of: id) else { return }
-        let required = ShelfRenderWindow.countIncluding(index: index, total: store.filtered.count)
-        if required > renderedClipCount {
-            renderedClipCount = required
-            DispatchQueue.main.async { proxy.scrollTo(id) }
-        } else {
-            proxy.scrollTo(id)
+    /// Closes the search field shortly, if by then it is still empty, unfocused and no filter or filter card is open.
+    private func collapseIdleSearchSoon() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [store] in
+            if !store.searchFocused && !store.filtersExpanded && store.query.isEmpty && !store.filtersActive { store.searchExpanded = false }
         }
+    }
+    /// Index of the selected card in the visible results (0 when nothing is selected).
+    private var focusIndex: Int { store.selected.flatMap { store.visibleIndex(of: $0) } ?? 0 }
+    /// "Apply source" / "date" shortcuts for the text typed in the search field. Shown only when there is something to
+    /// apply, so no empty container is ever drawn; only the container itself takes clicks.
+    @ViewBuilder
+    private var searchSuggestions: some View {
+        let sources = Array(store.sources.filter { $0.localizedCaseInsensitiveContains(store.query) }.prefix(3))
+        let dateWord = ["今天", "本周", "本月"].contains(store.query)
+        if store.searchExpanded && !store.query.isEmpty && !store.filtersExpanded && (!sources.isEmpty || dateWord) {
+            HStack(spacing: 6) {
+                ForEach(sources, id: \.self) { source in
+                    suggestionChip("应用：" + source) { store.sourceFilter = source; store.query = "" }
+                }
+                if dateWord {
+                    suggestionChip("日期：" + store.query) {
+                        let days = store.query == "今天" ? 0 : (store.query == "本周" ? 7 : 30)
+                        store.startDate = Date().addingTimeInterval(-Double(days * 86400)); store.endDate = Date(); store.dateRangeEnabled = true; store.query = ""
+                    }
+                }
+            }
+            .padding(.horizontal, 6).padding(.vertical, 5)
+            .floatingCapsule()
+            .padding(.top, 6)
+            .transition(.opacity)
+        }
+    }
+    private func suggestionChip(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                .foregroundStyle(Color.accentColor)
+                .padding(.horizontal, 10).padding(.vertical, 4)
+                .frame(maxWidth: 180)
+                .background(Color.accentColor.opacity(0.12), in: Capsule())
+                .contentShape(Capsule())
+        }.buttonStyle(.plain)
+    }
+    /// Widest text of the translation tip before it wraps.
+    private static let tipTextWidth: CGFloat = 340
+    /// Translation status (translating, done, failed, skipped). Centred at the bottom so it never covers the character
+    /// count in the bottom-left corner of rich-text cards, and it lets clicks through to the cards.
+    @ViewBuilder
+    private var translationBadge: some View {
+        if !store.translationStatus.isEmpty {
+            // A small tip: it hugs its text. A flexible frame (`maxWidth`) would stretch it to the full width, so the width
+            // is only fixed when the message is longer than a tip should be, and then it wraps to at most two lines.
+            let tipFont = NSFont.systemFont(ofSize: 11)
+            let wraps = (store.translationStatus as NSString).size(withAttributes: [.font: tipFont]).width + 2 > Self.tipTextWidth
+            HStack(spacing: 5) {
+                if store.translating { ProgressView().controlSize(.mini).scaleEffect(0.85) }
+                else { Image(systemName: "info.circle").font(.system(size: 10)).foregroundStyle(.secondary) }
+                Text(store.translationStatus).font(.system(size: 11)).lineLimit(2).multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: wraps ? Self.tipTextWidth : nil, alignment: .leading)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .floatingCapsule()
+            .padding(.horizontal, 24).padding(.bottom, 10)
+            .allowsHitTesting(false)
+        }
+    }
+    /// Type, source, today and date-range filters live in one small card so the header stays a single row. It is drawn
+    /// inside the shelf (not an AppKit popover window), so opening it never changes the panel's key window or the
+    /// search field's focus.
+    private var filterButton: some View {
+        Button { withFilterCardAnimation { store.filtersExpanded.toggle() } } label: {
+            Image(systemName: store.filtersActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                .font(.system(size: 14)).foregroundStyle(store.filtersActive ? Color.blue : Color.secondary)
+                .frame(width: 22, height: 22).contentShape(Rectangle())
+        }.buttonStyle(.plain).help("筛选 · ⌘F")
+        .anchorPreference(key: FunnelAnchorKey.self, value: .bounds) { $0 }
+    }
+    /// The filter card hangs under the funnel button with a small caret pointing at it; a click anywhere else closes it.
+    private func filterLayer(_ anchor: Anchor<CGRect>?) -> some View {
+        GeometryReader { geometry in
+            if store.filtersExpanded, let anchor {
+                let frame = geometry[anchor]
+                let width: CGFloat = 440
+                let x = min(max(frame.midX - width / 2, 12), max(12, geometry.size.width - width - 12))
+                ZStack(alignment: .topLeading) {
+                    Color.black.opacity(0.001).contentShape(Rectangle()).onTapGesture { withFilterCardAnimation { store.filtersExpanded = false } }
+                    // On a short (compact) shelf the card may not fit below the button; it then scrolls inside itself.
+                    filterCard(width: width, caretX: frame.midX - x, maxHeight: max(80, geometry.size.height - frame.maxY - 8))
+                        .offset(x: x, y: frame.maxY + 2)
+                        .transition(.scale(scale: 0.97, anchor: UnitPoint(x: frame.midX / max(geometry.size.width, 1), y: 0)).combined(with: .opacity))
+                }
+            }
+        }
+        .allowsHitTesting(store.filtersExpanded)
+    }
+    private var timeScope: Binding<FilterTimeScope> {
+        Binding(get: { store.timeScope }, set: { store.setTimeScope($0) })
+    }
+    private func filterCard(width: CGFloat, caretX: CGFloat, maxHeight: CGFloat) -> some View {
+        let kinds: [FilterSegmentOption<String>] = [
+            .init(value: "全部", title: "全部", symbol: "square.grid.2x2", tint: nil),
+            .init(value: "文字", title: "文字", symbol: "text.alignleft", tint: .teal),
+            .init(value: "链接", title: "链接", symbol: "link", tint: .blue),
+            .init(value: "图片", title: "图片", symbol: "photo", tint: .purple),
+            .init(value: "文件", title: "文件", symbol: "folder", tint: .orange),
+            .init(value: "颜色", title: "颜色", symbol: "paintpalette", tint: .pink)]
+        let times: [FilterSegmentOption<FilterTimeScope>] = [
+            .init(value: .any, title: "不限", symbol: nil, tint: nil),
+            .init(value: .today, title: "今天", symbol: nil, tint: nil),
+            .init(value: .custom, title: "自定义", symbol: nil, tint: nil)]
+        let sourceActive = store.sourceFilter != "全部来源"
+        let shape = FilterCardShape(caretX: caretX)
+        let content = VStack(alignment: .leading, spacing: 10) {
+            FilterSegmented(options: kinds, selection: $store.kind)
+            HStack(spacing: 8) {
+                Menu {
+                    Button("全部来源") { store.sourceFilter = "全部来源" }
+                    ForEach(store.sources, id: \.self) { source in Button(source) { store.sourceFilter = source } }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "app.dashed").font(.system(size: 12))
+                        Text(store.sourceFilter).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).opacity(0.6)
+                    }
+                    .foregroundStyle(sourceActive ? Color.accentColor : Color.primary.opacity(0.8))
+                    .padding(.horizontal, 10).frame(height: 30).frame(maxWidth: .infinity)
+                    .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(sourceActive ? Color.accentColor.opacity(0.1) : Color.primary.opacity(0.05)))
+                    .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(sourceActive ? Color.accentColor.opacity(0.45) : Color.primary.opacity(0.08)))
+                    .contentShape(Rectangle())
+                }.menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+                FilterSegmented(options: times, selection: timeScope).frame(width: 190)
+            }
+            if store.dateRangeEnabled {
+                HStack(spacing: 8) {
+                    Text("从").font(.system(size: 12)).foregroundStyle(.secondary)
+                    DatePicker("开始", selection: $store.startDate, displayedComponents: .date).labelsHidden().datePickerStyle(.compact)
+                    Text("至").font(.system(size: 12)).foregroundStyle(.secondary)
+                    DatePicker("结束", selection: $store.endDate, in: store.startDate..., displayedComponents: .date).labelsHidden().datePickerStyle(.compact)
+                    Spacer(minLength: 0)
+                }.transition(.opacity)
+            }
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(store.filtered.count.formatted()).font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                Text("条结果").font(.system(size: 12)).foregroundStyle(.secondary)
+                Spacer()
+                // Clears only what this card sets; the search text stays.
+                Button { store.clearFilters() } label: {
+                    Text("清除筛选").font(.system(size: 12, weight: .medium)).foregroundStyle(store.filtersActive ? Color.accentColor : Color.secondary.opacity(0.5))
+                }.buttonStyle(.plain).disabled(!store.filtersActive)
+            }.padding(.horizontal, 2)
+        }
+        .padding(.horizontal, 12).padding(.bottom, 12).padding(.top, 12 + FilterCardShape.caretHeight)
+        return ViewThatFits(in: .vertical) {
+            content
+            ScrollView(.vertical) { content }
+        }
+        .frame(width: width)
+        .background { shape.fill(.regularMaterial); shape.fill(Color(nsColor: .windowBackgroundColor).opacity(0.62)) }
+        .overlay(shape.stroke(Color.primary.opacity(0.1), lineWidth: 0.75))
+        .shadow(color: .black.opacity(0.14), radius: 22, y: 10)
+        .shadow(color: .black.opacity(0.08), radius: 2, y: 1)
+        .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeOut(duration: 0.15), value: store.dateRangeEnabled)
+        .frame(maxHeight: maxHeight, alignment: .top)
+    }
+    /// Brings the new selection to the middle of the shelf. The focus glides there (or snaps for far jumps such as search
+    /// and filters); near either end the strip stops at its padding, so the selection sits off-centre there instead.
+    func reveal(_ id: UUID) {
+        // Read and clear the arrow-key flag right away, so the decision belongs to this selection change.
+        let byKeyboard = store.keyboardNavigated
+        store.keyboardNavigated = false
+        guard let index = store.visibleIndex(of: id) else { return }
+        lastRevealed = id
+        // The Dock effect belongs to the arrow keys only: clicks, search and board switches leave the cards at full size.
+        driver.move(to: index, keyboard: byKeyboard, magnify: byKeyboard && store.arrowKeyMagnification)
     }
     func resetSearch() { store.resetFilters(preserveBoard: true, preserveDateRange: true) }
     func tab(_ name: String, icon: String, active: Bool, action: @escaping () -> Void) -> some View {
@@ -1362,6 +1471,168 @@ func ageLabel(_ date: Date, now: Date) -> String {
     if minutes < 60 { return "\(minutes) 分钟前" }
     if minutes < 1440 { return "\(minutes / 60) 小时前" }
     return "\(minutes / 1440) 天前"
+}
+
+private extension View {
+    /// Material capsule with a hairline and a soft shadow, for short transient labels that float over the cards.
+    func floatingCapsule() -> some View {
+        background(.regularMaterial, in: Capsule())
+            .overlay(Capsule().stroke(Color.primary.opacity(0.12), lineWidth: 0.75))
+            .shadow(color: .black.opacity(0.16), radius: 8, y: 2)
+    }
+}
+
+struct FunnelAnchorKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = value ?? nextValue() }
+}
+
+enum FilterTimeScope: Hashable { case any, today, custom }
+
+struct FilterSegmentOption<Value: Hashable> {
+    let value: Value
+    let title: String
+    let symbol: String?
+    /// Colour of the icon while selected; the card header colours, so a filter looks like the cards it picks out.
+    let tint: Color?
+}
+
+/// A track with a white pill that slides to the selected segment.
+struct FilterSegmented<Value: Hashable>: View {
+    let options: [FilterSegmentOption<Value>]
+    @Binding var selection: Value
+    @Namespace private var pill
+    @Environment(\.colorScheme) private var colorScheme
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(options.indices, id: \.self) { index in
+                let option = options[index]
+                let on = option.value == selection
+                Button { selection = option.value } label: {
+                    HStack(spacing: 4) {
+                        if let symbol = option.symbol {
+                            Image(systemName: symbol).font(.system(size: 11, weight: .semibold)).foregroundStyle(on ? (option.tint ?? Color.primary) : Color.secondary.opacity(0.8))
+                        }
+                        Text(option.title).font(.system(size: 12, weight: on ? .semibold : .medium)).foregroundStyle(on ? Color.primary : Color.secondary)
+                    }
+                    .frame(maxWidth: .infinity).frame(height: 26)
+                    .background {
+                        if on {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous).fill(colorScheme == .dark ? Color.white.opacity(0.17) : Color(nsColor: .controlBackgroundColor))
+                                .shadow(color: .black.opacity(colorScheme == .dark ? 0.35 : 0.14), radius: 1.5, y: 1)
+                                .matchedGeometryEffect(id: "pill", in: pill)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }.buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.07)))
+        .animation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeOut(duration: 0.16), value: selection)
+    }
+}
+
+/// Rounded card outline with a small caret on the top edge, drawn as one path so the caret and the card share one border.
+struct FilterCardShape: Shape {
+    var caretX: CGFloat
+    static let caretHeight: CGFloat = 8
+    func path(in rect: CGRect) -> Path {
+        let r: CGFloat = 16, w: CGFloat = 18
+        let top = rect.minY + Self.caretHeight
+        let cx = min(max(caretX, r + w / 2), rect.width - r - w / 2)
+        var p = Path()
+        p.move(to: CGPoint(x: rect.minX + r, y: top))
+        p.addLine(to: CGPoint(x: cx - w / 2, y: top))
+        p.addLine(to: CGPoint(x: cx, y: rect.minY))
+        p.addLine(to: CGPoint(x: cx + w / 2, y: top))
+        p.addLine(to: CGPoint(x: rect.maxX - r, y: top))
+        p.addArc(tangent1End: CGPoint(x: rect.maxX, y: top), tangent2End: CGPoint(x: rect.maxX, y: top + r), radius: r)
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - r))
+        p.addArc(tangent1End: CGPoint(x: rect.maxX, y: rect.maxY), tangent2End: CGPoint(x: rect.maxX - r, y: rect.maxY), radius: r)
+        p.addLine(to: CGPoint(x: rect.minX + r, y: rect.maxY))
+        p.addArc(tangent1End: CGPoint(x: rect.minX, y: rect.maxY), tangent2End: CGPoint(x: rect.minX, y: rect.maxY - r), radius: r)
+        p.addLine(to: CGPoint(x: rect.minX, y: top + r))
+        p.addArc(tangent1End: CGPoint(x: rect.minX, y: top), tangent2End: CGPoint(x: rect.minX + r, y: top), radius: r)
+        p.closeSubpath()
+        return p
+    }
+}
+
+/// Whether `event` is the second (or later) click of a double-click. `clickCount` may only be read on mouse events (it
+/// raises on any other type), so anything else counts as a single click.
+func isDoubleClick(_ event: NSEvent?) -> Bool {
+    guard let event, [.leftMouseDown, .leftMouseUp].contains(event.type) else { return false }
+    return event.clickCount >= 2
+}
+
+/// Opens or closes the filter card with its short animation (none with reduced motion). Only the user's own actions go
+/// through here; showing or hiding the shelf sets the flag directly, so the card never animates while the shelf appears.
+func withFilterCardAnimation(_ change: () -> Void) {
+    if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { change() } else { withAnimation(.easeOut(duration: 0.16), change) }
+}
+
+/// A visible card and its position in the results.
+private struct StripItem: Identifiable {
+    let index: Int
+    let clip: Clip
+    var id: UUID { clip.id }
+}
+
+/// The shelf's card strip. It places the cards itself from one shared frame (focus, magnification, pan), so no scroll
+/// view can hold a position that disagrees with where the cards are drawn. Only cards near the screen are built
+/// (`FocusDriver.keptRange`); built cards that are off screen are parked at one fixed spot, so they cost nothing per
+/// frame and are not rebuilt when they come back.
+struct DockStrip: View {
+    @ObservedObject var store: Store
+    @ObservedObject var driver: FocusDriver
+    let size: CGSize
+    var body: some View {
+        let clips = store.filtered
+        let cardWidth = CardMagnification.cardWidth(compact: store.compact)
+        let leading: CGFloat = store.translating ? cardWidth + CardMagnification.spacing : 0
+        let frame = driver.frame(count: clips.count, cardWidth: cardWidth, size: size, extraLeading: leading)
+        let padding = CardMagnification.stripVerticalPadding
+        let height = max(0, size.height - padding * 2)
+        let visible = frame.visible()
+        let items = driver.keptRange(around: visible, count: clips.count).map { StripItem(index: $0, clip: clips[$0]) }
+        let parked = -(cardWidth + 100)
+        ZStack(alignment: .topLeading) {
+            if store.translating {
+                VStack(spacing: 12) { ProgressView(); Text("正在翻译…"); Text("原文保持不变").font(.caption).foregroundStyle(.secondary) }
+                    .frame(width: cardWidth, height: height).background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                    .offset(x: frame.firstLeft - leading, y: padding)
+            }
+            ForEach(items) { item in
+                let onScreen = visible.contains(item.index)
+                let scale = onScreen ? frame.scale(item.index) : 1
+                ClipCard(clip: item.clip, index: item.index, selected: store.selection.contains(item.clip.id) || item.clip.id == store.selected, current: item.clip.id == store.currentClipID, renaming: store.renamingID == item.clip.id, store: store).equatable()
+                    .frame(width: cardWidth, height: height)
+                    .scaleEffect(scale, anchor: .bottom)
+                    .offset(x: onScreen ? frame.centre(item.index) - cardWidth / 2 : parked, y: padding)
+                    // Magnified cards reach over their neighbours, so larger cards draw on top.
+                    .zIndex(Double(scale))
+                    .allowsHitTesting(onScreen)
+            }
+        }
+        .frame(width: size.width, height: size.height, alignment: .topLeading)
+        .clipped()
+        .background(StripHost(driver: driver))
+    }
+}
+
+/// The strip's AppKit view: the display link and the preview popover's anchor come from it, and scroll events over it
+/// pan the strip.
+private struct StripHost: NSViewRepresentable {
+    let driver: FocusDriver
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        driver.hostView = view
+        return view
+    }
+    func updateNSView(_ view: NSView, context: Context) {
+        if driver.hostView !== view { driver.hostView = view }
+    }
 }
 
 struct ClipCard: View, Equatable {
@@ -1447,15 +1718,19 @@ struct ClipCard: View, Equatable {
                 }.font(.system(size: 10)).foregroundStyle(footerColor).padding(.horizontal, 12).padding(.bottom, 7)
             }
         }
-        .frame(width: store.compact ? 180 : 240).frame(maxHeight: .infinity)
+        .frame(width: CardMagnification.cardWidth(compact: store.compact)).frame(maxHeight: .infinity)
         .background(clip.kind == "文字" && CodeSyntax.language(clip.text) != nil ? Color(white: 0.14) : (richText ? Color.white : Color(nsColor: .controlBackgroundColor)), in: RoundedRectangle(cornerRadius: 12))
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? Color.blue : Color.primary.opacity(0.08), lineWidth: selected ? 2 : 1))
-        .shadow(color: .black.opacity(0.03), radius: 2, y: 1)
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? Color.blue : Color.primary.opacity(0.08), lineWidth: selected ? 3 : 1))
+        .shadow(color: selected ? Color.blue.opacity(0.28) : .black.opacity(0.03), radius: selected ? 7 : 2, y: selected ? 0 : 1)
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) { Controller.shared.pasteSelection(fallback: clip) }
         .onDrag { let selected = store.selectedClips; store.draggingIDs = selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]; store.dragStartedAt = Date(); if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
-        .onTapGesture { store.searchFocused = false; store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) }
+        // One click handler for both: a separate double-click gesture would make SwiftUI hold every single click for the
+        // double-click interval (about half a second) before selecting. The first click selects, the second pastes.
+        .onTapGesture {
+            if isDoubleClick(NSApp.currentEvent), store.selected == clip.id { Controller.shared.pasteSelection(fallback: clip); return }
+            store.searchFocused = false; store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView)
+        }
         .contextMenu {
             Button("粘贴") { Controller.shared.pasteSelection(fallback: clip) }
             Button("预览 · 空格") { Controller.shared.showPreview(clip) }

@@ -272,19 +272,12 @@ extension Controller {
         guard let popover = previewPopover, let anchor = previewAnchor(for: id) else { return }
         popover.positioningRect = anchor.rect
     }
-    /// The selected card, in the coordinates of the shelf's scrolling content; nil when it is not on screen.
+    /// Where the card rests once it is selected (the strip centres the selection), in the strip's coordinates; nil when
+    /// that place is not on screen.
     func previewAnchor(for id: UUID) -> (view: NSView, rect: NSRect, edge: NSRectEdge)? {
-        guard panel.isVisible, let content = panel.contentView, let index = store.visibleIndex(of: id),
-              let scroll = firstScrollView(in: content), let document = scroll.documentView else { return nil }
-        let width: CGFloat = store.compact ? 180 : 240
-        let slot = index + (store.translating ? 1 : 0)
-        let rect = NSRect(x: 20 + CGFloat(slot) * (width + 12), y: 8, width: width, height: max(40, document.bounds.height - 16))
-        return (document, rect, document.isFlipped ? .minY : .maxY)
-    }
-    private func firstScrollView(in view: NSView) -> NSScrollView? {
-        if let scroll = view as? NSScrollView { return scroll }
-        for child in view.subviews { if let found = firstScrollView(in: child) { return found } }
-        return nil
+        guard panel.isVisible, let index = store.visibleIndex(of: id), let view = stripDriver.hostView,
+              let rect = stripDriver.restingRect(index: index) else { return nil }
+        return (view, rect, view.isFlipped ? .minY : .maxY)
     }
     func openItem(_ clip: Clip) { if let url = URL(string: clip.text), clip.kind == "链接" { openExternal(url) } else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first { openExternal(URL(fileURLWithPath: path)) } else { showPreview(clip) } }
     /// Renames the card title in place on the shelf; a dialog is only
@@ -329,14 +322,6 @@ extension Controller {
         store.board = target
         if let first = store.filtered.first { store.choose(first.id) }
         panel.makeFirstResponder(panel.contentView)
-    }
-    func horizontalScrollView(in root: NSView, at location: NSPoint) -> NSScrollView? {
-        if let scroll = root as? NSScrollView,
-           scroll.convert(scroll.bounds, to: nil).contains(location),
-           let document = scroll.documentView, document.frame.width > scroll.contentSize.width + 1,
-           document.frame.height <= scroll.contentSize.height + 1 { return scroll }
-        for child in root.subviews { if let found = horizontalScrollView(in: child, at: location) { return found } }
-        return nil
     }
     /// Starts a search from a typed key without consuming it: the key events are held
     /// until the field is first responder, then replayed so input methods compose normally.

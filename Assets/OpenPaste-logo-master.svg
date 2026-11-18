@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1254" height="1254" viewBox="0 0 1254 1254" fill="none" role="img" aria-labelledby="logo-title logo-description">
+  <title id="logo-title">OpenPaste — opening paper P</title>
+  <desc id="logo-description">An editable vector reconstruction of the OpenPaste icon: a jade-teal paper ribbon in the shape of P, a warm ivory reverse at its peeled end, and a porcelain-white squircle. Every visible element is a vector path or gradient. The exterior is transparent.</desc>
+  <defs>
+    <path id="tile-outline" d="M390 110H860C962 110 1013 110 1069 158C1123 199 1150 275 1150 367V903C1150 995 1124 1066 1070 1111C1015 1158 962 1160 860 1160H390C288 1160 233 1158 178 1111C124 1066 100 995 100 903V367C100 275 127 199 181 158C237 110 288 110 390 110Z"/>
+    <path id="p-outline" fill-rule="evenodd" clip-rule="evenodd" d="M452 264H803C911 264 991 345 991 451C991 550 960 636 912 677C861 718 744 733 599 733H510C488 733 480 745 480 769V928C480 981 443 1019 391 1019H354C297 1019 263 981 263 928V450C263 344 347 264 452 264ZM454 400C420 400 398 423 398 455V538C398 570 418 589 451 589H819C853 589 874 568 874 538V455C874 423 850 400 817 400H454Z"/>
+    <clipPath id="tile-clip"><use href="#tile-outline"/></clipPath>
+    <clipPath id="p-clip"><use href="#p-outline"/></clipPath>
+    <linearGradient id="porcelain" x1="340" y1="110" x2="950" y2="1160" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFEFC"/>
+      <stop offset="0.6" stop-color="#FBF8F5"/>
+      <stop offset="1" stop-color="#F3F0ED"/>
+    </linearGradient>
+    <linearGradient id="tile-edge" x1="625" y1="110" x2="625" y2="1160" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="0.45" stop-color="#F1EEEA"/>
+      <stop offset="1" stop-color="#DFDCD6"/>
+    </linearGradient>
+    <linearGradient id="teal-body" x1="282" y1="435" x2="880" y2="1007" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#05C5AC"/>
+      <stop offset="0.38" stop-color="#00B49E"/>
+      <stop offset="0.76" stop-color="#009E8A"/>
+      <stop offset="1" stop-color="#008D7A"/>
+    </linearGradient>
+    <linearGradient id="upper-ribbon" x1="282" y1="300" x2="995" y2="548" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#28EBD0"/>
+      <stop offset="0.32" stop-color="#08C7AC"/>
+      <stop offset="0.72" stop-color="#00A58F"/>
+      <stop offset="1" stop-color="#008B79"/>
+    </linearGradient>
+    <radialGradient id="stem-light" cx="0" cy="0" r="1" gradientTransform="translate(295 731) rotate(4) scale(295 364)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#10D8BB" stop-opacity="0.4"/>
+      <stop offset="1" stop-color="#10D8BB" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="upper-turn" cx="0" cy="0" r="1" gradientTransform="translate(409 408) scale(205 218)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#003F36" stop-opacity="0.64"/>
+      <stop offset="0.44" stop-color="#005A4B" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#007A69" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="lower-turn" cx="0" cy="0" r="1" gradientTransform="translate(490 744) rotate(22) scale(176 248)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#004B3E" stop-opacity="0.52"/>
+      <stop offset="0.40" stop-color="#005A4B" stop-opacity="0.19"/>
+      <stop offset="1" stop-color="#008F7B" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ivory-reverse" x1="746" y1="604" x2="870" y2="749" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFCF4"/>
+      <stop offset="0.48" stop-color="#FFF1DD"/>
+      <stop offset="1" stop-color="#EFD2AC"/>
+    </linearGradient>
+    <linearGradient id="reverse-soft-light" x1="664" y1="702" x2="912" y2="619" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="short-contact-shadow" x="224" y="238" width="808" height="827" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6" result="soft"/>
+      <feOffset in="soft" dx="0" dy="8" result="offset"/>
+      <feFlood flood-color="#273D32" flood-opacity="0.18" result="ink"/>
+      <feComposite in="ink" in2="offset" operator="in"/>
+    </filter>
+  </defs>
+
+  <g id="porcelain-base">
+    <use href="#tile-outline" fill="url(#porcelain)"/>
+    <use href="#tile-outline" stroke="url(#tile-edge)" stroke-width="2"/>
+  </g>
+
+  <g id="ribbon-mark" clip-path="url(#tile-clip)">
+    <use href="#p-outline" fill="#000000" filter="url(#short-contact-shadow)"/>
+    <use href="#p-outline" fill="url(#teal-body)"/>
+
+    <g id="ribbon-folds" clip-path="url(#p-clip)">
+      <use href="#p-outline" fill="url(#stem-light)"/>
+
+      <use href="#p-outline" fill="url(#upper-turn)"/>
+
+      <use href="#p-outline" fill="url(#lower-turn)"/>
+
+      <path d="M263 543C279 459 357 400 454 400H817C850 400 874 423 874 455V538C874 568 853 589 819 589C900 579 951 553 977 516C987 502 991 486 991 469V451C991 345 911 264 803 264H452C347 264 263 344 263 450V543Z" fill="url(#upper-ribbon)"/>
+
+      <path d="M599 733C646 733 663 712 695 672C738 620 768 606 819 593C910 570 979 555 990 471C984 551 961 635 912 677C861 718 744 733 599 733Z" fill="url(#ivory-reverse)"/>
+      <path d="M599 733C646 733 663 712 695 672C738 620 768 606 819 593C910 570 979 555 990 471C984 551 961 635 912 677C861 718 744 733 599 733Z" fill="url(#reverse-soft-light)"/>
+
+      <path d="M599 732.5C646 732.5 663 711.5 695 671.5C738 619.5 768 605.5 819 592.5C910 569.5 979 554.5 990 471" stroke="#FFFDF8" stroke-width="2.1" stroke-linecap="round"/>
+      <path d="M452 265H803C910 265 990 345 990 451" stroke="#7AEBD9" stroke-opacity="0.3" stroke-width="1.3"/>
+      <path d="M263.7 928C263.7 980 297 1018.3 354 1018.3H391C443 1018.3 479.3 981 479.3 928" stroke="#006D5E" stroke-opacity="0.5" stroke-width="1.4"/>
+      <path d="M454 400.5H817C850 400.5 873.5 423 873.5 455" stroke="#006957" stroke-opacity="0.26" stroke-width="1"/>
+    </g>
+  </g>
+</svg>

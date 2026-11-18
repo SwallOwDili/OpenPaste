@@ -170,7 +170,7 @@ extension Controller {
         let workflowFixture = TestMode.translationWorkflow
         guard (config.enabled || workflowFixture), (!preview || workflowFixture), let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { showShelf(); return }
         target = app; lastExternalApp = app
-        guard !store.ignored.components(separatedBy: .newlines).map({ $0.trimmingCharacters(in: .whitespaces) }).contains(app.bundleIdentifier ?? "") else { showShelf(); store.translationStatus = "当前应用已排除，不执行翻译"; return }
+        guard !store.ignored.components(separatedBy: .newlines).map({ $0.trimmingCharacters(in: .whitespaces) }).contains(app.bundleIdentifier ?? "") else { showShelf(); store.showTranslationNotice("当前应用已排除，不执行翻译"); return }
         let selectionAuthorized = AXIsProcessTrusted()
         store.translationSelectionAuthorized = selectionAuthorized
         guard selectionAuthorized else { refreshPermission(); showShelf(); return }
@@ -182,7 +182,7 @@ extension Controller {
         // Apps without selected-text accessibility support: copy selection, then restore all original clipboard types.
         let pb = NSPasteboard.general
         guard let original = ClipboardWrite.snapshot(pb) else {
-            activateShelf(); store.translationStatus = "当前剪贴板无法完整暂存，已取消翻译"; return
+            activateShelf(); store.showTranslationNotice("当前剪贴板无法完整暂存，已取消翻译"); return
         }
         let before = original.changeCount; let generation = translationGeneration
         activeSelectionCaptureGeneration = generation
@@ -205,7 +205,7 @@ extension Controller {
             // Do not let the shelf's forced capture turn our synthetic Command-C
             // payload into a history item after a canceled fallback.
             if pb.changeCount != before { suppressCurrentCapture() }
-            self.activateShelf(); self.store.translationStatus = message
+            self.activateShelf(); self.store.showTranslationNotice(message)
             endSelectionCapture()
         }
         func finish(_ attempt: Int) {
@@ -258,9 +258,9 @@ extension Controller {
                         suppressCurrentCapture()
                     }
                     self.activateShelf()
-                    self.store.translationStatus = restoration == .superseded
+                    self.store.showTranslationNotice(restoration == .superseded
                         ? "剪贴板已被其他内容更新，已取消翻译"
-                        : "无法安全恢复原剪贴板，已取消翻译"
+                        : "无法安全恢复原剪贴板，已取消翻译")
                     endSelectionCapture()
                     return
                 }
@@ -268,7 +268,7 @@ extension Controller {
                 guard generation == self.translationGeneration else { endSelectionCapture(); return }
                 self.activateShelf()
                 endSelectionCapture()
-                if fileSelection { self.store.translationStatus = "选中的是文件，已跳过翻译"; return }
+                if fileSelection { self.store.showTranslationNotice("选中的是文件，已跳过翻译"); return }
                 if !confidential, let copied, !copied.isEmpty { self.translateSelection(copied) }
             }
         }
@@ -289,7 +289,7 @@ extension Controller {
                   (config.enabled || fixture), self.panel.isVisible else { return }
             let request: URLRequest
             do { request = try TranslationAPI.request(base: base, key: keyResult.get(), model: model, language: language, text: text) }
-            catch { self.store.translating = false; self.store.translationStatus = error.localizedDescription; return }
+            catch { self.store.translating = false; self.store.showTranslationNotice(error.localizedDescription); return }
             let configuration = URLSessionConfiguration.ephemeral; configuration.timeoutIntervalForResource = 65
             let session = URLSession(configuration: configuration, delegate: TranslationNoRedirect(), delegateQueue: nil)
             self.translationTask = session.dataTask(with: request) { data, response, error in
@@ -301,12 +301,12 @@ extension Controller {
                     guard generation == self.translationGeneration, revision == config.revision, (config.enabled || fixture), self.panel.isVisible else { return }
                     self.store.translating = false; self.translationTask = nil
                     switch result {
-                    case .failure(let error): self.store.translationStatus = error.localizedDescription
+                    case .failure(let error): self.store.showTranslationNotice(error.localizedDescription)
                     case .success(let translated):
                         let clip = Clip(created: max(Date(), self.store.archive.clips.first?.created.addingTimeInterval(0.01) ?? Date()), source: "快速翻译", sourceID: "io.github.SwallOwDili.OpenPaste", kind: "文字", title: "翻译 · \(language)", text: translated, parts: [[ClipPart(type: "public.utf8-plain-text", data: Data(translated.utf8))]])
                         self.store.resetFilters(); self.store.reverseHistory = false
-                        if let id = self.store.ingest(clip) { UsageAnalytics.shared.record(.translationCompleted); self.store.selection.removeAll(); self.store.selected = id; self.store.translationStatus = "翻译完成 · ↵ 替换选中原文" }
-                        else { self.store.translationStatus = "译文无法保存：\(self.store.message)" }
+                        if let id = self.store.ingest(clip) { UsageAnalytics.shared.record(.translationCompleted); self.store.selection.removeAll(); self.store.selected = id; let done = "翻译完成 · ↵ 替换选中原文"; self.store.translationStatus = done; self.store.dismissTranslationStatus(done) }
+                        else { self.store.showTranslationNotice("译文无法保存：\(self.store.message)") }
                     }
                 }
             }

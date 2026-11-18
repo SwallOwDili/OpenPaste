@@ -14,14 +14,16 @@ enum BoardNavigation {
 }
 
 enum HorizontalWheel {
-    /// Converts a vertical wheel gesture into a horizontal offset for a list that
-    /// only scrolls sideways. Returns nil when the gesture is already horizontal
-    /// (or has no vertical part) so the system handles it unchanged.
-    static func offset(current: CGFloat, deltaX: CGFloat, deltaY: CGFloat, precise: Bool,
-                       contentWidth: CGFloat, viewportWidth: CGFloat) -> CGFloat? {
-        guard abs(deltaY) > abs(deltaX), deltaY != 0 else { return nil }
-        let scaled = precise ? deltaY : deltaY * 12
-        let maximum = max(0, contentWidth - viewportWidth)
-        return min(maximum, max(0, current - scaled))
+    /// Converts a scroll gesture over the card strip into a sideways pan in points (positive shows earlier cards).
+    /// Horizontal trackpad swipes pan directly; a vertical wheel or swipe pans too, since the strip only moves sideways.
+    /// Line-based wheel deltas (a plain mouse) are scaled to points. Returns nil when there is nothing to move.
+    /// Whether a scroll event pans the card strip: only over the strip, and never while the filter card is open, since
+    /// the card floats over the strip and scrolls its own content when the shelf is too short for it.
+    static func pansStrip(pointerOverStrip: Bool, filterCardOpen: Bool) -> Bool { pointerOverStrip && !filterCardOpen }
+
+    static func panDelta(deltaX: CGFloat, deltaY: CGFloat, precise: Bool) -> CGFloat? {
+        let raw = abs(deltaY) > abs(deltaX) ? deltaY : deltaX
+        guard raw != 0 else { return nil }
+        return precise ? raw : raw * 12
     }
 }

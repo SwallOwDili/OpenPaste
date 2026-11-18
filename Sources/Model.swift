@@ -106,7 +106,10 @@ final class Store: ObservableObject {
     var canModifyHistory: Bool { !initialLoading && !hasHistoryLoadFailure && !changingDataDirectory && !importingPaste }
     var recordingPauseControl: RecordingPauseControl { pauseReasons.control }
     @Published var translating = false
-    @Published var translationStatus = ""
+    @Published var translationStatus = "" { didSet { translationStatusGeneration &+= 1 } }
+    /// Counts every assignment of `translationStatus`, so a dismissal timer can tell whether its message was shown again
+    /// (even with the same text) after it was scheduled.
+    private var translationStatusGeneration = 0
     @Published var translationSelectionAuthorized = false
     var selectionCaptureActive = false
     @Published var message = "所有内容仅保存在这台 Mac"
@@ -117,6 +120,11 @@ final class Store: ObservableObject {
     @Published var kind = "全部" { didSet { if kind != oldValue { filterValueChanged() } } }
     @Published var sourceFilter = "全部来源" { didSet { if sourceFilter != oldValue { filterValueChanged() } } }
     @Published var filtersExpanded = false
+    /// Set when an arrow key actually changed the selection. The shelf reads and clears it once while it scrolls to the
+    /// new selection and shows its magnification effect only then; clicks, search and board switches never set it.
+    var keyboardNavigated = false
+    /// Any filter besides the search text is on (type, source, today, date range).
+    var filtersActive: Bool { kind != "全部" || sourceFilter != "全部来源" || todayOnly || dateRangeEnabled }
     @Published var dateRangeEnabled = false { didSet { if dateRangeEnabled != oldValue { filterValueChanged() } } }
     @Published var startDate = Date().addingTimeInterval(-7 * 86400) { didSet { if startDate != oldValue { filterValueChanged() } } }
     @Published var endDate = Date() { didSet { if endDate != oldValue { filterValueChanged() } } }
@@ -151,6 +159,8 @@ final class Store: ObservableObject {
     @Published var selection = Set<UUID>()
     @Published var compact = false
     @Published var networkPreviews: Bool { didSet { if usePreferences { configurationDefaults?.set(networkPreviews, forKey: "networkPreviews") }; LinkPreviewCache.shared.enabled = networkPreviews } }
+    /// Dock-style magnification of the selected card while the arrow keys are used. Off unless the user turns it on.
+    @Published var arrowKeyMagnification: Bool { didSet { if usePreferences { configurationDefaults?.set(arrowKeyMagnification, forKey: "arrowKeyMagnification") } } }
     @Published var indexingImages = false
     @Published var ocrProgress = ""
     var draggingIDs: [UUID] = []
@@ -212,6 +222,7 @@ final class Store: ObservableObject {
         shortcutLabel = (configurationDefaults.map { GlobalShortcut.load(from: $0) } ?? .standard).label
         shelfShortcuts = ShelfShortcuts.load(from: configurationDefaults)
         networkPreviews = configurationDefaults?.object(forKey: "networkPreviews") as? Bool ?? true
+        arrowKeyMagnification = configurationDefaults?.object(forKey: "arrowKeyMagnification") as? Bool ?? false
         retentionDays = configurationDefaults?.integer(forKey: "retentionDays") ?? 0
         limit = configurationDefaults?.object(forKey: "historyLimit") as? Int ?? 1000
         ignored = configurationDefaults?.string(forKey: "ignoredApps") ?? "com.1password.1password\ncom.agilebits.onepassword7\ncom.bitwarden.desktop\ncom.apple.Passwords"
@@ -337,6 +348,52 @@ final class Store: ObservableObject {
         sourcePasses += 1
         sourceNames = Array(Set(archive.clips.map(\.source))).sorted()
     }
+    /// How long the "translation finished" hint stays on the shelf.
+    static let translationDoneSeconds: TimeInterval = 5
+    /// How long a skipped, canceled or failed translation hint stays (a little longer than "done", to read an error).
+    static let translationNoticeSeconds: TimeInterval = 8
+    /// Clears `text` from the translation status after `delay`, but only while it is still the message shown by that same
+    /// assignment, so a newer message (a new translation, an error, or the same text shown again) is never wiped by an
+    /// older timer.
+    func dismissTranslationStatus(_ text: String, after delay: TimeInterval = Store.translationDoneSeconds) {
+        let generation = translationStatusGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.translationStatus == text, self.translationStatusGeneration == generation else { return }
+            self.translationStatus = ""
+        }
+    }
+    /// Shows a translation hint that ends the attempt (skipped, canceled or failed) and clears it after
+    /// `translationNoticeSeconds`. Such a hint has nothing left to act on, so it must not stay on the shelf until the
+    /// next translation; a newer message is never cleared by its timer.
+    func showTranslationNotice(_ text: String, after delay: TimeInterval = Store.translationNoticeSeconds) {
+        translationStatus = text
+        dismissTranslationStatus(text, after: delay)
+    }
+    /// The time filter as one choice. The date range wins if both flags are on, as the filter card shows it.
+    var timeScope: FilterTimeScope { dateRangeEnabled ? .custom : (todayOnly ? .today : .any) }
+    /// Switches between no time filter, today only and the custom date range in a single refresh, so the results never
+    /// pass through a state where neither (or both) is on.
+    func setTimeScope(_ scope: FilterTimeScope) {
+        let today = scope == .today, custom = scope == .custom
+        guard todayOnly != today || dateRangeEnabled != custom else { return }
+        batchingFilterChanges = true
+        if todayOnly != today { todayOnly = today }
+        if dateRangeEnabled != custom { dateRangeEnabled = custom }
+        batchingFilterChanges = false
+        if filterRefreshPending { filterRefreshPending = false; refreshResults() }
+    }
+    /// Clears the filters of the filter card (type, source, today, date range) in one refresh. The search text, the board
+    /// and the stored start/end dates are kept.
+    func clearFilters() {
+        guard filtersActive else { return }
+        batchingFilterChanges = true
+        if kind != "全部" { kind = "全部" }
+        if sourceFilter != "全部来源" { sourceFilter = "全部来源" }
+        if todayOnly { todayOnly = false }
+        if dateRangeEnabled { dateRangeEnabled = false }
+        batchingFilterChanges = false
+        if filterRefreshPending { filterRefreshPending = false; refreshResults() }
+    }
     /// Clears query, kind, source and today filters in one refresh. Board and the
     /// enabled date range are also cleared unless their preserve flags are set;
     /// stored start/end dates remain available for the next time the range is enabled.
@@ -368,7 +425,10 @@ final class Store: ObservableObject {
         guard !visibleClips.isEmpty else { return }
         let index = selected.flatMap { visibleIndexByID[$0] } ?? 0
         selection.removeAll()
-        selected = visibleClips[max(0, min(visibleClips.count - 1, index + delta))].id; selectionAnchor = selected
+        let next = visibleClips[max(0, min(visibleClips.count - 1, index + delta))].id
+        // At the first or last card the key cannot move anything, so there is nothing to magnify.
+        if next != selected { keyboardNavigated = true }
+        selected = next; selectionAnchor = selected
     }
     func prune() {
         guard canModifyHistory else { return }
