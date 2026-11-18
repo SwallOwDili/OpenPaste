@@ -17,6 +17,10 @@ enum HorizontalWheel {
     /// Converts a scroll gesture over the card strip into a sideways pan in points (positive shows earlier cards).
     /// Horizontal trackpad swipes pan directly; a vertical wheel or swipe pans too, since the strip only moves sideways.
     /// Line-based wheel deltas (a plain mouse) are scaled to points. Returns nil when there is nothing to move.
+    /// Whether a scroll event pans the card strip: only over the strip, and never while the filter card is open, since
+    /// the card floats over the strip and scrolls its own content when the shelf is too short for it.
+    static func pansStrip(pointerOverStrip: Bool, filterCardOpen: Bool) -> Bool { pointerOverStrip && !filterCardOpen }
+
     static func panDelta(deltaX: CGFloat, deltaY: CGFloat, precise: Bool) -> CGFloat? {
         let raw = abs(deltaY) > abs(deltaX) ? deltaY : deltaX
         guard raw != 0 else { return nil }

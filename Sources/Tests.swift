@@ -292,7 +292,10 @@ func runNavigationTests() {
           HorizontalWheel.panDelta(deltaX: 0, deltaY: 40, precise: true) == 40,
           HorizontalWheel.panDelta(deltaX: 12, deltaY: 1, precise: true) == 12,
           HorizontalWheel.panDelta(deltaX: -2, deltaY: 0, precise: false) == -24,
-          HorizontalWheel.panDelta(deltaX: 0, deltaY: 0, precise: false) == nil else { print("FAIL: wheel conversion"); exit(1) }
+          HorizontalWheel.panDelta(deltaX: 0, deltaY: 0, precise: false) == nil,
+          HorizontalWheel.pansStrip(pointerOverStrip: true, filterCardOpen: false),
+          !HorizontalWheel.pansStrip(pointerOverStrip: true, filterCardOpen: true),
+          !HorizontalWheel.pansStrip(pointerOverStrip: false, filterCardOpen: false) else { print("FAIL: wheel conversion"); exit(1) }
     var labelled = clips[7]; labelled.userLabel = "Gamma 名称"
     store.archive.clips[7] = labelled
     store.query = "gamma 名称"

@@ -306,9 +306,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             return event
         }
         wheelMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
-            // The card strip has no scroll view of its own: trackpad and wheel scrolling over it pan the strip.
+            // The card strip has no scroll view of its own: trackpad and wheel scrolling over it pan the strip. While the
+            // filter card is open it floats over the strip and may scroll itself (a short shelf), so its events pass through.
             guard let self, event.window === self.panel, !self.store.settings, let strip = self.stripDriver.hostView, strip.window === self.panel,
-                  strip.bounds.contains(strip.convert(event.locationInWindow, from: nil)),
+                  HorizontalWheel.pansStrip(pointerOverStrip: strip.bounds.contains(strip.convert(event.locationInWindow, from: nil)),
+                                            filterCardOpen: self.store.filtersExpanded),
                   let delta = HorizontalWheel.panDelta(deltaX: event.scrollingDeltaX, deltaY: event.scrollingDeltaY, precise: event.hasPreciseScrollingDeltas) else { return event }
             self.stripDriver.scroll(by: delta)
             return nil
