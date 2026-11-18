@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 private final class UpdateMockProtocol: URLProtocol {
     static var status = 200
@@ -237,5 +237,145 @@ func runUpdateTests() {
     UpdateNotice.recordPending(from: "0.0.4-rc0", to: "0.0.4-rc1", defaults: noticeDefaults)
     UpdateNotice.clearPending(defaults: noticeDefaults)
     expect(UpdateNotice.consumePending(current: "0.0.4-rc1", defaults: noticeDefaults) == nil, "cancelled install leaves no notice")
+    // Release notes in the update dialog
+    let notesBody = """
+    v0.0.7 的预发布版。\r
+    \r
+    <p align="center">
+      <img src="https://example.com/a.jpg" width="880" alt="效果图" />
+      <br />
+      <sub>效果图说明</sub>
+    </p>
+
+    ### 卡片条与选择
+
+    - **方向键放大**：默认关闭，可在 设置 → 通用 中打开（#23）
+    - 第二项
+      续行
+    1. 第一步 `code`
+
+    ![内联图](https://example.com/b.png)
+    普通段落 <b>加粗</b> &amp; [链接](https://example.com/x) [脚本](javascript:alert(1))
+    <!-- 注释 -->
+    ## C# 支持 ##
+    ---
+    """
+    let notesBlocks = ReleaseNotes.blocks(notesBody)
+    expect(notesBlocks == [
+        .paragraph("v0.0.7 的预发布版。"),
+        .heading(3, "卡片条与选择"),
+        .bullet("**方向键放大**：默认关闭，可在 设置 → 通用 中打开（#23）"),
+        .bullet("第二项 续行"),
+        .numbered("1.", "第一步 `code`"),
+        .paragraph("普通段落 加粗 & [链接](https://example.com/x) [脚本](javascript:alert(1))"),
+        .heading(2, "C# 支持")
+    ], "release notes drop picture blocks, captions, comments and tags into headings, items and paragraphs")
+    let notesText = ReleaseNotes.attributed(notesBody)
+    expect(!notesText.string.contains("<") && !notesText.string.contains("**") && !notesText.string.contains("###")
+           && !notesText.string.contains("效果图") && !notesText.string.contains("example.com"),
+           "release notes show no markup, pictures or captions")
+    expect(notesText.string.contains("•\t方向键放大：默认关闭"), "release note list items get bullets")
+    var linkTargets: [String] = []
+    var boldText = ""
+    notesText.enumerateAttributes(in: NSRange(location: 0, length: notesText.length)) { attributes, range, _ in
+        if let link = attributes[.link] as? URL { linkTargets.append(link.absoluteString) }
+        if let font = attributes[.font] as? NSFont, font.fontDescriptor.symbolicTraits.contains(.bold),
+           notesText.attributedSubstring(from: range).string.hasPrefix("方向键放大") { boldText = notesText.attributedSubstring(from: range).string }
+    }
+    expect(linkTargets == ["https://example.com/x"], "release notes keep web links only")
+    expect(boldText == "方向键放大", "release note bold text is styled")
+    expect(ReleaseNotes.attributed("").string == "该版本没有提供更新说明。", "empty release notes show a placeholder")
+    // Pictures from this repository on GitHub
+    let picture = "https://github.com/SwallOwDili/OpenPaste/releases/download/v9.9.9/picture.png"
+    let missing = "https://raw.githubusercontent.com/SwallOwDili/OpenPaste/v9.9.9/docs/missing.png"
+    for (url, trusted) in [(picture, true), (missing, true),
+                           ("https://github.com/evil/OpenPaste/releases/download/v1/x.png", false),
+                           ("http://raw.githubusercontent.com/SwallOwDili/OpenPaste/main/x.png", false),
+                           ("https://raw.githubusercontent.com/SwallOwDili/OpenPaste/main/x.png?track=1", false),
+                           ("https://example.com/SwallOwDili/OpenPaste/x.png", false)] {
+        expect(ReleaseNotes.isTrustedImage(URL(string: url)!) == trusted, "release note picture \(trusted ? "accepted" : "refused"): \(url)")
+    }
+    let pictureBody = """
+    开头一句。
+
+    <p align="center">
+      <img src="\(picture)" width="880" alt="示意" />
+      <br />
+      <sub>上：示意　下：图标</sub>
+    </p>
+
+    ![](\(missing))
+
+    <p><img src="https://example.com/x.png" /><sub>外部图片说明</sub></p>
+
+    ### 小节
+    """
+    expect(ReleaseNotes.blocks(pictureBody) == [
+        .paragraph("开头一句。"),
+        .image(URL(string: picture)!, caption: "上：示意　下：图标"),
+        .image(URL(string: missing)!, caption: nil),
+        .heading(3, "小节")
+    ], "release note pictures from this repository become picture blocks with captions; others are left out")
+    expect(!ReleaseNotes.attributed(pictureBody).string.contains("上：示意"), "pictures and captions are left out without a picture width")
+    let pictureStorage = NSTextStorage(attributedString: ReleaseNotes.attributed(pictureBody, imageWidth: 400))
+    func slotCount() -> Int {
+        var slots = Set<ObjectIdentifier>()
+        pictureStorage.enumerateAttribute(ReleaseNotes.imageSlotKey, in: NSRange(location: 0, length: pictureStorage.length)) { value, _, _ in
+            if let slot = value as? ReleaseNotes.ImageSlot { slots.insert(ObjectIdentifier(slot)) }
+        }
+        return slots.count
+    }
+    func attachmentSizes() -> [NSSize] {
+        var sizes: [NSSize] = []
+        pictureStorage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: pictureStorage.length)) { value, _, _ in
+            if let attachment = value as? NSTextAttachment { sizes.append(attachment.bounds.size) }
+        }
+        return sizes
+    }
+    expect(slotCount() == 2 && attachmentSizes() == [NSSize(width: 400, height: 168), NSSize(width: 400, height: 168)]
+           && pictureStorage.string.contains("上：示意　下：图标"), "each picture starts as a full-width placeholder with its caption")
+    // A slow server: one picture arrives after 300 ms, the other is missing.
+    final class SlowPictureProtocol: URLProtocol {
+        static var png = Data()
+        static var requestedOnMain = false
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+        override func startLoading() {
+            if Thread.isMainThread { Self.requestedOnMain = true }
+            let found = request.url?.lastPathComponent == "picture.png"
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
+                let response = HTTPURLResponse(url: self.request.url!, statusCode: found ? 200 : 404, httpVersion: "HTTP/1.1", headerFields: [:])!
+                self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                self.client?.urlProtocol(self, didLoad: found ? Self.png : Data("not found".utf8))
+                self.client?.urlProtocolDidFinishLoading(self)
+            }
+        }
+        override func stopLoading() {}
+    }
+    let source = NSImage(size: NSSize(width: 200, height: 100), flipped: false) { rect in NSColor.systemTeal.setFill(); rect.fill(); return true }
+    SlowPictureProtocol.png = NSBitmapImageRep(data: source.tiffRepresentation!)!.representation(using: .png, properties: [:])!
+    let pictureConfig = URLSessionConfiguration.ephemeral
+    pictureConfig.protocolClasses = [SlowPictureProtocol.self]
+    let loader = ReleaseNoteImageLoader(session: URLSession(configuration: pictureConfig))
+    var loaded = false
+    let loadStart = Date()
+    loader.load(into: pictureStorage, width: 400) { loaded = true }
+    let loadCall = Date().timeIntervalSince(loadStart)
+    expect(loadCall < 0.1 && !loaded && slotCount() == 2, "loading pictures returns at once and leaves the placeholders while the server is slow")
+    let deadline = Date().addingTimeInterval(5)
+    while !loaded && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+    expect(loaded, "picture loading finishes")
+    expect(attachmentSizes() == [NSSize(width: 200, height: 100)] && slotCount() == 1,
+           "a loaded picture replaces its placeholder at its own size, no wider than the notes")
+    expect(!pictureStorage.string.contains("\n\n") && pictureStorage.string.contains("上：示意　下：图标") && pictureStorage.string.hasSuffix("小节"),
+           "a missing picture leaves no placeholder or empty line; the loaded picture keeps its caption")
+    let cancelledStorage = NSTextStorage(attributedString: ReleaseNotes.attributed(pictureBody, imageWidth: 400))
+    let cancelled = ReleaseNoteImageLoader(session: URLSession(configuration: pictureConfig))
+    var cancelledDone = false
+    cancelled.load(into: cancelledStorage, width: 400) { cancelledDone = true }
+    cancelled.cancel()
+    let cancelDeadline = Date().addingTimeInterval(5)
+    while !cancelledDone && Date() < cancelDeadline { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+    expect(cancelledDone, "cancelling picture loading settles every placeholder")
     print("Update checks: \(count) tests passed")
 }

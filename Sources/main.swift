@@ -731,16 +731,23 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         alert.informativeText = blocked == nil
             ? "选择“下载并更新”后，应用会下载并校验新版，确认后才会重启安装；历史保留，辅助功能授权不变。"
             : "\(blocked?.localizedDescription ?? "")。"
-        let notes = NSTextView(frame: NSRect(x: 0, y: 0, width: 430, height: 180))
-        notes.string = String((release.body ?? "该版本没有提供更新说明。").prefix(12000))
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 430, height: 260)); scroll.hasVerticalScroller = true
+        let notes = NSTextView(frame: NSRect(origin: .zero, size: scroll.contentSize))
+        notes.autoresizingMask = [.width]
         notes.isEditable = false
-        notes.font = .systemFont(ofSize: 12)
-        let scroll = NSScrollView(frame: notes.frame); scroll.hasVerticalScroller = true; scroll.documentView = notes
+        notes.textContainerInset = NSSize(width: 4, height: 6)
+        scroll.documentView = notes
+        // Pictures get placeholders now and are loaded in the background; closing the dialog cancels what is left.
+        let imageWidth = scroll.contentSize.width - 2 * notes.textContainerInset.width - 2 * (notes.textContainer?.lineFragmentPadding ?? 5)
+        notes.textStorage?.setAttributedString(ReleaseNotes.attributed(String((release.body ?? "").prefix(12000)), imageWidth: imageWidth))
+        let images = ReleaseNoteImageLoader()
+        if let storage = notes.textStorage { images.load(into: storage, width: imageWidth) }
         alert.accessoryView = scroll
         alert.addButton(withTitle: blocked == nil ? "下载并更新" : "前往下载")
         alert.addButton(withTitle: "稍后")
         alert.addButton(withTitle: "跳过此版本")
         presentAlert(alert) { [weak self] response in
+            images.cancel()
             if response == .alertFirstButtonReturn {
                 if blocked == nil {
                     installer.onReady = { [weak self] in self?.promptInstallReady() }
