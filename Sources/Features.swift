@@ -218,7 +218,7 @@ extension Controller {
         window.title = title; window.level = NSWindow.Level(rawValue: panel.level.rawValue + 1); window.isReleasedWhenClosed = false; window.center(); window.delegate = self; return window
     }
     func showPreview(_ clip: Clip) {
-        closePreview()
+        closePreview(animated: false)
         let popover = NSPopover()
         popover.behavior = .applicationDefined
         popover.animates = true
@@ -233,22 +233,46 @@ extension Controller {
         } else if let content = panel.contentView {
             popover.show(relativeTo: NSRect(x: content.bounds.midX, y: content.bounds.midY, width: 1, height: 1), of: content, preferredEdge: .maxY)
         }
-        previewSelectionObserver = store.$selected.dropFirst().receive(on: DispatchQueue.main).sink { [weak self] id in
-            guard let self, let id, self.previewPopover?.isShown == true, id != self.previewClipID else { return }
+        previewSelectionObserver = store.$selected.dropFirst().receive(on: DispatchQueue.main).sink { [weak self, weak popover] id in
+            guard let self, let popover, popover === self.previewPopover, !self.previewClosing,
+                  popover.isShown, let id, id != self.previewClipID else { return }
             self.updatePreview(to: id)
         }
     }
-    func closePreview() {
+    func closePreview(animated: Bool = true) {
+        previewReopenRequested = false
+        guard let popover = previewPopover, !animated || !previewClosing else { return }
         previewSelectionObserver = nil
-        // Closing without animation leaves no lingering popover window to take part in focus handling.
-        if let popover = previewPopover, popover.isShown { popover.animates = false; popover.close() }
-        previewPopover = nil; previewHost = nil; previewClipID = nil
+        if popover.isShown {
+            previewClosing = true
+            popover.animates = animated
+            popover.close()
+            if animated { return }
+        }
+        finishPreviewClose(popover)
     }
     func popoverDidClose(_ notification: Notification) {
-        guard notification.object as? NSPopover === previewPopover || previewPopover == nil else { return }
+        guard let popover = notification.object as? NSPopover else { return }
+        finishPreviewClose(popover)
+    }
+    private func finishPreviewClose(_ popover: NSPopover) {
+        guard popover === previewPopover else { return }
+        let reopen = previewReopenRequested
+        previewReopenRequested = false
         previewSelectionObserver = nil
         previewPopover = nil; previewHost = nil; previewClipID = nil
-        DispatchQueue.main.async { [weak self] in self?.restoreWorkingWindowFocus() }
+        previewClosing = false
+        // Consume the final toggle before another key event can see an intermediate closed state.
+        if reopen, panel.isVisible, NSApp.isActive, !store.settings,
+           !interactionState.hasModalInteraction, !interactionState.menuTracking,
+           editorWindow?.isVisible != true, let clip = store.selectedClips.first {
+            showPreview(clip)
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.previewPopover == nil else { return }
+            self.restoreWorkingWindowFocus()
+        }
     }
     private func previewSize(for id: UUID) -> NSSize {
         let screen = (panel.screen ?? NSScreen.main ?? NSScreen.screens[0]).visibleFrame.size
@@ -263,8 +287,9 @@ extension Controller {
         popover.contentSize = previewSize(for: id)
         reanchorPreview(to: id)
         // The shelf scrolls the new card into view asynchronously; anchor again once it has.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self, self.previewClipID == id else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak popover] in
+            guard let self, let popover, popover === self.previewPopover, !self.previewClosing,
+                  self.previewClipID == id else { return }
             self.reanchorPreview(to: id)
         }
     }

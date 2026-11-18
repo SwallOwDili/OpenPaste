@@ -16,7 +16,7 @@ final class SettingsDirectoryInfo: ObservableObject {
             let cloud = DataDirectory.isCloud(root)
             DispatchQueue.main.async {
                 guard let self, self.root == root else { return }
-                self.isCloud = cloud
+                if self.isCloud != cloud { self.isCloud = cloud }
             }
         }
     }
@@ -90,6 +90,7 @@ struct SettingsPages: NSViewRepresentable {
             let host: NSHostingView<SettingsPageView>
             if let cached = hosts[page] { host = cached }
             else {
+                let finishHost = AcceptanceMetrics.begin("settings.host.\(page.rawValue)"); defer { finishHost() }
                 host = NSHostingView(rootView: SettingsPageView(store: store, directory: directory, page: page))
                 host.sizingOptions = []
                 host.autoresizingMask = [.width, .height]
