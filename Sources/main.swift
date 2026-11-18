@@ -36,8 +36,6 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     var shelfPresentation = 0
     /// The preview is a system popover anchored to the selected card.
     var previewPopover: NSPopover?
-    var previewClosing = false
-    var previewReopenRequested = false
     var previewHost: NSHostingController<FullItemPreview>?
     var previewSelectionObserver: AnyCancellable?
     var previewWindow: NSWindow? { previewPopover?.isShown == true ? previewHost?.view.window : nil }
@@ -242,15 +240,6 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                 return nil
             }
             if self.store.settings, self.settingsWindow?.attachedSheet == nil, self.settingsWindow?.isKeyWindow == true, event.keyCode == 53 || (event.keyCode == 13 && event.modifierFlags.contains(.command)) { self.closeSettings(); return nil }
-            if !self.store.settings, self.previewClosing,
-               event.window === self.panel || event.window === self.previewHost?.view.window,
-               event.keyCode == 49 || event.keyCode == 53 {
-                if !event.isARepeat {
-                    if event.keyCode == 49 { self.previewReopenRequested.toggle() }
-                    else { self.closePreview() }
-                }
-                return nil
-            }
             // Read-only text in the preview may hold focus; only a text view being edited keeps the arrow keys.
             if self.previewPopover?.isShown == true, !self.store.settings, (NSApp.keyWindow?.firstResponder as? NSTextView)?.isEditable != true {
                 let plain = event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
@@ -271,6 +260,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                 return event
             }
             if event.keyCode == 53 {
+                // A held Esc acts once: after it closed the preview or collapsed search, its repeats must not go on to
+                // hide the shelf.
+                if event.isARepeat { return nil }
                 if self.store.filtersExpanded { withFilterCardAnimation { self.store.filtersExpanded = false } }
                 else if self.store.searchExpanded {
                     self.store.resetFilters(preserveBoard: true); self.store.filtersExpanded = false
@@ -609,7 +601,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     func hideShelf() {
         logInteraction("shelf.hide", reason: "explicit")
         shelfAwaitingActivation = false
-        closePreview(animated: false)
+        closePreview()
         cancelTranslation()
         store.reverseHistory = false
         // Close the filter card with the shelf (no animation), so the next show does not briefly play its closing.
@@ -671,7 +663,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         rememberExternalTarget()
         settingsRequest += 1
         store.settings = true
-        closePreview(animated: false)
+        closePreview()
         cancelTranslation()
         store.reverseHistory = false
         refreshPermission()
@@ -979,7 +971,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         guard store.restoreMany(selected.contains(where: { $0.id == clip.id }) ? selected : [clip], plain: plain) else { showToast("无法合并所选内容"); return }; pastePrepared()
     }
     func pastePrepared() {
-        closePreview(animated: false)
+        closePreview()
         cancelTranslation()
         refreshPermission()
         logInteraction("shelf.hide", reason: "paste")
@@ -1032,7 +1024,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if self.toastGeneration == generation { toast.orderOut(nil) } }
     }
     func openExternal(_ url: URL) {
-        closePreview(animated: false)
+        closePreview()
         cancelTranslation()
         closeSettings()
         logInteraction("shelf.hide", reason: "open-external")
@@ -1068,7 +1060,6 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         presentAlert(alert) { [weak self] response in if response == .alertFirstButtonReturn { self?.store.addBoard(field.stringValue) } }
     }
     func edit(_ clip: Clip) {
-        previewReopenRequested = false
         if clip.kind == "图片" { showPreview(clip); return }
         if clip.kind == "文件" { showToast("文件不能直接编辑，按 ⌘O 打开原文件"); return }
         let editTarget = store.contentEditTarget(for: clip)
@@ -1793,7 +1784,8 @@ struct ClipCard: View, Equatable {
         .background(isCode ? Color(white: 0.14) : (richText ? Color.white : Color(nsColor: .controlBackgroundColor)), in: RoundedRectangle(cornerRadius: 12))
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? Color.blue : Color.primary.opacity(0.08), lineWidth: selected ? 3 : 1))
-        .shadow(color: selected ? Color.blue.opacity(0.28) : .black.opacity(0.03), radius: selected ? 7 : 2, y: selected ? 0 : 1)
+        // The selected card is marked by its blue border only, without a glow behind it.
+        .shadow(color: .black.opacity(0.03), radius: 2, y: 1)
         .contentShape(Rectangle())
         .onDrag { let selected = store.selectedClips; store.draggingIDs = selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]; store.dragStartedAt = Date(); if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
         // One click handler for both: a separate double-click gesture would make SwiftUI hold every single click for the

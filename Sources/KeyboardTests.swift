@@ -438,15 +438,17 @@ func runPreviewToggleTests(controller: Controller) async {
     let panel = controller.panel!
     var checks = 0
     var failures = 0
-    var closingObservations = 0
-    var synchronousCloses = 0
+    var blocked: String?
     var stage = "setup"
     func check(_ value: Bool, _ label: String) {
         checks += 1
         guard !value else { return }
         failures += 1
-        print("FAIL: preview-toggle stage=\(stage) check=\(label) closing=\(controller.previewClosing) popoverShown=\(controller.previewPopover?.isShown == true) tracked=\(controller.previewPopover != nil) active=\(NSApp.isActive) panelVisible=\(panel.isVisible) panelKey=\(panel.isKeyWindow) settings=\(store.settings) editorVisible=\(controller.editorWindow?.isVisible == true)")
+        print("FAIL: preview-toggle stage=\(stage) check=\(label) popoverShown=\(controller.previewPopover?.isShown == true) tracked=\(controller.previewPopover != nil) active=\(NSApp.isActive) frontmost=\(frontmost()) panelVisible=\(panel.isVisible) panelKey=\(panel.isKeyWindow) settings=\(store.settings) editorVisible=\(controller.editorWindow?.isVisible == true)")
         fflush(stdout)
+    }
+    func frontmost() -> Bool {
+        NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier
     }
     func pause(_ milliseconds: UInt64) async {
         try? await Task.sleep(nanoseconds: milliseconds * 1_000_000)
@@ -457,16 +459,11 @@ func runPreviewToggleTests(controller: Controller) async {
             await pause(20)
         }
     }
-    func send(_ type: NSEvent.EventType, code: UInt16 = 49, characters: String = " ", repeating: Bool = false) {
+    func send(_ type: NSEvent.EventType, code: UInt16 = 49, characters: String = " ", modifiers: NSEvent.ModifierFlags = [], repeating: Bool = false) {
         let window: NSWindow?
-        if controller.previewClosing {
-            window = panel.isVisible ? panel : nil
-        } else if let current = NSApp.keyWindow, current.isVisible {
-            window = current
-        } else {
-            window = panel.isVisible ? panel : nil
-        }
-        guard let window, let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [],
+        if let current = NSApp.keyWindow, current.isVisible { window = current }
+        else { window = panel.isVisible ? panel : nil }
+        guard let window, let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: modifiers,
             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
             context: nil, characters: characters, charactersIgnoringModifiers: characters,
             isARepeat: repeating, keyCode: code) else {
@@ -475,53 +472,62 @@ func runPreviewToggleTests(controller: Controller) async {
         }
         NSApp.sendEvent(event)
     }
-    func tap(_ code: UInt16 = 49, _ characters: String = " ") {
+    func tap(_ code: UInt16 = 49, _ characters: String = " ", modifiers: NSEvent.ModifierFlags = []) {
+        send(.keyDown, code: code, characters: characters, modifiers: modifiers)
+        send(.keyUp, code: code, characters: characters, modifiers: modifiers)
+    }
+    func hold(_ code: UInt16, _ characters: String) async {
         send(.keyDown, code: code, characters: characters)
+        for _ in 0..<4 { await pause(30); send(.keyDown, code: code, characters: characters, repeating: true) }
         send(.keyUp, code: code, characters: characters)
     }
-    func observeClose() {
-        if controller.previewClosing { closingObservations += 1 }
-        else { synchronousCloses += 1 }
-    }
+    func isOpen() -> Bool { controller.previewPopover?.isShown == true }
     func verifyOpen(_ expected: Bool, _ label: String) {
-        check(!controller.previewClosing && (controller.previewPopover?.isShown == true) == expected &&
-              (expected || controller.previewPopover == nil), label)
+        check(isOpen() == expected && (expected || controller.previewPopover == nil), label)
     }
-    func reset(_ name: String) async {
+    /// Starts a stage from a visible shelf that owns the keyboard. Popover display and window focus only mean something
+    /// while OpenPaste is the system's frontmost application. macOS may refuse activation to a process started without
+    /// user input: the non-activating shelf then still takes keys while another app stays frontmost, and hiding the
+    /// shelf or opening a window drops the app out of the foreground. That is reported as blocked by the environment and
+    /// stops the run, instead of failing every later stage.
+    func reset(_ name: String) async -> Bool {
         stage = name
-        controller.closePreview(animated: false)
+        controller.closePreview()
         controller.editorWindow?.close()
         if store.settings { controller.closeSettings() }
         controller.showShelf()
-        await waitUntil { NSApp.isActive && panel.isVisible && panel.isKeyWindow }
+        await waitUntil { frontmost() && NSApp.isActive && panel.isVisible && panel.isKeyWindow }
+        guard frontmost(), NSApp.isActive, panel.isVisible, panel.isKeyWindow else {
+            blocked = "stage=\(name) front=\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "none") active=\(NSApp.isActive) panelKey=\(panel.isKeyWindow)"
+            return false
+        }
         if let first = store.filtered.first { store.choose(first.id) }
         panel.makeFirstResponder(panel.contentView)
-        check(NSApp.isActive && panel.isKeyWindow, "shelf owns keyboard focus")
+        return true
     }
+    /// The state right after the last press must already be final (closing is immediate), and stay so once any late
+    /// callbacks from closed popovers have arrived.
     func settle(_ expected: Bool) async {
-        await pause(650)
-        verifyOpen(expected, "final preview state")
+        await pause(50)
+        verifyOpen(expected, "state is final right after the last press")
         let identity = controller.previewClipID
-        await pause(350)
+        await pause(400)
         verifyOpen(expected, "late close callbacks preserve final state")
         check(controller.previewClipID == identity, "late callbacks preserve preview identity")
     }
-    func pendingOpen(_ name: String) async {
-        await reset(name)
-        tap()
-        check(controller.previewPopover?.isShown == true, "first press opens native popover")
-        tap()
-        observeClose()
-        tap()
-    }
     defer {
-        controller.closePreview(animated: false)
+        controller.closePreview()
         controller.editorWindow?.close()
         controller.settingsWindow?.close()
         panel.orderOut(nil)
-        print("\(failures == 0 ? "PASS" : "FAIL"): preview-toggle summary checks=\(checks) failures=\(failures) nativeClosing=\(closingObservations) synchronousCloses=\(synchronousCloses)")
+        if let blocked {
+            print("BLOCKED: preview-toggle environment: OpenPaste is not the frontmost application, so the remaining stages were not run; \(blocked)")
+        }
+        let result = failures > 0 ? "FAIL" : (blocked != nil ? "BLOCKED" : "PASS")
+        print("\(result): preview-toggle summary checks=\(checks) failures=\(failures)")
         fflush(stdout)
-        NSApp.terminate(nil)
+        _ = controller.applicationShouldTerminate(NSApp)
+        exit(failures > 0 ? 1 : (blocked != nil ? 2 : 0))
     }
     guard store.ephemeral, !store.networkPreviews, store.archive.clips.count == 1_000,
           store.archive.clips.allSatisfy({ $0.kind == "文字" }) else {
@@ -548,71 +554,90 @@ func runPreviewToggleTests(controller: Controller) async {
     NSApp.activate()
     await pause(100)
 
+    // Every press toggles at once: an odd number of presses ends open, an even number closed, with no waiting.
     for interval: UInt64 in [30, 60, 100] {
         for count in [3, 4, 5] {
-            await reset("\(count)-press-\(interval)ms")
+            guard await reset("\(count)-press-\(interval)ms") else { return }
             for index in 0..<count {
                 if index > 0 { await pause(interval) }
                 tap()
-                if index == 1 { observeClose() }
+                check(isOpen() == (index % 2 == 0), "press \(index + 1) takes effect immediately")
             }
             await settle(count % 2 == 1)
         }
     }
 
-    await reset("held-space-opens-once")
+    // Held keys: repeats never take part in the toggle.
+    guard await reset("held-space-opens-once") else { return }
     send(.keyDown)
     for _ in 0..<4 { await pause(30); send(.keyDown, repeating: true) }
     verifyOpen(true, "repeat keyDown does not close opened preview")
     send(.keyUp)
     tap()
-    observeClose()
     await settle(false)
 
-    await reset("held-space-closes-once")
+    guard await reset("held-space-closes-once") else { return }
     tap()
-    send(.keyDown)
-    observeClose()
-    for _ in 0..<4 { await pause(30); send(.keyDown, repeating: true) }
-    send(.keyUp)
+    await hold(49, " ")
     await settle(false)
     tap()
     await settle(true)
 
-    await pendingOpen("pending-open-escape")
+    guard await reset("held-escape-closes-once") else { return }
+    tap()
+    await hold(53, "\u{1b}")
+    await settle(false)
+    check(panel.isVisible && panel.isKeyWindow, "held escape closes the preview without hiding the shelf")
+
+    guard await reset("escape-closes") else { return }
+    tap()
     tap(53, "\u{1b}")
     await settle(false)
-    check(panel.isVisible && panel.isKeyWindow, "escape cancels pending open without hiding shelf")
+    check(panel.isVisible && panel.isKeyWindow, "escape closes the preview without hiding the shelf")
 
-    await pendingOpen("pending-open-settings")
-    controller.openSettings()
-    await settle(false)
-    check(store.settings && controller.settingsWindow?.isKeyWindow == true && !panel.isVisible,
-          "late callbacks preserve settings focus")
+    // A late close callback from an earlier popover must not clear the newer one or take its focus.
+    guard await reset("stale-callback") else { return }
+    tap()
+    let old = controller.previewPopover
+    tap()
+    tap()
+    let current = controller.previewPopover
+    check(old != nil && current != nil && current !== old, "reopening creates a new preview")
+    let keyBefore = NSApp.keyWindow
+    if let old { controller.popoverDidClose(Notification(name: NSPopover.didCloseNotification, object: old)) }
+    await pause(100)
+    check(controller.previewPopover === current && isOpen(), "a stale close callback leaves the new preview open")
+    check(keyBefore != nil && NSApp.keyWindow === keyBefore, "a stale close callback does not move keyboard focus")
 
-    await pendingOpen("pending-open-hide")
-    controller.hideShelf()
-    await settle(false)
-    check(!panel.isVisible, "late callbacks leave shelf hidden")
-
-    await pendingOpen("pending-open-editor")
-    if let clip = store.filtered.first {
-        controller.edit(clip)
-        await settle(false)
-        check(controller.editorWindow?.isKeyWindow == true, "late callbacks preserve editor focus")
-    } else { check(false, "isolated edit fixture exists") }
-
-    await reset("closing-arrow-pending-open")
+    // The open preview follows the selection.
+    guard await reset("arrow-follows") else { return }
     let ids = store.filtered.prefix(2).map(\.id)
     guard ids.count == 2 else { check(false, "two isolated selection fixtures exist"); return }
     tap()
-    tap()
-    observeClose()
     tap(124, "\u{F703}")
+    await pause(100)
+    check(store.selected == ids[1] && controller.previewClipID == ids[1] && isOpen(), "the open preview follows the arrow selection")
+
+    // Hand-offs move focus to another window or away from the app, so they run last.
+    guard await reset("editor-after-close") else { return }
     tap()
-    await settle(true)
-    check(store.selected == ids[1] && controller.previewClipID == ids[1],
-          "pending open follows latest arrow selection")
-    print("Preview-toggle native close observations: asynchronous=\(closingObservations) synchronous=\(synchronousCloses)")
-    check(closingObservations > 0, "native animated close exposes the pending-input path")
+    tap()
+    if let clip = store.filtered.first {
+        controller.edit(clip)
+        await settle(false)
+        check(controller.editorWindow?.isKeyWindow == true, "late callbacks leave the editor focused")
+    } else { check(false, "isolated edit fixture exists") }
+
+    guard await reset("settings-closes") else { return }
+    tap()
+    controller.openSettings()
+    await settle(false)
+    check(store.settings && controller.settingsWindow?.isKeyWindow == true && !panel.isVisible,
+          "settings takes focus once the preview is closed")
+
+    guard await reset("hide-closes") else { return }
+    tap()
+    controller.hideShelf()
+    await settle(false)
+    check(!panel.isVisible, "hiding the shelf closes the preview and stays hidden")
 }

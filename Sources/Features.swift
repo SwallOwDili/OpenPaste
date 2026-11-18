@@ -218,7 +218,7 @@ extension Controller {
         window.title = title; window.level = NSWindow.Level(rawValue: panel.level.rawValue + 1); window.isReleasedWhenClosed = false; window.center(); window.delegate = self; return window
     }
     func showPreview(_ clip: Clip) {
-        closePreview(animated: false)
+        closePreview()
         let popover = NSPopover()
         popover.behavior = .applicationDefined
         popover.animates = true
@@ -234,41 +234,27 @@ extension Controller {
             popover.show(relativeTo: NSRect(x: content.bounds.midX, y: content.bounds.midY, width: 1, height: 1), of: content, preferredEdge: .maxY)
         }
         previewSelectionObserver = store.$selected.dropFirst().receive(on: DispatchQueue.main).sink { [weak self, weak popover] id in
-            guard let self, let popover, popover === self.previewPopover, !self.previewClosing,
+            guard let self, let popover, popover === self.previewPopover,
                   popover.isShown, let id, id != self.previewClipID else { return }
             self.updatePreview(to: id)
         }
     }
-    func closePreview(animated: Bool = true) {
-        previewReopenRequested = false
-        guard let popover = previewPopover, !animated || !previewClosing else { return }
-        previewSelectionObserver = nil
-        if popover.isShown {
-            previewClosing = true
-            popover.animates = animated
-            popover.close()
-            if animated { return }
-        }
+    /// Closes the preview at once. There is no closing animation: the native one takes about half a second, and a
+    /// Space press right after closing must bring the preview back immediately instead of waiting for it to finish.
+    func closePreview() {
+        guard let popover = previewPopover else { return }
+        if popover.isShown { popover.animates = false; popover.close() }
         finishPreviewClose(popover)
     }
     func popoverDidClose(_ notification: Notification) {
         guard let popover = notification.object as? NSPopover else { return }
         finishPreviewClose(popover)
     }
+    /// A late close callback from an earlier popover must neither clear a newer preview nor take focus back from it.
     private func finishPreviewClose(_ popover: NSPopover) {
         guard popover === previewPopover else { return }
-        let reopen = previewReopenRequested
-        previewReopenRequested = false
         previewSelectionObserver = nil
         previewPopover = nil; previewHost = nil; previewClipID = nil
-        previewClosing = false
-        // Consume the final toggle before another key event can see an intermediate closed state.
-        if reopen, panel.isVisible, NSApp.isActive, !store.settings,
-           !interactionState.hasModalInteraction, !interactionState.menuTracking,
-           editorWindow?.isVisible != true, let clip = store.selectedClips.first {
-            showPreview(clip)
-            return
-        }
         DispatchQueue.main.async { [weak self] in
             guard let self, self.previewPopover == nil else { return }
             self.restoreWorkingWindowFocus()
@@ -288,7 +274,7 @@ extension Controller {
         reanchorPreview(to: id)
         // The shelf scrolls the new card into view asynchronously; anchor again once it has.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak popover] in
-            guard let self, let popover, popover === self.previewPopover, !self.previewClosing,
+            guard let self, let popover, popover === self.previewPopover,
                   self.previewClipID == id else { return }
             self.reanchorPreview(to: id)
         }
