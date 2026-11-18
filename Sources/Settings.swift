@@ -264,6 +264,16 @@ struct SettingsPageView: View {
                     Button("恢复默认") { Controller.shared.cancelShortcutRecording(); store.shelfShortcuts = .standard }.buttonStyle(.link).font(.caption)
                 }
             }
+            group("选中效果") {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("方向键放大卡片")
+                        note("按 ← → 切换时，选中的卡片像 Dock 一样放大，两侧卡片逐级缩小；停手后恢复原大小。关闭时卡片大小不变。")
+                    }
+                    Spacer()
+                    Toggle("方向键放大卡片", isOn: $store.arrowKeyMagnification).labelsHidden().toggleStyle(.switch)
+                }
+            }
             group("历史记录") {
                 HStack { Text("记录条数"); Spacer(); Picker("记录条数", selection: Binding(get: { store.limit }, set: { store.limit = $0 })) { Text("不限制").tag(0); Text("500 条").tag(500); Text("1,000 条").tag(1000); Text("5,000 条").tag(5000); if store.limit > 5000 { Text("\(store.limit) 条").tag(store.limit) } }.labelsHidden().frame(width: 150) }
                 Divider()

@@ -31,15 +31,17 @@ func runTests() {
     preferences.set(77, forKey: "historyLimit")
     preferences.set(12, forKey: "retentionDays")
     preferences.set(false, forKey: "networkPreviews")
+    preferences.set(true, forKey: "arrowKeyMagnification")
     preferences.set("test.excluded", forKey: "ignoredApps")
     let preferencesBefore = preferences.persistentDomain(forName: preferencesSuiteName) ?? [:]
     let injectedDeviceID = UUID().uuidString
     let configured = Store(root: root.appendingPathComponent("isolated-preferences"), defaults: preferences, deviceID: injectedDeviceID)
     check(configured.storageLimitMB == 321 && configured.limit == 77 && configured.retentionDays == 12 && !configured.networkPreviews && configured.ignored == "test.excluded", "root-injected Store reads only its explicit configuration")
     check(configured.deviceIDForPersistence() == injectedDeviceID, "root-injected Store uses its injected sync device identity")
-    configured.ingest(clip("isolated preference save")); configured.limit = 76; configured.ignored = "changed.only.in.memory"; configured.retentionDays = 11; configured.flush()
+    check(configured.arrowKeyMagnification && !store.arrowKeyMagnification, "the arrow-key magnification is off by default and is read from the explicit defaults when set")
+    configured.ingest(clip("isolated preference save")); configured.limit = 76; configured.ignored = "changed.only.in.memory"; configured.retentionDays = 11; configured.arrowKeyMagnification = false; configured.flush()
     let ephemeralPreferences = Store(ephemeral: true, defaults: preferences, deviceID: UUID().uuidString)
-    ephemeralPreferences.limit = 75; ephemeralPreferences.ignored = "ephemeral.only"; ephemeralPreferences.retentionDays = 10
+    ephemeralPreferences.limit = 75; ephemeralPreferences.ignored = "ephemeral.only"; ephemeralPreferences.retentionDays = 10; ephemeralPreferences.arrowKeyMagnification = false
     let preferencesAfter = preferences.persistentDomain(forName: preferencesSuiteName) ?? [:]
     check(NSDictionary(dictionary: preferencesBefore).isEqual(NSDictionary(dictionary: preferencesAfter)), "root-injected and ephemeral Stores leave the explicit defaults domain unchanged")
     store.clearHistory(); check(store.archive.clips.count == 1, "clear keeps pinned clips")
@@ -185,6 +187,52 @@ func runTests() {
     currentDeletion.clearHistory()
     currentDeletion.capture(force: true, pasteboard: pb)
     check(currentDeletion.archive.clips.isEmpty, "clear history also suppresses unchanged current clipboard")
+    do {
+        let status = Store(ephemeral: true, deviceID: UUID().uuidString)
+        check(Store.translationDoneSeconds == 5, "the translation-finished hint stays for five seconds")
+        status.translationStatus = "翻译完成"; status.dismissTranslationStatus("翻译完成", after: 0.05)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        check(status.translationStatus.isEmpty, "the translation-finished hint is cleared after its delay")
+        status.translationStatus = "翻译完成"; status.dismissTranslationStatus("翻译完成", after: 0.05)
+        status.translationStatus = "翻译超时，请稍后重试"
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        check(status.translationStatus == "翻译超时，请稍后重试", "an older timer never clears a newer status message")
+        status.translationStatus = "翻译完成"; status.dismissTranslationStatus("翻译完成", after: 0.1)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.06))
+        status.translationStatus = "翻译完成"; status.dismissTranslationStatus("翻译完成", after: 0.25)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        check(status.translationStatus == "翻译完成", "a second identical message is not cleared by the first message's timer")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        check(status.translationStatus.isEmpty, "the second identical message is cleared by its own timer")
+        check(Store.translationNoticeSeconds == 8 && Store.translationNoticeSeconds > Store.translationDoneSeconds, "skipped, canceled and failed translation hints stay eight seconds")
+        status.showTranslationNotice("当前剪贴板无法完整暂存，已取消翻译", after: 0.05)
+        check(status.translationStatus == "当前剪贴板无法完整暂存，已取消翻译", "a translation notice is shown at once")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        check(status.translationStatus.isEmpty, "a canceled-translation notice clears itself instead of staying on the shelf")
+        status.showTranslationNotice("翻译超时，请稍后重试", after: 0.05); status.translationStatus = "正在翻译选中文字…"
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        check(status.translationStatus == "正在翻译选中文字…", "an old notice's timer never clears a translation in progress")
+    }
+    do {
+        let mark = MenuBarMark.image()
+        check(mark.isTemplate && mark.size == NSSize(width: 18, height: 18), "the menu-bar mark is an 18 pt template image")
+        let side = 36
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        mark.draw(in: NSRect(x: 0, y: 0, width: side, height: side))
+        NSGraphicsContext.restoreGraphicsState()
+        // Pixel (x, y) counts from the top-left; the artwork is drawn at 2x, so a point in the 18 pt artwork is doubled.
+        func alpha(_ x: Int, _ y: Int) -> CGFloat { rep.colorAt(x: x, y: y)?.alphaComponent ?? -1 }
+        check(alpha(7, 24) > 0.99, "the stem of the menu-bar P is solid")
+        check(alpha(18, 5) > 0.99, "the top bar of the menu-bar P is solid")
+        check(alpha(18, 12) < 0.01, "the counter of the menu-bar P is a hole (even-odd fill)")
+        check(alpha(28, 28) < 0.01 && alpha(0, 0) < 0.01 && alpha(side - 1, side - 1) < 0.01, "the area outside the menu-bar P is transparent")
+        var solid = 0
+        for y in 0..<side { for x in 0..<side where alpha(x, y) > 0.5 { solid += 1 } }
+        let share = Double(solid) / Double(side * side)
+        check(share > 0.25 && share < 0.55, "the menu-bar P covers a reasonable share of its slot (\(share))")
+    }
     print("\(passed) tests passed")
 }
 
@@ -240,11 +288,11 @@ func runNavigationTests() {
           BoardNavigation.next(from: boards[2], boards: boards, delta: 1) == .some(nil),
           BoardNavigation.next(from: nil, boards: boards, delta: -1) == .some(boards[2]),
           BoardNavigation.next(from: boards[1], boards: boards, delta: -1) == .some(boards[0]) else { print("FAIL: board cycling"); exit(1) }
-    guard HorizontalWheel.offset(current: 100, deltaX: 0, deltaY: -3, precise: false, contentWidth: 5000, viewportWidth: 1000) == 136,
-          HorizontalWheel.offset(current: 10, deltaX: 0, deltaY: 40, precise: true, contentWidth: 5000, viewportWidth: 1000) == 0,
-          HorizontalWheel.offset(current: 3990, deltaX: 0, deltaY: -50, precise: true, contentWidth: 5000, viewportWidth: 1000) == 4000,
-          HorizontalWheel.offset(current: 0, deltaX: 12, deltaY: 1, precise: true, contentWidth: 5000, viewportWidth: 1000) == nil,
-          HorizontalWheel.offset(current: 0, deltaX: 0, deltaY: 0, precise: false, contentWidth: 5000, viewportWidth: 1000) == nil else { print("FAIL: wheel conversion"); exit(1) }
+    guard HorizontalWheel.panDelta(deltaX: 0, deltaY: -3, precise: false) == -36,
+          HorizontalWheel.panDelta(deltaX: 0, deltaY: 40, precise: true) == 40,
+          HorizontalWheel.panDelta(deltaX: 12, deltaY: 1, precise: true) == 12,
+          HorizontalWheel.panDelta(deltaX: -2, deltaY: 0, precise: false) == -24,
+          HorizontalWheel.panDelta(deltaX: 0, deltaY: 0, precise: false) == nil else { print("FAIL: wheel conversion"); exit(1) }
     var labelled = clips[7]; labelled.userLabel = "Gamma 名称"
     store.archive.clips[7] = labelled
     store.query = "gamma 名称"
