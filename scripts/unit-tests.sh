@@ -10,7 +10,7 @@ scripts/prepare-test-scratch.sh "$arch"
 OPENPASTE_TESTING=1 swift build --manifest-cache none -c release --triple "${arch}-apple-macosx14.0" --scratch-path "$scratch" --product OpenPaste
 bin_dir="$(OPENPASTE_TESTING=1 swift build --manifest-cache none -c release --triple "${arch}-apple-macosx14.0" --scratch-path "$scratch" --show-bin-path)"
 app="$bin_dir/OpenPaste"
-for check in --maintenance-test --update-test --self-test --code-style-test --data-directory-test --paste-import-unit-test --shortcut-model-test --recording-pause-test --storage-recovery-test --permission-monitor-test --interaction-policy-test --content-editing-test --capture-boundary-test --filter-test --paste-queue-test --clipboard-write-test --current-clipboard-test --preview-cache-test --navigation-test --drag-provider-test --translation-config-test; do
+for check in --maintenance-test --update-test --self-test --code-style-test --rich-text-decode-test --data-directory-test --paste-import-unit-test --shortcut-model-test --recording-pause-test --storage-recovery-test --permission-monitor-test --interaction-policy-test --content-editing-test --capture-boundary-test --filter-test --paste-queue-test --clipboard-write-test --current-clipboard-test --preview-cache-test --navigation-test --drag-provider-test --translation-config-test; do
     "$app" "$check"
 done
 # Translation checks use fake credentials and a localhost fixture, never your API.

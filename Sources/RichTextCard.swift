@@ -72,9 +72,32 @@ final class RichTextCache {
 
 /// Prepares attributed text for display on a light page.
 enum RichTextRendering {
+    /// Replaces runs whose font resolved to LastResort, the system's placeholder font that draws
+    /// every character as a boxed glyph (issue #22: code copied from VSCode). LastResort reports a
+    /// glyph for every character, so a glyph-coverage check cannot catch it; it is matched by name.
+    /// A document made only of LastResort runs, or whose other runs are fixed-pitch, gets the
+    /// monospaced system font; otherwise the system font. Colours, links and paragraph styles stay.
+    /// Returns the same object when nothing needs replacing.
+    static func repairingFonts(_ source: NSAttributedString) -> NSAttributedString {
+        let full = NSRange(location: 0, length: source.length)
+        var broken: [(NSRange, CGFloat)] = []
+        var proportional = false
+        source.enumerateAttribute(.font, in: full) { value, range, _ in
+            guard let font = value as? NSFont else { return }
+            if font.fontName.hasPrefix("LastResort") { broken.append((range, font.pointSize)) }
+            else if !font.isFixedPitch { proportional = true }
+        }
+        guard !broken.isEmpty else { return source }
+        let result = NSMutableAttributedString(attributedString: source)
+        for (range, size) in broken {
+            let font = proportional ? NSFont.systemFont(ofSize: size) : NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+            result.addAttribute(.font, value: font, range: range)
+        }
+        return result
+    }
     /// Scales fonts, keeps paragraph spacing, and gives unstyled runs black text so they stay legible in dark mode.
     static func prepare(_ source: NSAttributedString, scale: CGFloat, limit: Int = 30_000) -> NSAttributedString {
-        let trimmed = source.length > limit ? source.attributedSubstring(from: NSRange(location: 0, length: limit)) : source
+        let trimmed = repairingFonts(source.length > limit ? source.attributedSubstring(from: NSRange(location: 0, length: limit)) : source)
         let result = NSMutableAttributedString(attributedString: trimmed)
         let full = NSRange(location: 0, length: result.length)
         result.enumerateAttribute(.font, in: full) { value, range, _ in

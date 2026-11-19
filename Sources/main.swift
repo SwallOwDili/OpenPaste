@@ -1847,6 +1847,8 @@ if CommandLine.arguments.contains("--interaction-policy-test") {
     runDataDirectoryTests()
 } else if CommandLine.arguments.contains("--code-style-test") {
     runCodeStyleTests()
+} else if CommandLine.arguments.contains("--rich-text-decode-test") {
+    runRichTextDecodingTests()
 } else if CommandLine.arguments.contains("--translation-config-test") {
     runTranslationConfigTests()
 } else if CommandLine.arguments.contains("--translation-test") {
