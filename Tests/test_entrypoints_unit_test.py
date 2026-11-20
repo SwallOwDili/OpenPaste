@@ -26,6 +26,7 @@ REQUIRED_HEADLESS_CHECKS = {
     '--permission-monitor-test',
     '--preview-cache-test',
     '--recording-pause-test',
+    '--rich-text-decode-test',
     '--storage-recovery-test',
     '--self-test',
     '--shortcut-model-test',
