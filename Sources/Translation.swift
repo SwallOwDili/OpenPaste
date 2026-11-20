@@ -141,6 +141,43 @@ enum SelectionCapturePolicy {
     static func isFileSelection(types: [NSPasteboard.PasteboardType]) -> Bool {
         types.contains { $0 == .fileURL || $0.rawValue == "NSFilenamesPboardType" || $0.rawValue == "com.apple.pasteboard.promised-file-url" }
     }
+    static let chromiumCustomDataType = NSPasteboard.PasteboardType("org.chromium.web-custom-data")
+    static let monacoEditorDataType = NSPasteboard.PasteboardType("vscode-editor-data")
+    /// Chromium's custom clipboard data: a pickle (UInt32 payload size, UInt32 count, then that many
+    /// type/value pairs of length-prefixed UTF-16LE strings, each padded to 4 bytes). Malformed data yields
+    /// the pairs read so far.
+    static func chromiumCustomData(_ data: Data) -> [String: String] {
+        let bytes = [UInt8](data)
+        var offset = 4
+        func uint32() -> Int? {
+            guard offset + 4 <= bytes.count else { return nil }
+            let value = Int(bytes[offset]) | Int(bytes[offset + 1]) << 8 | Int(bytes[offset + 2]) << 16 | Int(bytes[offset + 3]) << 24
+            offset += 4
+            return value
+        }
+        func string16() -> String? {
+            guard let units = uint32(), units <= (bytes.count - offset) / 2 else { return nil }
+            let text = String(bytes: bytes[offset..<offset + units * 2], encoding: .utf16LittleEndian)
+            offset += (units * 2 + 3) & ~3
+            return text
+        }
+        var result: [String: String] = [:]
+        guard let count = uint32(), count <= 256 else { return result }
+        for _ in 0..<count {
+            guard let type = string16(), let value = string16() else { break }
+            result[type] = value
+        }
+        return result
+    }
+    /// Monaco editors (VS Code, Cursor and others) copy the whole current line when nothing is selected, and mark
+    /// that copy with `"isFromEmptySelection": true`. Such a copy is not a selection and must not be translated.
+    static func isEmptySelectionLineCopy(customData: Data?, editorData: String?) -> Bool {
+        let candidates = [customData.flatMap { chromiumCustomData($0)[monacoEditorDataType.rawValue] }, editorData].compactMap { $0 }
+        return candidates.contains { json in
+            guard let data = json.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+            return object["isFromEmptySelection"] as? Bool == true
+        }
+    }
 }
 
 extension Controller {
@@ -234,6 +271,9 @@ extension Controller {
                 let copied = pb.string(forType: .string)
                 let confidential = pb.types?.contains(where: { $0.rawValue.contains("Concealed") || $0.rawValue.contains("confidential") || $0.rawValue.contains("Transient") }) == true
                 let fileSelection = SelectionCapturePolicy.isFileSelection(types: pb.types ?? [])
+                let emptySelectionCopy = SelectionCapturePolicy.isEmptySelectionLineCopy(
+                    customData: pb.data(forType: SelectionCapturePolicy.chromiumCustomDataType),
+                    editorData: pb.string(forType: SelectionCapturePolicy.monacoEditorDataType))
                 guard pb.changeCount == copiedChangeCount else {
                     failSelectionCapture("剪贴板已被其他内容更新，已取消翻译")
                     return
@@ -269,6 +309,8 @@ extension Controller {
                 self.activateShelf()
                 endSelectionCapture()
                 if fileSelection { self.store.showTranslationNotice("选中的是文件，已跳过翻译"); return }
+                // Nothing was selected: the editor copied the current line. Behave like an empty selection.
+                if emptySelectionCopy { return }
                 if !confidential, let copied, !copied.isEmpty { self.translateSelection(copied) }
             }
         }
