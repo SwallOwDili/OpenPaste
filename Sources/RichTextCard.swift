@@ -72,6 +72,8 @@ final class RichTextCache {
 
 /// Prepares attributed text for display on a light page.
 enum RichTextRendering {
+    static let appearance = NSAppearance(named: .aqua)
+
     /// Replaces runs whose font resolved to LastResort, the system's placeholder font that draws
     /// every character as a boxed glyph (issue #22: code copied from VSCode). LastResort reports a
     /// glyph for every character, so a glyph-coverage check cannot catch it; it is matched by name.
@@ -95,7 +97,7 @@ enum RichTextRendering {
         }
         return result
     }
-    /// Scales fonts, keeps paragraph spacing, and gives unstyled runs black text so they stay legible in dark mode.
+    /// Prepares a display copy. Clipboard export uses the original representations.
     static func prepare(_ source: NSAttributedString, scale: CGFloat, limit: Int = 30_000) -> NSAttributedString {
         let trimmed = repairingFonts(source.length > limit ? source.attributedSubstring(from: NSRange(location: 0, length: limit)) : source)
         let result = NSMutableAttributedString(attributedString: trimmed)
@@ -110,11 +112,49 @@ enum RichTextRendering {
                 if value == nil { result.addAttribute(.font, value: NSFont.systemFont(ofSize: 13 * scale), range: range) }
             }
         }
-        result.enumerateAttribute(.foregroundColor, in: full) { value, range, _ in
-            if value == nil { result.addAttribute(.foregroundColor, value: NSColor.black, range: range) }
+        let adjustColors = {
+            trimmed.enumerateAttributes(in: full) { attributes, range, _ in
+                if let color = readableForeground(for: attributes) {
+                    result.addAttribute(.foregroundColor, value: color, range: range)
+                }
+            }
         }
+        if let appearance { appearance.performAsCurrentDrawingAppearance(adjustColors) }
+        else { adjustColors() }
         return result
     }
+
+    private static func readableForeground(for attributes: [NSAttributedString.Key: Any]) -> NSColor? {
+        var background = SIMD3<Double>(repeating: 1)
+        if let paragraph = attributes[.paragraphStyle] as? NSParagraphStyle {
+            for block in paragraph.textBlocks { background = composite(block.backgroundColor, over: background) }
+        }
+        background = composite(attributes[.backgroundColor] as? NSColor, over: background)
+
+        let originalColor = attributes[.foregroundColor] as? NSColor
+        let foreground = luminance(composite(originalColor ?? .black, over: background))
+        let backdrop = luminance(background)
+        let contrast = (max(foreground, backdrop) + 0.05) / (min(foreground, backdrop) + 0.05)
+        if contrast >= 4.5 { return originalColor == nil ? .black : nil }
+        let blackContrast = (backdrop + 0.05) / 0.05
+        let whiteContrast = 1.05 / (backdrop + 0.05)
+        return whiteContrast > blackContrast ? .white : .black
+    }
+
+    private static func composite(_ color: NSColor?, over background: SIMD3<Double>) -> SIMD3<Double> {
+        guard let rgb = color?.usingColorSpace(.sRGB) else { return background }
+        let foreground = SIMD3(Double(rgb.redComponent), Double(rgb.greenComponent), Double(rgb.blueComponent))
+        let opacity = Double(rgb.alphaComponent)
+        return foreground * opacity + background * (1 - opacity)
+    }
+
+    private static func luminance(_ color: SIMD3<Double>) -> Double {
+        func linear(_ value: Double) -> Double {
+            value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(color.x) + 0.7152 * linear(color.y) + 0.0722 * linear(color.z)
+    }
+
     /// Plain text styled like a document page.
     static func plain(_ text: String, size: CGFloat) -> NSAttributedString {
         let style = NSMutableParagraphStyle(); style.lineSpacing = 3; style.paragraphSpacing = 6
@@ -166,7 +206,7 @@ struct RichTextView: NSViewRepresentable {
         scroll.drawsBackground = false; scroll.borderType = .noBorder
         scroll.hasVerticalScroller = scrolls; scroll.hasHorizontalScroller = false
         scroll.scrollerStyle = .overlay; scroll.autohidesScrollers = true
-        scroll.appearance = NSAppearance(named: .aqua)
+        scroll.appearance = RichTextRendering.appearance
         let view = NSTextView()
         view.isEditable = false; view.isSelectable = scrolls
         view.drawsBackground = false

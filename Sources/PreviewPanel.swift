@@ -152,7 +152,7 @@ struct FullItemPreview: View {
             }
             else if clip.kind == "文字", CodeSyntax.language(clip.text) != nil { FullCodePreview(text: clip.text) }
             else {
-                RichTextView(text: pageText(clip), identity: clip.id.uuidString + clip.fingerprint, inset: NSSize(width: 26, height: 22))
+                RichTextView(text: Self.pageText(clip), identity: clip.id.uuidString + clip.fingerprint, inset: NSSize(width: 26, height: 22))
                     .background(Color.white)
             }
         }
@@ -161,7 +161,7 @@ struct FullItemPreview: View {
     }
 
     /// Rich clips keep their own typography (shown a little larger); plain text gets a readable document style.
-    private func pageText(_ clip: Clip) -> NSAttributedString {
+    static func pageText(_ clip: Clip) -> NSAttributedString {
         if RichTextCache.hasRichPart(clip), CodeSyntax.language(clip.text) == nil {
             // Only the preview is truncated: parsing a huge HTML-only clip here would block the main thread,
             // while pasting, editing and merging keep the full rich content.
