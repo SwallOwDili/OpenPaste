@@ -334,22 +334,49 @@ extension Controller {
         if let first = store.filtered.first { store.choose(first.id) }
         panel.makeFirstResponder(panel.contentView)
     }
+    func setSearchExpanded(_ expanded: Bool) {
+        guard store.searchExpanded != expanded else { return }
+        let animation: Animation? = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .smooth(duration: 0.24)
+        withAnimation(animation) { store.searchExpanded = expanded }
+    }
+    func focusSearch() {
+        setSearchExpanded(true)
+        if !store.searchFocused { store.searchFocused = true }
+    }
+    func closeSearch(preserveDateRange: Bool = false) {
+        pendingSearchKeys.removeAll()
+        store.resetFilters(preserveBoard: true, preserveDateRange: preserveDateRange)
+        store.filtersExpanded = false
+        store.searchFocused = false
+        setSearchExpanded(false)
+        panel.makeFirstResponder(panel.contentView)
+    }
     /// Starts a search from a typed key without consuming it: the key events are held
     /// until the field is first responder, then replayed so input methods compose normally.
     func beginTypeToSearch(_ event: NSEvent) {
         pendingSearchKeys.append(event)
-        store.searchFocused = true
+        focusSearch()
         guard pendingSearchKeys.count == 1 else { return }
         pendingSearchAttempts = 0
         flushPendingSearchKeys()
     }
+    @discardableResult
+    func replayPendingSearchKeys() -> Bool {
+        guard !pendingSearchKeys.isEmpty, panel.firstResponder is NSTextView else { return false }
+        let events = pendingSearchKeys
+        pendingSearchKeys.removeAll()
+        for event in events { panel.sendEvent(event) }
+        return true
+    }
     private func flushPendingSearchKeys() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
             guard let self, !self.pendingSearchKeys.isEmpty else { return }
-            if self.panel.firstResponder is NSTextView {
-                let events = self.pendingSearchKeys; self.pendingSearchKeys.removeAll()
-                for event in events { self.panel.sendEvent(event) }
-            } else if self.pendingSearchAttempts < 30 {
+            guard self.panel.isVisible, self.store.searchExpanded, self.store.searchFocused else {
+                self.pendingSearchKeys.removeAll()
+                return
+            }
+            if self.replayPendingSearchKeys() { return }
+            if self.pendingSearchAttempts < 30 {
                 self.pendingSearchAttempts += 1; self.flushPendingSearchKeys()
             } else {
                 let text = self.pendingSearchKeys.compactMap(\.characters).joined(); self.pendingSearchKeys.removeAll()
