@@ -190,8 +190,31 @@ func runKeyboardTests(controller: Controller) async {
     send(16, "y")
     await waitUntil { store.query == "xy" }
     check(store.query == "xy" && panel.firstResponder is NSTextView, "typing from the list lands in the search field in order, after the debounce")
-    store.resetFilters(); store.searchFocused = false; store.searchExpanded = false
-    panel.makeFirstResponder(panel.contentView)
+    send(53, "\u{1B}")
+    check(panel.isVisible && !store.searchExpanded && store.query.isEmpty, "Escape collapses search and clears the query while leaving the shelf open")
+    await drain()
+
+    send(3, "f", modifiers: .command)
+    send(7, "x")
+    send(16, "y")
+    await waitUntil { store.query == "xy" }
+    check(store.query == "xy", "typing immediately after Command-F keeps both keys in order during expansion")
+    send(53, "\u{1B}")
+    await drain()
+
+    send(7, "x")
+    send(53, "\u{1B}")
+    try? await Task.sleep(nanoseconds: 350_000_000)
+    check(panel.isVisible && !store.searchExpanded && store.query.isEmpty && controller.pendingSearchKeys.isEmpty,
+          "Escape during expansion cancels queued keys and leaves the shelf open")
+
+    send(3, "f", modifiers: .command)
+    send(3, "f", modifiers: .command)
+    check(store.searchExpanded && store.filtersExpanded, "a second Command-F can open filters during search expansion")
+    send(53, "\u{1B}")
+    check(store.searchExpanded && !store.filtersExpanded, "the first Escape closes filters")
+    send(53, "\u{1B}")
+    check(panel.isVisible && !store.searchExpanded && !(panel.firstResponder is NSTextView), "the second Escape returns focus to the shelf")
     await drain()
 
     // Issue #10: board switching with the default shortcuts.

@@ -254,6 +254,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                 }
             }
             guard !self.modalShowing, self.panel.isKeyWindow, !self.store.settings else { return event }
+            if self.store.searchFocused { self.replayPendingSearchKeys() }
             if let editor = self.panel.firstResponder as? NSTextView, editor.hasMarkedText() { return event }
             if self.store.renamingID != nil {
                 if event.keyCode == 53 { self.cancelInlineRename(); return nil }
@@ -264,11 +265,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                 // hide the shelf.
                 if event.isARepeat { return nil }
                 if self.store.filtersExpanded { withFilterCardAnimation { self.store.filtersExpanded = false } }
-                else if self.store.searchExpanded {
-                    self.store.resetFilters(preserveBoard: true); self.store.filtersExpanded = false
-                    self.store.searchFocused = false; self.store.searchExpanded = false
-                    self.panel.makeFirstResponder(self.panel.contentView)
-                } else { self.hideShelf() }
+                else if self.store.searchExpanded { self.closeSearch() }
+                else { self.hideShelf() }
                 return nil
             }
             if event.keyCode == 51, [NSEvent.ModifierFlags.command, [.command, .shift]].contains(event.modifierFlags.intersection([.command, .option, .control, .shift])) {
@@ -300,11 +298,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                     if !event.isARepeat { self.showPreview(clip) }
                     return nil
                 }
-                if event.keyCode == 48 { self.store.searchFocused = true; return nil }
+                if event.keyCode == 48 { self.focusSearch(); return nil }
                 if !event.modifierFlags.intersection([.command, .control, .option]).isEmpty { }
                 else if let chars = event.characters, !chars.isEmpty, chars.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }), ![36,49,123,124,125,126,48,53,51,117].contains(event.keyCode) { self.beginTypeToSearch(event); return nil }
             } else if event.keyCode == 48 || event.keyCode == 125 { self.store.searchFocused = false; self.panel.makeFirstResponder(self.panel.contentView); return nil }
-            if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" { if self.store.searchExpanded { withFilterCardAnimation { self.store.filtersExpanded.toggle() } }; self.store.searchFocused = true; return nil }
+            if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" {
+                if self.store.searchExpanded { withFilterCardAnimation { self.store.filtersExpanded.toggle() } }
+                self.focusSearch()
+                return nil
+            }
             let quick = self.store.shelfShortcuts.quickPasteMatch(event.modifierFlags)
             if quick.matches, let n = Int(event.charactersIgnoringModifiers ?? ""), n >= 1, n <= 9, self.store.filtered.count >= n { self.paste(self.store.filtered[n - 1], plain: quick.plain); return nil }
             if event.keyCode == 36 || event.keyCode == 76, let clip = self.store.filtered.first(where: { $0.id == self.store.selected }) ?? self.store.filtered.first { self.pasteSelection(fallback: clip, plain: self.store.shelfShortcuts.isPlain(event.modifierFlags)); return nil }
@@ -490,6 +492,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         if TestMode.ui { target = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.SwallOwDili.OpenPaste.fixture").first }
         if TestMode.ui { print("UI show target: \(target?.bundleIdentifier ?? "none")"); fflush(stdout) }
         pasteGeneration += 1
+        pendingSearchKeys.removeAll()
         store.resetFilters(); store.filtersExpanded = false
         if !preview, AppEnvironment.current.defaults.bool(forKey: "recordingAccepted") { store.capture(force: true) }
         refreshPermission()
@@ -1179,6 +1182,7 @@ struct ShelfView: View {
     /// frame; only the strip observes it.
     let driver: FocusDriver
     @FocusState private var searchFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Text typed in the field; committed to the store after a short pause so large
     /// histories are not re-filtered per keystroke or during input-method composition.
     @State private var draftQuery = ""
@@ -1190,23 +1194,7 @@ struct ShelfView: View {
                 .gesture(DragGesture().onChanged { value in if resizeStart == nil { resizeStart = Controller.shared.panel.frame.height }; Controller.shared.resizeShelf((resizeStart ?? 300) - value.translation.height) }.onEnded { _ in resizeStart = nil })
             HStack(spacing: 12) {
                 Spacer(minLength: 0)
-                if !store.searchExpanded {
-                Button { store.searchExpanded.toggle(); store.searchFocused = store.searchExpanded; if !store.searchExpanded { resetSearch() } } label: { Image(systemName: "magnifyingglass").font(.system(size: 15)).foregroundStyle(.secondary) }.buttonStyle(.plain).help("搜索 · ⌘F")
-                }
-                if store.searchExpanded {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(searchFocused ? Color.blue : Color.secondary)
-                    TextField("搜索文字、链接或来源", text: $draftQuery).textFieldStyle(.plain).focused($searchFocused).frame(width: 190)
-                    if !draftQuery.isEmpty { Button { draftQuery = ""; store.query = ""; store.searchFocused = true } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain).help("清空搜索") }
-                    else { Text("⌘F").font(.system(size: 10)).foregroundStyle(.tertiary).frame(height: 14) }
-                    Text(store.paused ? store.recordingPauseControl.status : (store.query.isEmpty && !store.filtersActive ? "\(store.filtered.count) 条" : "\(store.filtered.count) 条结果"))
-                        .font(.system(size: 11)).foregroundStyle(store.paused ? Color.orange : Color.secondary).lineLimit(1).fixedSize()
-                    filterButton
-                    Button { resetSearch(); store.searchExpanded = false; store.searchFocused = false; Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) } label: { Image(systemName: "xmark").font(.system(size: 10)).foregroundStyle(.secondary) }.buttonStyle(.plain).help("退出搜索 · Esc")
-                }.padding(.horizontal, 12).padding(.vertical, 7)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(searchFocused ? Color.blue.opacity(0.65) : Color.primary.opacity(0.1)))
-                }
+                searchControl
                 tab("历史", icon: "clock.arrow.circlepath", active: store.board == nil) { store.board = nil }
                 ForEach(store.archive.boards) { board in
                     Button { store.board = board.id } label: {
@@ -1292,10 +1280,10 @@ struct ShelfView: View {
         }
         .onChange(of: draftQuery) { _, value in
             queryCommit?.cancel()
-            guard value != store.query else { return }
+            guard store.searchExpanded, value != store.query else { return }
             if value.isEmpty { store.query = value; return }
             let work = DispatchWorkItem { [weak store] in
-                guard let store else { return }
+                guard let store, store.searchExpanded else { return }
                 // Wait until the input method has committed its marked text.
                 if let editor = Controller.shared?.panel.firstResponder as? NSTextView, editor.hasMarkedText() { return }
                 store.query = value
@@ -1303,9 +1291,19 @@ struct ShelfView: View {
             queryCommit = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
         }
+        .onChange(of: store.searchExpanded) { _, expanded in
+            if !expanded {
+                queryCommit?.cancel()
+                draftQuery = store.query
+            }
+        }
         .onChange(of: store.searchFocused) { _, focused in
-            if focused { store.searchExpanded = true; DispatchQueue.main.async { searchFocused = true } }
-            else {
+            if focused {
+                DispatchQueue.main.async {
+                    guard store.searchFocused && store.searchExpanded else { return }
+                    searchFocused = true
+                }
+            } else {
                 searchFocused = false
                 // Pressing the filter button blurs the field before the mouse is released. Collapsing at once would remove the
                 // button mid-click, so the empty search is only closed if it is still idle shortly afterwards.
@@ -1317,10 +1315,70 @@ struct ShelfView: View {
         .onChange(of: searchFocused) { _, focused in if store.searchFocused != focused { store.searchFocused = focused } }
 
     }
+    private var searchControl: some View {
+        let expanded = store.searchExpanded
+        let shape = RoundedRectangle(cornerRadius: 10)
+        let accent = reduceMotion ? nil : Animation.easeOut(duration: 0.14)
+        let count = store.filtered.count
+        let countLabel = store.query.isEmpty && !store.filtersActive ? "\(count) 条" : "\(count) 条结果"
+        let status = store.paused ? store.recordingPauseControl.status : countLabel
+        let widestStatus = store.paused ? status : "\(store.archive.clips.count) 条结果"
+        return SearchControlLayout(expansion: expanded ? 1 : 0) {
+            Button { Controller.shared.focusSearch() } label: {
+                Image(systemName: "magnifyingglass").font(.system(size: 15))
+                    .foregroundStyle(searchFocused ? Color.blue : Color.secondary)
+                    .frame(height: 28).contentShape(Rectangle())
+                    .animation(accent, value: searchFocused)
+            }
+            .buttonStyle(.plain).help("搜索 · ⌘F")
+            .allowsHitTesting(!expanded).accessibilityHidden(expanded)
+            HStack(spacing: 8) {
+                TextField("搜索文字、链接或来源", text: $draftQuery)
+                    .textFieldStyle(.plain).focused($searchFocused).frame(width: 190)
+                Group {
+                    if draftQuery.isEmpty {
+                        Text("⌘F").font(.system(size: 10)).foregroundStyle(.tertiary)
+                            .transition(.opacity)
+                    } else {
+                        Button {
+                            draftQuery = ""; store.query = ""; Controller.shared.focusSearch()
+                        } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
+                            .buttonStyle(.plain).help("清空搜索").transition(.opacity)
+                    }
+                }
+                .frame(width: 20, height: 14)
+                .animation(accent, value: draftQuery.isEmpty)
+                ZStack(alignment: .trailing) {
+                    Text(widestStatus).hidden()
+                    Text(status)
+                }
+                .font(.system(size: 11)).monospacedDigit()
+                .foregroundStyle(store.paused ? Color.orange : Color.secondary).lineLimit(1).fixedSize()
+                filterButton
+                Button { Controller.shared.closeSearch(preserveDateRange: true) } label: {
+                    Image(systemName: "xmark").font(.system(size: 10)).foregroundStyle(.secondary)
+                }.buttonStyle(.plain).help("退出搜索 · Esc")
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            .opacity(expanded ? 1 : 0)
+            .disabled(!expanded).allowsHitTesting(expanded).accessibilityHidden(!expanded)
+        }
+        .background { shape.fill(Color(nsColor: .controlBackgroundColor)).opacity(expanded ? 1 : 0) }
+        .overlay {
+            shape.strokeBorder(searchFocused ? Color.blue.opacity(0.65) : Color.primary.opacity(0.1))
+                .animation(accent, value: searchFocused)
+                .opacity(expanded ? 1 : 0)
+                .allowsHitTesting(false)
+        }
+        .clipShape(shape)
+        .contentShape(Rectangle())
+    }
     /// Closes the search field shortly, if by then it is still empty, unfocused and no filter or filter card is open.
     private func collapseIdleSearchSoon() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [store] in
-            if !store.searchFocused && !store.filtersExpanded && store.query.isEmpty && !store.filtersActive { store.searchExpanded = false }
+            if !store.searchFocused && !store.filtersExpanded && store.query.isEmpty && !store.filtersActive {
+                Controller.shared.setSearchExpanded(false)
+            }
         }
     }
     /// Index of the selected card in the visible results (0 when nothing is selected).
@@ -1392,7 +1450,7 @@ struct ShelfView: View {
                 .font(.system(size: 14)).foregroundStyle(store.filtersActive ? Color.blue : Color.secondary)
                 .frame(width: 22, height: 22).contentShape(Rectangle())
         }.buttonStyle(.plain).help("筛选 · ⌘F")
-        .anchorPreference(key: FunnelAnchorKey.self, value: .bounds) { $0 }
+        .anchorPreference(key: FunnelAnchorKey.self, value: .bounds) { store.searchExpanded ? $0 : nil }
     }
     /// The filter card hangs under the funnel button with a small caret pointing at it; a click anywhere else closes it.
     private func filterLayer(_ anchor: Anchor<CGRect>?) -> some View {
@@ -1493,9 +1551,34 @@ struct ShelfView: View {
         // The Dock effect belongs to the arrow keys only: clicks, search and board switches leave the cards at full size.
         driver.move(to: index, keyboard: byKeyboard, magnify: byKeyboard && store.arrowKeyMagnification)
     }
-    func resetSearch() { store.resetFilters(preserveBoard: true, preserveDateRange: true) }
     func tab(_ name: String, icon: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) { Label(name, systemImage: icon).font(.system(size: 13, weight: .medium)).padding(.horizontal, 10).padding(.vertical, 6).background(active ? Color.primary.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 8)).foregroundStyle(Color.primary) }.buttonStyle(.plain)
+    }
+}
+
+private struct SearchControlLayout: Layout {
+    var expansion: CGFloat
+    private let inset: CGFloat = 12
+    private let spacing: CGFloat = 8
+    private var progress: CGFloat { min(max(expansion, 0), 1) }
+
+    var animatableData: CGFloat {
+        get { expansion }
+        set { expansion = newValue }
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let icon = subviews[0].sizeThatFits(.unspecified)
+        let controls = subviews[1].sizeThatFits(.unspecified)
+        return CGSize(width: icon.width + (controls.width + spacing + inset * 2) * progress,
+                      height: max(icon.height, controls.height + 14))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let iconWidth = subviews[0].sizeThatFits(.unspecified).width
+        let x = bounds.minX + inset * progress
+        subviews[0].place(at: CGPoint(x: x, y: bounds.midY), anchor: .leading, proposal: .unspecified)
+        subviews[1].place(at: CGPoint(x: x + iconWidth + spacing, y: bounds.midY), anchor: .leading, proposal: .unspecified)
     }
 }
 func boardColor(_ name: String?) -> Color {
