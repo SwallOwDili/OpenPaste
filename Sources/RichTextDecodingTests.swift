@@ -1,6 +1,6 @@
 import AppKit
 
-/// Issue #22: rich text whose font resolves to LastResort draws every character as a boxed "?".
+/// Covers rich text font, contrast, and pasteboard export behavior.
 /// Uses only fixtures and uniquely named pasteboards; never touches the general pasteboard.
 func runRichTextDecodingTests() {
     var checks = 0
@@ -78,6 +78,58 @@ func runRichTextDecodingTests() {
     check(rtf != nil && !hasLastResort(rtf!), "merged paste RTF carries no LastResort font")
     check(String(data: board.data(forType: .rtf) ?? Data(), encoding: .ascii)?.contains("LastResort") == false, "merged paste RTF font table does not name LastResort")
 
+    let contrastText = "OpenPaste contrast test"
+    let whiteRTF = Data(#"{\rtf1\ansi\deff0{\fonttbl{\f0 Helvetica;}}{\colortbl;\red255\green255\blue255;}\f0\fs26\b\cf1 OpenPaste contrast test}"#.utf8)
+    let whiteHTML = Data("<strong style=\"color: #fff\">\(contrastText)</strong>".utf8)
+    var white = clip(whiteHTML, text: contrastText)
+    white.parts[0].append(ClipPart(type: NSPasteboard.PasteboardType.rtf.rawValue, data: whiteRTF))
+    func foreground(_ text: NSAttributedString, at index: Int = 0) -> NSColor? {
+        (text.attribute(.foregroundColor, at: index, effectiveRange: nil) as? NSColor)?.usingColorSpace(.sRGB)
+    }
+    let black = NSColor.black.usingColorSpace(.sRGB)
+    let opaqueWhite = NSColor.white.usingColorSpace(.sRGB)
+    let originalWhite = white.attributedText
+    check(foreground(originalWhite) == opaqueWhite, "issue #29 fixture imports opaque white")
+    for (view, display) in [("history card", RichTextRendering.prepare(originalWhite, scale: 1)),
+                            ("full preview", FullItemPreview.pageText(white))] {
+        check(foreground(display) == black && display.string == contrastText, "white RTF is readable in the \(view)")
+        check(fonts(display).first?.fontDescriptor.symbolicTraits.contains(.bold) == true, "the \(view) keeps bold text")
+    }
+    let htmlOnly = clip(whiteHTML, text: contrastText).attributedText
+    check(foreground(htmlOnly) == opaqueWhite && foreground(RichTextRendering.prepare(htmlOnly, scale: 1)) == black, "white HTML is corrected for display too")
+
+    let mixedColors = NSMutableAttributedString(string: "abcdef", attributes: [.foregroundColor: NSColor.white])
+    let navy = NSColor(srgbRed: 0.1, green: 0.2, blue: 0.5, alpha: 1)
+    let link = URL(string: "https://example.com")!
+    mixedColors.addAttribute(.backgroundColor, value: NSColor.black, range: NSRange(location: 1, length: 1))
+    mixedColors.addAttributes([.foregroundColor: navy, .link: link], range: NSRange(location: 2, length: 1))
+    mixedColors.addAttribute(.foregroundColor, value: NSColor.black.withAlphaComponent(0.1), range: NSRange(location: 3, length: 1))
+    mixedColors.addAttribute(.backgroundColor, value: NSColor.black.withAlphaComponent(0.25), range: NSRange(location: 4, length: 1))
+    mixedColors.addAttribute(.foregroundColor, value: NSColor.black, range: NSRange(location: 5, length: 1))
+    mixedColors.addAttribute(.backgroundColor, value: NSColor.black, range: NSRange(location: 5, length: 1))
+    let readable = RichTextRendering.prepare(mixedColors, scale: 1)
+    check(foreground(readable) == black && foreground(readable, at: 1) == opaqueWhite, "identical white runs are handled according to their own backgrounds")
+    check(foreground(readable, at: 2) == navy && readable.attribute(.link, at: 2, effectiveRange: nil) as? URL == link, "readable colors and link attributes survive")
+    check(foreground(readable, at: 3) == black && foreground(readable, at: 4) == black, "translucent foregrounds and backgrounds are composited")
+    check(foreground(readable, at: 5) == opaqueWhite, "dark text on a dark background becomes light")
+    check(readable.attribute(.backgroundColor, at: 1, effectiveRange: nil) as? NSColor == .black, "preview keeps the original background")
+
+    let table = NSTextTableBlock(table: NSTextTable(), startingRow: 0, rowSpan: 1, startingColumn: 0, columnSpan: 1)
+    table.backgroundColor = .black
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.textBlocks = [table]
+    let tableText = NSAttributedString(string: "Cell", attributes: [.foregroundColor: NSColor.white, .paragraphStyle: paragraph])
+    check(foreground(RichTextRendering.prepare(tableText, scale: 1)) == opaqueWhite, "white text remains white in a dark rich-text table cell")
+
+    check(foreground(originalWhite) == opaqueWhite && foreground(white.attributedText) == opaqueWhite, "preparing the previews leaves both source attributed text and clip unchanged")
+    check(store.restore(white, plain: false, pasteboard: board), "white rich text restores after previewing")
+    check(board.data(forType: .rtf) == whiteRTF && board.data(forType: .html) == whiteHTML &&
+          board.data(forType: .string) == Data(contrastText.utf8), "pasteboard receives the exact original white RTF, HTML, and plain bytes")
+    check(store.restore(white, plain: true, pasteboard: board) && board.data(forType: .rtf) == nil &&
+          board.data(forType: .html) == nil && board.string(forType: .string) == contrastText, "explicit plain-text copy strips rich formats")
+    let invalid = FullItemPreview.pageText(clip(Data(), text: contrastText))
+    check(invalid.string == contrastText && foreground(invalid) == black, "unreadable rich data falls back to legible plain text")
+
     // Cost evidence only (not asserted, to keep the check deterministic): one pass over font runs.
     let large = NSMutableAttributedString()
     let lastResort = fonts(imported)[0]
@@ -87,6 +139,11 @@ func runRichTextDecodingTests() {
     let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
     check(!hasLastResort(largeRepaired) && largeRepaired.length == large.length, "large document (\(large.length) chars, 3,000 runs) is fully repaired")
     print(String(format: "INFO: repairingFonts on %d chars / 3,000 runs took %.2f ms", large.length, elapsed))
+    let previewStart = DispatchTime.now().uptimeNanoseconds
+    let largePreview = RichTextRendering.prepare(large, scale: 1.3)
+    let previewElapsed = Double(DispatchTime.now().uptimeNanoseconds - previewStart) / 1_000_000
+    check(largePreview.string == large.string, "large rich preview retains every character")
+    print(String(format: "INFO: rich preview preparation on %d chars / 3,000 runs took %.2f ms", large.length, previewElapsed))
 
     print("PASS: rich text decoding checks (\(checks))")
 }
