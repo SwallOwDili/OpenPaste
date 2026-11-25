@@ -454,9 +454,43 @@ final class Store: ObservableObject {
         if pruned.clips.count != archive.clips.count { archive = pruned }
         discardMissingQueueItems()
     }
+    /// Decides after which saves unreferenced attachments are collected; used on the persistence queue only.
+    struct BlobCleanupGate {
+        var root: URL?
+        var referenced: Set<String> = []
+        var undoCount = 0
+        var lastRun = Date.distantPast
+        static let interval: TimeInterval = 3600
+        /// True for the first save of a session or directory, when an attachment reference disappeared, when the undo
+        /// history shrank, or when an hour has passed; the state is updated either way.
+        mutating func shouldRun(root: URL, referenced now: Set<String>, undoCount count: Int, at date: Date = Date()) -> Bool {
+            let first = self.root != root
+            let dropped = !referenced.isSubset(of: now) || count < undoCount
+            self.root = root; referenced = now; undoCount = count
+            guard first || dropped || date.timeIntervalSince(lastRun) >= Self.interval else { return false }
+            lastRun = date
+            return true
+        }
+    }
+    private var cleanupGate = BlobCleanupGate()
+    /// Link titles are applied to memory only; they are written by the next save, by `flush`, or after this delay.
+    var linkTitleSaveDelay: TimeInterval = 30
+    private(set) var hasUnsavedLinkTitles = false
+    private var linkTitleSaveScheduled = false
+    func noteUnsavedLinkTitle() {
+        hasUnsavedLinkTitles = true
+        guard !linkTitleSaveScheduled else { return }
+        linkTitleSaveScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + linkTitleSaveDelay) { [weak self] in
+            guard let self else { return }
+            self.linkTitleSaveScheduled = false
+            if self.hasUnsavedLinkTitles { self.save() }
+        }
+    }
     func save() {
         guard !ephemeral, !initialLoading, !changingDataDirectory, !importingPaste, pauseReasons.loadFailure == nil else { return }
         directoryMutation += 1
+        hasUnsavedLinkTitles = false
         let snapshot = archive
         let undoClips = undoItems.flatMap(\.clips)
         let folder = root
@@ -480,12 +514,15 @@ final class Store: ObservableObject {
                 } else {
                     try DataDirectory.coordinated(url, writing: true) { path in try HistoryStorage.write(snapshot, to: path) }
                 }
-                if cloud {
-                    // Local indexes cannot prove that an offline device no longer needs a shared blob.
-                    try? HistoryStorage.collectUnused(at: DataDirectory.cacheURL(folder).deletingLastPathComponent(), preserving: undoClips)
-                } else {
-                    try? DataDirectory.coordinated(folder, writing: true) { path in
-                        try HistoryStorage.collectUnused(at: path, preserving: undoClips)
+                // Collecting lists every attachment and decodes every manifest: only when something may have become unreferenced.
+                if let self, self.cleanupGate.shouldRun(root: folder, referenced: HistoryStorage.referencedBlobs(snapshot), undoCount: undoClips.count) {
+                    if cloud {
+                        // Local indexes cannot prove that an offline device no longer needs a shared blob.
+                        try? HistoryStorage.collectUnused(at: DataDirectory.cacheURL(folder).deletingLastPathComponent(), preserving: undoClips)
+                    } else {
+                        try? DataDirectory.coordinated(folder, writing: true) { path in
+                            try HistoryStorage.collectUnused(at: path, preserving: undoClips)
+                        }
                     }
                 }
                 DispatchQueue.main.async {
@@ -516,6 +553,7 @@ final class Store: ObservableObject {
         for generation in pendingImages.keys.sorted() { finishPendingImage(generation) }
     }
     func flush() {
+        if hasUnsavedLinkTitles { save() }
         captureQueue.sync {}
         for generation in pendingImages.keys.sorted() { finishPendingImage(generation) }
         // Initial loading only reads history, while every mutation and save path is
@@ -800,8 +838,13 @@ final class Store: ObservableObject {
         if new.kind == "链接", networkPreviews, !ephemeral { enrichLink(new) }
         return new.id
     }
-    func delete(_ id: UUID, recordUndo: Bool = true) {
+    /// Link previews of this store's cards; replaceable for tests.
+    var linkPreviews: LinkPreviewCache = .shared
+    /// `saves: false` leaves the write to the caller (one save for a batch of deletions).
+    func delete(_ id: UUID, recordUndo: Bool = true, saves: Bool = true) {
         guard canModifyHistory else { return }
+        // Deleting a link drops its kept preview (result, failure cooldown, disk files): copying it again starts from nothing.
+        if let clip = archive.clips.first(where: { $0.id == id }), clip.kind == "链接" { linkPreviews.forget(clip.text) }
         if recordUndo, let clip = archive.clips.first(where: { $0.id == id }) { remember([clip], label: "删除") }
         if currentClipID == id {
             deletedCurrentChange = change
@@ -814,7 +857,7 @@ final class Store: ObservableObject {
         archive.clips.removeAll { $0.id == id }
         pasteQueue.removeAll { $0 == id }
         if wasSelected, let index = index { let remaining = filtered; selected = remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)].id }
-        save()
+        if saves { save() }
     }
     func pin(_ clip: Clip, to board: UUID) {
         guard canModifyHistory, let i = archive.clips.firstIndex(where: { $0.id == clip.id }) else { return }

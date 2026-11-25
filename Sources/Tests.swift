@@ -369,6 +369,86 @@ func runNavigationTests() {
     let whiteOnly = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { rect in NSColor.white.setFill(); rect.fill(); return true }
     guard let light = IconAccent.dominant(of: whiteOnly)?.usingColorSpace(.sRGB), light.redComponent <= 0.63 else { print("FAIL: light icons must be darkened for white text"); exit(1) }
     print("PASS: card header takes the source icon's dominant colour")
+    runAccentStoreChecks()
+}
+
+func runAccentStoreChecks() {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("openpaste-accent-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let file = dir.appendingPathComponent("AppAccents.json")
+    func flushed(_ store: AccentStore) {
+        var done = false
+        store.flush { done = true }
+        let deadline = Date().addingTimeInterval(5)
+        while !done && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+    }
+    func near(_ a: NSColor?, _ r: Double, _ g: Double, _ b: Double) -> Bool {
+        guard let c = a?.usingColorSpace(.sRGB) else { return false }
+        return abs(c.redComponent - r) < 0.002 && abs(c.greenComponent - g) < 0.002 && abs(c.blueComponent - b) < 0.002
+    }
+    let first = AccentStore(url: file)
+    first.set(NSColor(srgbRed: 0.98, green: 0.72, blue: 0, alpha: 1), for: "test.app", stamp: "s1")
+    flushed(first)
+    let reopened = AccentStore(url: file)
+    guard near(reopened.color(for: "test.app", stamp: "s1"), 0.98, 0.72, 0) else { print("FAIL: saved header colour is not restored after restart"); exit(1) }
+    guard reopened.color(for: "test.app", stamp: "s2") == nil else { print("FAIL: a changed app (stamp) must recompute its header colour"); exit(1) }
+    for i in 0...AccentStore.capacity { reopened.set(.red, for: "cap.\(i)", stamp: "s") }
+    guard reopened.entries.count == AccentStore.capacity else { print("FAIL: accent store must keep at most \(AccentStore.capacity) apps"); exit(1) }
+    try? Data("not json".utf8).write(to: file)
+    guard AccentStore(url: file).entries.isEmpty else { print("FAIL: a corrupt accent file must read as empty"); exit(1) }
+    guard let stamp = AccentStore.stamp(for: "com.apple.calculator"), stamp.hasPrefix("\(AccentStore.algorithmVersion)|"),
+          AccentStore.stamp(for: "invalid.openpaste.missing") == nil, AccentStore.stamp(for: "") == nil else { print("FAIL: accent stamp"); exit(1) }
+    // A saved colour with a matching stamp is used as is, without analysing the icon (an app outside the fixed table).
+    let unlisted = "com.apple.ActivityMonitor"
+    guard IconAccent.known[unlisted] == nil, let unlistedStamp = AccentStore.stamp(for: unlisted) else { print("FAIL: accent test app"); exit(1) }
+    let seeded = AccentStore(url: nil)
+    seeded.set(NSColor(srgbRed: 0.1, green: 0.2, blue: 0.3, alpha: 1), for: unlisted, stamp: unlistedStamp)
+    guard near(PreviewCache.shared.accentColor(unlisted, store: seeded), 0.1, 0.2, 0.3) else { print("FAIL: header colour must come from the saved store"); exit(1) }
+    print("PASS: header colours persist per app and recompute when the app changes")
+    // Well-known apps take the fixed table colour, ahead of any saved or sampled one, installed or not.
+    let table = AccentStore(url: nil)
+    table.set(.red, for: "com.apple.Notes", stamp: AccentStore.stamp(for: "com.apple.Notes") ?? "s")
+    guard IconAccent.known.count == 79,
+          near(PreviewCache.shared.accentColor("com.apple.Notes", store: table), 250.0 / 255, 183.0 / 255, 0),
+          near(PreviewCache.shared.accentColor("com.adobe.RoboHelp", store: table), 10.0 / 255, 149.0 / 255, 124.0 / 255),
+          table.entries["com.adobe.RoboHelp"] == nil else { print("FAIL: fixed colours for well-known apps"); exit(1) }
+    print("PASS: well-known apps use the fixed header colour table")
+    // Image cards fill when the aspect ratios are at least 80% alike, otherwise fit.
+    let area = CGSize(width: 240, height: 180)
+    guard ImageCardScaling.fills(image: CGSize(width: 1200, height: 900), area: area),
+          ImageCardScaling.fills(image: CGSize(width: 1000, height: 900), area: area),       // 1.111 vs 1.333: similarity 0.833
+          !ImageCardScaling.fills(image: CGSize(width: 1254, height: 596), area: area),      // 2.104 vs 1.333: 0.634
+          !ImageCardScaling.fills(image: CGSize(width: 723, height: 55), area: area),
+          !ImageCardScaling.fills(image: CGSize(width: 600, height: 1200), area: area),
+          !ImageCardScaling.fills(image: .zero, area: area), !ImageCardScaling.fills(image: area, area: .zero),
+          ImageCardBody.sizeLabel(width: 1254, height: 596) == "1254 × 596" else { print("FAIL: image card scaling"); exit(1) }
+    print("PASS: image cards fill or fit by aspect similarity and label their pixel size")
+    // File cards: one image file shows its picture, everything else an icon; several files share the documents icon.
+    guard FileCardBody.showsThumbnail(["/tmp/a.PNG"]), !FileCardBody.showsThumbnail(["/tmp/a.pdf"]), !FileCardBody.showsThumbnail(["/tmp/a.png", "/tmp/b.png"]),
+          FileCardBody.paths(Clip(source: "x", sourceID: "", kind: "文件", title: "2 个文件", text: "/tmp/a.pdf\n/tmp/b.pdf\n", parts: [])).count == 2,
+          FileCardBody.icon(["/tmp/a.pdf", "/tmp/b.pdf"]).size.width > 0, FileCardBody.icon(["/System/Applications/Calculator.app"]).size.width > 0,
+          CardChrome.ringRadius == CardChrome.radius + 4, [10, 16].contains(CardChrome.radius), CardChrome.radius == (CardChrome.modern ? 16 : 10),
+          CardChrome.shadowOpacity == (CardChrome.modern ? 0.08 : 0.1), CardChrome.shadowOffsetY == (CardChrome.modern ? 0 : 1) else { print("FAIL: file card or card chrome"); exit(1) }
+    print("PASS: file cards pick thumbnail or icon, and the card outline follows the system version")
+    // Header height follows the card size class; the compact setting or a card under 200 pt uses the compact header.
+    let compactHeight: CGFloat = CardChrome.modern ? 36 : 34
+    guard CardChrome.headerHeight(cardHeight: 300, compact: false) == 56, CardChrome.headerHeight(cardHeight: 280, compact: false) == 56,
+          CardChrome.headerHeight(cardHeight: 279, compact: false) == 52, CardChrome.headerHeight(cardHeight: 240, compact: false) == 52,
+          CardChrome.headerHeight(cardHeight: 239, compact: false) == 48, CardChrome.headerHeight(cardHeight: 200, compact: false) == 48,
+          CardChrome.headerHeight(cardHeight: 199, compact: false) == compactHeight, CardChrome.headerHeight(cardHeight: 300, compact: true) == compactHeight,
+          CardChrome.headerHeight(cardHeight: 0, compact: false) == 52, CardChrome.compactHeader(cardHeight: 199, compact: false), !CardChrome.compactHeader(cardHeight: 200, compact: false),
+          ShortcutBadge.parts("⌘1") == ("⌘", "1"), ShortcutBadge.parts("9") == ("", "9") else { print("FAIL: header size classes or shortcut badge"); exit(1) }
+    print("PASS: header height follows the card's size class, and the quick-paste badge splits symbol and digit")
+    guard CardChrome.coverIconOpacity == 0.5 else { print("FAIL: the source icon is faded to 50% on a full-bleed cover"); exit(1) }
+    print("PASS: the source icon is faded on a full-bleed cover")
+    // Cards are square outside the compact setting; the strip uses fixed spacing and side margins.
+    guard CardMagnification.cardWidth(compact: false, cardHeight: 252) == 252, CardMagnification.cardWidth(compact: false, cardHeight: 300) == 300,
+          CardMagnification.cardWidth(compact: true, cardHeight: 252) == 180, CardMagnification.cardWidth(compact: false, cardHeight: 0) == 240,
+          CardMagnification.spacing == 12, CardMagnification.stripLeading == 24,
+          CardChrome.titleTrailing(cardHeight: 300, compact: false) == 70, CardChrome.titleTrailing(cardHeight: 250, compact: false) == 66,
+          CardChrome.titleTrailing(cardHeight: 210, compact: false) == 62, CardChrome.titleTrailing(cardHeight: 150, compact: false) == 30,
+          CardChrome.titleTrailing(cardHeight: 300, compact: true) == 30 else { print("FAIL: square cards, strip spacing or title margin"); exit(1) }
+    print("PASS: cards are square, the strip keeps 12 pt spacing with 24 pt side margins, and the title margin follows the size class")
 }
 
 func fixtureImage() -> Clip {

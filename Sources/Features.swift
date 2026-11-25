@@ -18,7 +18,7 @@ struct CapturedColor {
 struct ItemUndo { var clips: [Clip]; var ids: Set<UUID>; var label: String }
 extension Store {
     func enrichLink(_ clip: Clip) {
-        LinkPreviewCache.shared.load(clip.text) { [weak self] result in
+        linkPreviews.load(clip.text) { [weak self] result in
             guard let self, let result else { return }
             self.applyLinkPreview(result, to: clip)
         }
@@ -48,7 +48,7 @@ extension Store {
         guard let i = archive.clips.firstIndex(where: { $0.id == clip.id }), clip.byteCount <= 20 * 1024 * 1024 else { message = "内容超过单条 20 MB 上限"; return }
         remember([archive.clips[i]], label: label); var updated = clip; updated.cachedDigest = updated.fingerprint; archive.clips[i] = updated; save()
     }
-    func deleteChosen() { guard canModifyHistory else { return }; let clips = selectedClips; guard !clips.isEmpty else { return }; remember(clips, label: "删除"); for clip in clips { delete(clip.id, recordUndo: false) }; selection = selected.map { [$0] } ?? [] }
+    func deleteChosen() { guard canModifyHistory else { return }; let clips = selectedClips; guard !clips.isEmpty else { return }; remember(clips, label: "删除"); for clip in clips { delete(clip.id, recordUndo: false, saves: false) }; save(); selection = selected.map { [$0] } ?? [] }
     func restoreMany(_ clips: [Clip], plain: Bool, pasteboard: NSPasteboard = .general) -> Bool {
         guard !clips.isEmpty else { return false }
         if clips.count == 1 { return restore(clips[0], plain: plain, pasteboard: pasteboard) }
@@ -133,7 +133,7 @@ extension Clip {
     var attributedText: NSAttributedString {
         let parts = exportParts().flatMap { $0 }
         if let data = parts.first(where: { $0.type == NSPasteboard.PasteboardType.rtf.rawValue })?.data, let text = NSAttributedString(rtf: data, documentAttributes: nil) { return RichTextRendering.repairingFonts(text) }
-        if let data = parts.first(where: { $0.type == NSPasteboard.PasteboardType.html.rawValue })?.data, let text = NSAttributedString(html: data, documentAttributes: nil) { return RichTextRendering.repairingFonts(text) }
+        if let data = parts.first(where: { $0.type == NSPasteboard.PasteboardType.html.rawValue })?.data, let text = HTMLImport.attributedString(from: data) { return RichTextRendering.repairingFonts(text) }
         return NSAttributedString(string: text)
     }
     func dragProvider() -> NSItemProvider {
