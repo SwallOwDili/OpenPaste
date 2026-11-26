@@ -165,6 +165,18 @@ final class Store: ObservableObject {
     @Published var ocrProgress = ""
     var draggingIDs: [UUID] = []
     var dragStartedAt = Date.distantPast
+    /// Drag pasteboard counter when a card drag began; the drag itself bumps it by one.
+    var dragPasteboardCount: Int?
+    func beginCardDrag(_ ids: [UUID], pasteboardCount: Int = NSPasteboard(name: .drag).changeCount, at date: Date = Date()) {
+        draggingIDs = ids; dragStartedAt = date; dragPasteboardCount = pasteboardCount
+    }
+    /// The records of the card drag being dropped, once: only when no other drag happened since it began (the counter is
+    /// exactly one past the one noted). A drop from another app, or a stale record from a drag that ended elsewhere, gets nil.
+    func takeOwnDrag(pasteboardCount: Int = NSPasteboard(name: .drag).changeCount) -> [UUID]? {
+        defer { draggingIDs.removeAll(); dragPasteboardCount = nil }
+        guard !draggingIDs.isEmpty, let noted = dragPasteboardCount, pasteboardCount == noted + 1 else { return nil }
+        return draggingIDs
+    }
     var selectionAnchor: UUID?
     var undoItems: [ItemUndo] = []
     let ocrQueue = DispatchQueue(label: "openpaste.ocr", qos: .utility)

@@ -111,6 +111,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         return accessibility && eventPosting
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A link card dropped on Messages is pasted there, the same way Return pastes it.
+        DragPasteRedirect.paste = { [weak self] clip, pid in
+            guard let self, let app = NSRunningApplication(processIdentifier: pid) else { return }
+            self.target = app; self.lastExternalApp = app
+            AppDiagnostics.record("drag.paste-instead")
+            // As Return: the whole selection when the dragged card is part of it.
+            self.pasteSelection(fallback: clip)
+        }
         AcceptanceMetrics.start()
         AppDiagnostics.record("app.launch")
         Controller.shared = self
@@ -1217,19 +1225,13 @@ struct ShelfView: View {
                             .background(store.board == board.id ? boardColor(board.color).opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
                             .foregroundStyle(Color.primary)
                     }.buttonStyle(.plain).help("右键更改收藏板颜色")
-                        .onDrop(of: ["io.github.SwallOwDili.OpenPaste.clip-id"], isTargeted: nil) { providers in
-                            if !store.draggingIDs.isEmpty, Date().timeIntervalSince(store.dragStartedAt) < 60 {
-                                let ids = store.draggingIDs; store.draggingIDs.removeAll()
-                                for id in ids { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
-                                if TestMode.featureUI { print("UI board pinned \(ids.count) items"); fflush(stdout) }
-                                return true
-                            }
-                            guard let provider = providers.first else { return false }
-                            provider.loadDataRepresentation(forTypeIdentifier: "io.github.SwallOwDili.OpenPaste.clip-id") { data, error in
-                                if TestMode.featureUI { print("UI drop data bytes=\(data?.count ?? -1) error=\(error?.localizedDescription ?? "none")"); fflush(stdout) }
-                                guard let data, let string = String(data: data, encoding: .utf8), let id = UUID(uuidString: string) else { return }
-                                DispatchQueue.main.async { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
-                            }; return true
+                        // The private type only marks card drags as acceptable; which cards come from the drag counter, so the
+                        // drop never reads data (a link card over Messages withholds it) and never takes a stale earlier drag.
+                        .onDrop(of: ["io.github.SwallOwDili.OpenPaste.clip-id"], isTargeted: nil) { _ in
+                            guard let ids = store.takeOwnDrag() else { return false }
+                            for id in ids { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
+                            if TestMode.featureUI { print("UI board pinned \(ids.count) items"); fflush(stdout) }
+                            return true
                         }
                         .overlay {
                             RightClickMenu {
@@ -1897,7 +1899,7 @@ struct ClipCard: View, Equatable {
         .overlay { if selected { CardChrome.shape(radius: CardChrome.ringRadius).strokeBorder(Color.accentColor, lineWidth: CardChrome.ringInset).padding(-CardChrome.ringInset) } }
         .shadow(color: .black.opacity(CardChrome.shadowOpacity), radius: CardChrome.shadowRadius, y: CardChrome.shadowOffsetY)
         .contentShape(Rectangle())
-        .onDrag { let selected = store.selectedClips; store.draggingIDs = selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]; store.dragStartedAt = Date(); if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
+        .onDrag { let selected = store.selectedClips; store.beginCardDrag(selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]); DragPasteRedirect.begin(clip); if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
         // One click handler for both: a separate double-click gesture would make SwiftUI hold every single click for the
         // double-click interval (about half a second) before selecting. The first click selects, the second pastes.
         .onTapGesture {

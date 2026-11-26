@@ -769,6 +769,65 @@ func runDragProviderTests() {
     while !completed && Date() < until { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
     guard completed, identifier == idClip.id.uuidString else { print("FAIL: image drag does not preserve item identifier"); exit(1) }
     print("PASS: image drag resolves original item identifier")
+
+    // Link cards dropped on Messages end up as a link card: the URL text the drop inserted is selected and pasted over.
+    func window(_ pid: Int, _ frame: CGRect, layer: Int = 0) -> [String: Any] {
+        [kCGWindowOwnerPID as String: pid, kCGWindowLayer as String: layer, kCGWindowBounds as String: frame.dictionaryRepresentation as NSDictionary as! [String: Any]]
+    }
+    let messages = window(10, CGRect(x: 0, y: 0, width: 800, height: 600))
+    let notes = window(20, CGRect(x: 0, y: 0, width: 300, height: 300))
+    let overlay = window(30, CGRect(x: 0, y: 0, width: 1000, height: 30), layer: 25)
+    let shelf = window(99, CGRect(x: 0, y: 500, width: 1000, height: 300), layer: 25)
+    let dragImage = window(99, CGRect(x: 380, y: 380, width: 60, height: 60), layer: 500)
+    guard DragPasteRedirect.releaseApp(at: CGPoint(x: 400, y: 400), ownPID: 99, windows: [dragImage, overlay, notes, messages]) == 10,
+          DragPasteRedirect.releaseApp(at: CGPoint(x: 100, y: 100), ownPID: 99, windows: [overlay, notes, messages]) == 20,
+          DragPasteRedirect.releaseApp(at: CGPoint(x: 400, y: 550), ownPID: 99, windows: [shelf, messages]) == nil,
+          DragPasteRedirect.releaseApp(at: CGPoint(x: 900, y: 900), ownPID: 99, windows: [notes, messages]) == nil
+    else { print("FAIL: release target (the window under the pointer, skipping the drag image and overlays; none over OpenPaste)"); exit(1) }
+    let url = "https://maps.apple.com/?q=x"
+    guard DragPasteRedirect.insertedURL(before: "", after: url, url: url) == NSRange(location: 0, length: url.utf16.count),
+          DragPasteRedirect.insertedURL(before: "前面 后面", after: "前面 " + url + "后面", url: url) == NSRange(location: 3, length: url.utf16.count),
+          DragPasteRedirect.insertedURL(before: url + " ", after: url + " " + url, url: url) == NSRange(location: url.utf16.count + 1, length: url.utf16.count),
+          DragPasteRedirect.insertedURL(before: "\u{FFFC}", after: "\u{FFFC}" + url + "\n", url: url) == NSRange(location: 1, length: url.utf16.count),
+          DragPasteRedirect.insertedURL(before: "abc", after: "abc", url: url) == nil,
+          DragPasteRedirect.insertedURL(before: "abc", after: "abcdef", url: url) == nil
+    else { print("FAIL: the inserted URL must be found by comparing the field before and after the drop"); exit(1) }
+
+    let mapLink = Clip(source: "信息", sourceID: "com.apple.MobileSMS", kind: "链接", title: url, text: url, parts: [[ClipPart(type: "public.utf8-plain-text", data: Data(url.utf8))]])
+    let textClip = Clip(source: "备忘录", sourceID: "com.apple.Notes", kind: "文字", title: "note", text: "note", parts: [[ClipPart(type: "public.utf8-plain-text", data: Data("note".utf8))]])
+    var buttonDown = true, escape = false, under: pid_t? = 10, field = "草稿", events: [String] = []
+    var environment = DragPasteRedirect.Environment()
+    environment.isButtonDown = { buttonDown }; environment.isEscapeDown = { escape }
+    environment.pasteOnlyAppUnderPointer = { under }; environment.runningPasteOnlyApps = { [10] }
+    environment.fieldValue = { _ in field }
+    environment.select = { _, range in events.append("select \(range.location),\(range.length)"); return true }
+    environment.paste = { clip, app in events.append("paste \(clip.kind) into \(app)") }
+    func settle(_ seconds: Double = 0.3) { let until = Date().addingTimeInterval(seconds); while Date() < until { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) } }
+    // Dropped on the field: the inserted URL is selected, then the card is pasted over it, once.
+    DragPasteRedirect.begin(mapLink, environment: environment); settle()
+    guard events.isEmpty else { print("FAIL: nothing may happen while the button is down"); exit(1) }
+    buttonDown = false; settle(0.1); field = "草稿" + url; settle()
+    guard events == ["select 2,\(url.utf16.count)", "paste 链接 into 10"] else { print("FAIL: drop on Messages must select the inserted URL and paste once, got \(events)"); exit(1) }
+    // Dropped where Messages inserts nothing (the conversation area): pasted at the cursor after the wait.
+    events.removeAll(); buttonDown = true; field = "草稿"
+    DragPasteRedirect.begin(mapLink, environment: environment); settle(); buttonDown = false; settle(DragPasteRedirect.insertWait + 0.4)
+    guard events == ["paste 链接 into 10"] else { print("FAIL: no insertion: paste at the cursor once, got \(events)"); exit(1) }
+    // Escape during the drag, released over another app or over OpenPaste, or a text card: nothing.
+    events.removeAll(); buttonDown = true
+    DragPasteRedirect.begin(mapLink, environment: environment); settle(); escape = true; settle(); escape = false; buttonDown = false; settle()
+    buttonDown = true; under = nil
+    DragPasteRedirect.begin(mapLink, environment: environment); settle(); buttonDown = false; settle()
+    buttonDown = true; under = 10
+    DragPasteRedirect.begin(textClip, environment: environment); settle(); buttonDown = false; settle()
+    guard events.isEmpty else { print("FAIL: Escape, other targets and text cards must not paste, got \(events)"); exit(1) }
+
+    // Boards take a card drag only when it is the latest drag (counter N at the start, N+1 at the drop), never reading data.
+    let boards = Store(ephemeral: true)
+    boards.beginCardDrag([mapLink.id, textClip.id], pasteboardCount: 10)
+    guard boards.takeOwnDrag(pasteboardCount: 11) == [mapLink.id, textClip.id], boards.takeOwnDrag(pasteboardCount: 11) == nil else { print("FAIL: own drag must be taken once"); exit(1) }
+    boards.beginCardDrag([mapLink.id], pasteboardCount: 20)
+    guard boards.takeOwnDrag(pasteboardCount: 22) == nil, boards.takeOwnDrag(pasteboardCount: 1) == nil else { print("FAIL: a later drag from elsewhere must not pin the earlier cards"); exit(1) }
+    print("PASS: a link card dropped on Messages has its inserted URL selected and replaced by a paste (or pasted at the cursor); Escape, other targets and other cards are untouched; boards take only their own latest drag")
     let invalid = imageClip("public.png", Data("not an image".utf8), "Invalid fixture").dragProvider()
     guard invalid.suggestedName?.hasSuffix(".png") != true && !invalid.registeredTypeIdentifiers.contains("public.png") else { print("FAIL: invalid image advertised as PNG"); exit(1) }
     print("PASS: PNG, JPEG, and TIFF drag files preserve bytes, type, and extension; invalid bytes are not advertised as PNG")
