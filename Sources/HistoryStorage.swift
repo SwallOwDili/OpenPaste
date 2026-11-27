@@ -136,6 +136,10 @@ enum HistoryStorage {
         try data.write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
+    /// Every attachment the archive refers to (the stored id, or the content digest for parts not yet written back).
+    static func referencedBlobs(_ archive: Archive) -> Set<String> {
+        Set(archive.clips.flatMap(\.parts).flatMap { $0 }.map { $0.storageID.flatMap { validID($0) ? $0 : nil } ?? digest($0.data) })
+    }
     // Preserve references in every manifest/backup and the in-memory undo history.
     // Automatic callers must only collect local roots/caches, never shared cloud attachments.
     static func managedManifest(_ name: String) -> Bool {

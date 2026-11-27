@@ -88,6 +88,7 @@ struct PreviewImage: View {
 struct FullItemPreview: View {
     @ObservedObject var store: Store
     let id: UUID
+    @Environment(\.colorScheme) private var colorScheme
     var clip: Clip? { store.archive.clips.first { $0.id == id } }
 
     var body: some View {
@@ -108,7 +109,7 @@ struct FullItemPreview: View {
             Button { Controller.shared.closePreview() } label: {
                 Image(systemName: "xmark.circle.fill").font(.system(size: 22)).foregroundStyle(.secondary)
             }.buttonStyle(.plain).help("关闭 · Esc").accessibilityLabel("关闭预览")
-            Text(clip.cardTitle).font(.system(size: 16, weight: .semibold)).lineLimit(1)
+            Text(clip.showsAudioTitle && AudioCardCache.shared.cached(clip.text)?.parsed == true ? "音频" : clip.cardTitle).font(.system(size: 16, weight: .semibold)).lineLimit(1)
                 .onTapGesture { Controller.shared.rename(clip) }.help("重命名 · ⌘R")
             Spacer(minLength: 8)
             if !store.archive.boards.isEmpty {
@@ -141,7 +142,10 @@ struct FullItemPreview: View {
     @ViewBuilder private func content(_ clip: Clip) -> some View {
         Group {
             if clip.kind == "链接", let url = URL(string: clip.text), LinkPreviewCache.allowed(url) { LinkBrowser(url: url) }
-            else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first { SystemFilePreview(url: URL(fileURLWithPath: path)) }
+            else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first {
+                let url = URL(fileURLWithPath: path)
+                if AudioInfo.isAudio(url) { AudioPreview(url: url).id(path) } else { SystemFilePreview(url: url) }
+            }
             else if clip.kind == "图片" { PreviewImage(clip: clip) }
             else if let color = CapturedColor.parse(clip.text) {
                 ZStack {
@@ -152,8 +156,9 @@ struct FullItemPreview: View {
             }
             else if clip.kind == "文字", CodeSyntax.language(clip.text) != nil { FullCodePreview(text: clip.text) }
             else {
-                RichTextView(text: pageText(clip), identity: clip.id.uuidString + clip.fingerprint, inset: NSSize(width: 26, height: 22))
-                    .background(Color.white)
+                let page = Self.page(clip, dark: colorScheme == .dark), onDark = RichTextRendering.isDark(page.color)
+                RichTextView(text: page.text, identity: clip.id.uuidString + clip.fingerprint + (onDark ? ":dark" : ":light"), inset: NSSize(width: 26, height: 22), dark: onDark)
+                    .background(Color(nsColor: page.color))
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -161,18 +166,22 @@ struct FullItemPreview: View {
     }
 
     /// Rich clips keep their own typography (shown a little larger); plain text gets a readable document style.
-    private func pageText(_ clip: Clip) -> NSAttributedString {
+    /// The page colour follows the rich text as on the card; plain text keeps a white page.
+    static func page(_ clip: Clip, dark: Bool) -> (text: NSAttributedString, color: NSColor) {
         if RichTextCache.hasRichPart(clip), CodeSyntax.language(clip.text) == nil {
             // Only the preview is truncated: parsing a huge HTML-only clip here would block the main thread,
             // while pasting, editing and merging keep the full rich content.
             let parts = clip.exportParts().flatMap { $0 }
             let hasRTF = parts.contains { $0.type == NSPasteboard.PasteboardType.rtf.rawValue }
             let htmlBytes = parts.first { $0.type == NSPasteboard.PasteboardType.html.rawValue }?.data.count ?? 0
-            if !hasRTF, htmlBytes > RichTextCache.htmlByteLimit { return RichTextRendering.plain(clip.text, size: 16) }
+            if !hasRTF, htmlBytes > RichTextCache.htmlByteLimit { return (RichTextRendering.plain(clip.text, size: 16), .white) }
             let rich = clip.attributedText
-            if RichTextCache.hasVisibleFormatting(rich) { return RichTextRendering.prepare(rich, scale: 1.3) }
+            if RichTextCache.hasVisibleFormatting(rich) {
+                let color = RichTextRendering.pageColor(for: rich, dark: dark)
+                return (RichTextRendering.prepare(rich, scale: 1.3, onDark: RichTextRendering.isDark(color), page: color), color)
+            }
         }
-        return RichTextRendering.plain(clip.text, size: 16)
+        return (RichTextRendering.plain(clip.text, size: 16), .white)
     }
 
     private func footer(_ clip: Clip) -> some View {

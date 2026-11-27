@@ -16,7 +16,7 @@ enum CardMagnification {
     /// Horizontal spacing between cards.
     static let spacing: CGFloat = 12
     /// Space before the first card and after the last one.
-    static let stripLeading: CGFloat = 20
+    static let stripLeading: CGFloat = 24
     /// Space above and below the cards.
     static let stripVerticalPadding: CGFloat = 8
     /// Selection jumps farther than this many cards snap instead of gliding (search, filters, Home/End).
@@ -26,6 +26,11 @@ enum CardMagnification {
 
     /// Full width of a card on the shelf. Every place that needs the card width uses this.
     static func cardWidth(compact: Bool) -> CGFloat { compact ? 180 : 240 }
+    /// Width of a card for the height the strip gives it: cards are square, so the width follows the
+    /// height. The compact setting keeps its fixed width; an unknown height falls back to the fixed width.
+    static func cardWidth(compact: Bool, cardHeight: CGFloat) -> CGFloat {
+        compact || cardHeight <= 0 ? cardWidth(compact: compact) : cardHeight
+    }
 
     /// Scale of cards far from the focus: 1 without the effect, `restScale` with it.
     static func farScale(intensity: Double) -> CGFloat {

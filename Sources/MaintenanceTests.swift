@@ -70,6 +70,47 @@ func runMaintenanceTests() {
         live.delete(b.id); live.undoItems.removeAll(); live.save(); live.flush()
         check(!fm.fileExists(atPath: bFile.path), "discarding undo releases attachment")
 
+        // Collecting lists every attachment and decodes every manifest, so it runs only when something may be unreferenced.
+        var gate = Store.BlobCleanupGate()
+        let start = Date(), here = URL(fileURLWithPath: "/tmp/gate-a"), there = URL(fileURLWithPath: "/tmp/gate-b")
+        check(gate.shouldRun(root: here, referenced: ["a", "b"], undoCount: 0, at: start), "cleanup gate: the first save of a session collects")
+        check(!gate.shouldRun(root: here, referenced: ["a", "b", "c"], undoCount: 0, at: start + 10), "cleanup gate: a save that only added attachments does not")
+        check(!gate.shouldRun(root: here, referenced: ["a", "b", "c"], undoCount: 0, at: start + 20), "cleanup gate: an unchanged save does not")
+        check(gate.shouldRun(root: here, referenced: ["a", "c"], undoCount: 0, at: start + 30), "cleanup gate: a vanished reference collects")
+        check(!gate.shouldRun(root: here, referenced: ["a", "c"], undoCount: 2, at: start + 40), "cleanup gate: a growing undo history does not")
+        check(gate.shouldRun(root: here, referenced: ["a", "c"], undoCount: 1, at: start + 50), "cleanup gate: a shrinking undo history collects")
+        check(!gate.shouldRun(root: here, referenced: ["a", "c"], undoCount: 1, at: start + 3000), "cleanup gate: still quiet before the hour is up")
+        check(gate.shouldRun(root: here, referenced: ["a", "c"], undoCount: 1, at: start + 3700), "cleanup gate: an hour after the last run collects")
+        check(gate.shouldRun(root: there, referenced: ["a", "c"], undoCount: 1, at: start + 3701), "cleanup gate: a new data directory collects")
+
+        let gateRoot = root.appendingPathComponent("gate-store")
+        let keep = clip("gate keep"), drop = clip("gate drop")
+        try HistoryStorage.write(Archive(clips: [keep, drop]), to: gateRoot.appendingPathComponent("history.json"))
+        let keepFile = gateRoot.appendingPathComponent("blobs/\(HistoryStorage.digest(keep.parts[0][0].data))")
+        let dropFile = gateRoot.appendingPathComponent("blobs/\(HistoryStorage.digest(drop.parts[0][0].data))")
+        let gateOrphan = gateRoot.appendingPathComponent("blobs/" + String(repeating: "a", count: 64))
+        // Deleting a selection saves once, however many records go.
+        let batchRoot = root.appendingPathComponent("batch-delete")
+        let batchOne = clip("batch one"), batchTwo = clip("batch two"), batchThree = clip("batch three"), survivor = clip("batch survivor")
+        try HistoryStorage.write(Archive(clips: [batchOne, batchTwo, batchThree, survivor]), to: batchRoot.appendingPathComponent("history.json"))
+        let batch = Store(root: batchRoot)
+        batch.selection = [batchOne.id, batchTwo.id, batchThree.id]
+        let saves = batch.directoryMutation
+        batch.deleteChosen(); batch.flush()
+        check(batch.directoryMutation == saves + 1, "deleting three selected records saves once")
+        let onDisk = try HistoryStorage.read(from: batchRoot.appendingPathComponent("history.json")).clips.map(\.id)
+        check(batch.archive.clips.map(\.id) == [survivor.id] && onDisk == [survivor.id], "all selected records are gone, the other stays, in memory and on disk")
+        batch.undoItemChange(); batch.flush()
+        check(Set(batch.archive.clips.map(\.id)) == [batchOne.id, batchTwo.id, batchThree.id, survivor.id], "one undo restores the whole selection")
+
+        let gated = Store(root: gateRoot)
+        gated.save(); gated.flush()
+        try Data("gateOrphan".utf8).write(to: gateOrphan)
+        gated.save(); gated.flush()
+        check(fm.fileExists(atPath: gateOrphan.path), "a save that dropped no reference leaves an unreferenced attachment for later")
+        gated.delete(drop.id, recordUndo: false); gated.flush()
+        check(!fm.fileExists(atPath: gateOrphan.path) && !fm.fileExists(atPath: dropFile.path) && fm.fileExists(atPath: keepFile.path), "deleting a record collects its attachment and the unreferenced one, and keeps live content")
+
         // A dangling blob symlink must be replaced, even when its own size equals the payload size.
         let linkRoot = root.appendingPathComponent("dangling-link")
         let linked = clip("dangling link attachment")
@@ -119,13 +160,14 @@ func runMaintenanceTests() {
         try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-30 * 86400)], ofItemAtPath: orphan.path)
         try DataDirectory.write(DataDirectory.baseline(Archive()), root: shared, device: "fixture")
         defer { try? fm.removeItem(at: DataDirectory.cacheURL(shared).deletingLastPathComponent()) }
+        // The first save of a session collects: leftovers of an earlier run are in place before it.
+        let localCacheRoot = DataDirectory.cacheURL(shared).deletingLastPathComponent()
+        let localOrphan = localCacheRoot.appendingPathComponent("blobs/\(HistoryStorage.digest(a.parts[0][0].data))")
+        try fm.createDirectory(at: localCacheRoot.appendingPathComponent("blobs"), withIntermediateDirectories: true)
+        try a.parts[0][0].data.write(to: localOrphan)
         let sharedStore = Store(root: shared)
         sharedStore.ingest(b); sharedStore.flush()
         check(fm.fileExists(atPath: orphan.path), "shared old orphan retained for unknown offline references")
-        let localCacheRoot = DataDirectory.cacheURL(shared).deletingLastPathComponent()
-        let localOrphan = localCacheRoot.appendingPathComponent("blobs/\(HistoryStorage.digest(a.parts[0][0].data))")
-        try a.parts[0][0].data.write(to: localOrphan)
-        sharedStore.save(); sharedStore.flush()
         check(!fm.fileExists(atPath: localOrphan.path) && fm.fileExists(atPath: orphan.path), "local sync cache collected without deleting shared attachment")
 
         let encodeStarted = DispatchSemaphore(value: 0), allowEncode = DispatchSemaphore(value: 0)

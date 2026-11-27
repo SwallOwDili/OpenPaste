@@ -369,6 +369,86 @@ func runNavigationTests() {
     let whiteOnly = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { rect in NSColor.white.setFill(); rect.fill(); return true }
     guard let light = IconAccent.dominant(of: whiteOnly)?.usingColorSpace(.sRGB), light.redComponent <= 0.63 else { print("FAIL: light icons must be darkened for white text"); exit(1) }
     print("PASS: card header takes the source icon's dominant colour")
+    runAccentStoreChecks()
+}
+
+func runAccentStoreChecks() {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("openpaste-accent-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let file = dir.appendingPathComponent("AppAccents.json")
+    func flushed(_ store: AccentStore) {
+        var done = false
+        store.flush { done = true }
+        let deadline = Date().addingTimeInterval(5)
+        while !done && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+    }
+    func near(_ a: NSColor?, _ r: Double, _ g: Double, _ b: Double) -> Bool {
+        guard let c = a?.usingColorSpace(.sRGB) else { return false }
+        return abs(c.redComponent - r) < 0.002 && abs(c.greenComponent - g) < 0.002 && abs(c.blueComponent - b) < 0.002
+    }
+    let first = AccentStore(url: file)
+    first.set(NSColor(srgbRed: 0.98, green: 0.72, blue: 0, alpha: 1), for: "test.app", stamp: "s1")
+    flushed(first)
+    let reopened = AccentStore(url: file)
+    guard near(reopened.color(for: "test.app", stamp: "s1"), 0.98, 0.72, 0) else { print("FAIL: saved header colour is not restored after restart"); exit(1) }
+    guard reopened.color(for: "test.app", stamp: "s2") == nil else { print("FAIL: a changed app (stamp) must recompute its header colour"); exit(1) }
+    for i in 0...AccentStore.capacity { reopened.set(.red, for: "cap.\(i)", stamp: "s") }
+    guard reopened.entries.count == AccentStore.capacity else { print("FAIL: accent store must keep at most \(AccentStore.capacity) apps"); exit(1) }
+    try? Data("not json".utf8).write(to: file)
+    guard AccentStore(url: file).entries.isEmpty else { print("FAIL: a corrupt accent file must read as empty"); exit(1) }
+    guard let stamp = AccentStore.stamp(for: "com.apple.calculator"), stamp.hasPrefix("\(AccentStore.algorithmVersion)|"),
+          AccentStore.stamp(for: "invalid.openpaste.missing") == nil, AccentStore.stamp(for: "") == nil else { print("FAIL: accent stamp"); exit(1) }
+    // A saved colour with a matching stamp is used as is, without analysing the icon (an app outside the fixed table).
+    let unlisted = "com.apple.ActivityMonitor"
+    guard IconAccent.known[unlisted] == nil, let unlistedStamp = AccentStore.stamp(for: unlisted) else { print("FAIL: accent test app"); exit(1) }
+    let seeded = AccentStore(url: nil)
+    seeded.set(NSColor(srgbRed: 0.1, green: 0.2, blue: 0.3, alpha: 1), for: unlisted, stamp: unlistedStamp)
+    guard near(PreviewCache.shared.accentColor(unlisted, store: seeded), 0.1, 0.2, 0.3) else { print("FAIL: header colour must come from the saved store"); exit(1) }
+    print("PASS: header colours persist per app and recompute when the app changes")
+    // Well-known apps take the fixed table colour, ahead of any saved or sampled one, installed or not.
+    let table = AccentStore(url: nil)
+    table.set(.red, for: "com.apple.Notes", stamp: AccentStore.stamp(for: "com.apple.Notes") ?? "s")
+    guard IconAccent.known.count == 79,
+          near(PreviewCache.shared.accentColor("com.apple.Notes", store: table), 250.0 / 255, 183.0 / 255, 0),
+          near(PreviewCache.shared.accentColor("com.adobe.RoboHelp", store: table), 10.0 / 255, 149.0 / 255, 124.0 / 255),
+          table.entries["com.adobe.RoboHelp"] == nil else { print("FAIL: fixed colours for well-known apps"); exit(1) }
+    print("PASS: well-known apps use the fixed header colour table")
+    // Image cards fill when the aspect ratios are at least 80% alike, otherwise fit.
+    let area = CGSize(width: 240, height: 180)
+    guard ImageCardScaling.fills(image: CGSize(width: 1200, height: 900), area: area),
+          ImageCardScaling.fills(image: CGSize(width: 1000, height: 900), area: area),       // 1.111 vs 1.333: similarity 0.833
+          !ImageCardScaling.fills(image: CGSize(width: 1254, height: 596), area: area),      // 2.104 vs 1.333: 0.634
+          !ImageCardScaling.fills(image: CGSize(width: 723, height: 55), area: area),
+          !ImageCardScaling.fills(image: CGSize(width: 600, height: 1200), area: area),
+          !ImageCardScaling.fills(image: .zero, area: area), !ImageCardScaling.fills(image: area, area: .zero),
+          ImageCardBody.sizeLabel(width: 1254, height: 596) == "1254 × 596" else { print("FAIL: image card scaling"); exit(1) }
+    print("PASS: image cards fill or fit by aspect similarity and label their pixel size")
+    // File cards: one image file shows its picture, everything else an icon; several files share the documents icon.
+    guard FileCardBody.showsThumbnail(["/tmp/a.PNG"]), !FileCardBody.showsThumbnail(["/tmp/a.pdf"]), !FileCardBody.showsThumbnail(["/tmp/a.png", "/tmp/b.png"]),
+          FileCardBody.paths(Clip(source: "x", sourceID: "", kind: "文件", title: "2 个文件", text: "/tmp/a.pdf\n/tmp/b.pdf\n", parts: [])).count == 2,
+          FileCardBody.icon(["/tmp/a.pdf", "/tmp/b.pdf"]).size.width > 0, FileCardBody.icon(["/System/Applications/Calculator.app"]).size.width > 0,
+          CardChrome.ringRadius == CardChrome.radius + 4, [10, 16].contains(CardChrome.radius), CardChrome.radius == (CardChrome.modern ? 16 : 10),
+          CardChrome.shadowOpacity == (CardChrome.modern ? 0.08 : 0.1), CardChrome.shadowOffsetY == (CardChrome.modern ? 0 : 1) else { print("FAIL: file card or card chrome"); exit(1) }
+    print("PASS: file cards pick thumbnail or icon, and the card outline follows the system version")
+    // Header height follows the card size class; the compact setting or a card under 200 pt uses the compact header.
+    let compactHeight: CGFloat = CardChrome.modern ? 36 : 34
+    guard CardChrome.headerHeight(cardHeight: 300, compact: false) == 56, CardChrome.headerHeight(cardHeight: 280, compact: false) == 56,
+          CardChrome.headerHeight(cardHeight: 279, compact: false) == 52, CardChrome.headerHeight(cardHeight: 240, compact: false) == 52,
+          CardChrome.headerHeight(cardHeight: 239, compact: false) == 48, CardChrome.headerHeight(cardHeight: 200, compact: false) == 48,
+          CardChrome.headerHeight(cardHeight: 199, compact: false) == compactHeight, CardChrome.headerHeight(cardHeight: 300, compact: true) == compactHeight,
+          CardChrome.headerHeight(cardHeight: 0, compact: false) == 52, CardChrome.compactHeader(cardHeight: 199, compact: false), !CardChrome.compactHeader(cardHeight: 200, compact: false),
+          ShortcutBadge.parts("⌘1") == ("⌘", "1"), ShortcutBadge.parts("9") == ("", "9") else { print("FAIL: header size classes or shortcut badge"); exit(1) }
+    print("PASS: header height follows the card's size class, and the quick-paste badge splits symbol and digit")
+    guard CardChrome.coverIconOpacity == 0.5 else { print("FAIL: the source icon is faded to 50% on a full-bleed cover"); exit(1) }
+    print("PASS: the source icon is faded on a full-bleed cover")
+    // Cards are square outside the compact setting; the strip uses fixed spacing and side margins.
+    guard CardMagnification.cardWidth(compact: false, cardHeight: 252) == 252, CardMagnification.cardWidth(compact: false, cardHeight: 300) == 300,
+          CardMagnification.cardWidth(compact: true, cardHeight: 252) == 180, CardMagnification.cardWidth(compact: false, cardHeight: 0) == 240,
+          CardMagnification.spacing == 12, CardMagnification.stripLeading == 24,
+          CardChrome.titleTrailing(cardHeight: 300, compact: false) == 70, CardChrome.titleTrailing(cardHeight: 250, compact: false) == 66,
+          CardChrome.titleTrailing(cardHeight: 210, compact: false) == 62, CardChrome.titleTrailing(cardHeight: 150, compact: false) == 30,
+          CardChrome.titleTrailing(cardHeight: 300, compact: true) == 30 else { print("FAIL: square cards, strip spacing or title margin"); exit(1) }
+    print("PASS: cards are square, the strip keeps 12 pt spacing with 24 pt side margins, and the title margin follows the size class")
 }
 
 func fixtureImage() -> Clip {
@@ -689,6 +769,136 @@ func runDragProviderTests() {
     while !completed && Date() < until { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
     guard completed, identifier == idClip.id.uuidString else { print("FAIL: image drag does not preserve item identifier"); exit(1) }
     print("PASS: image drag resolves original item identifier")
+
+    // Link cards dropped on Messages end up as a link card: the URL text the drop inserted is selected and pasted over.
+    func window(_ pid: Int, _ frame: CGRect, layer: Int = 0) -> [String: Any] {
+        [kCGWindowOwnerPID as String: pid, kCGWindowLayer as String: layer, kCGWindowBounds as String: frame.dictionaryRepresentation as NSDictionary as! [String: Any]]
+    }
+    let messages = window(10, CGRect(x: 0, y: 0, width: 800, height: 600))
+    let notes = window(20, CGRect(x: 0, y: 0, width: 300, height: 300))
+    let overlay = window(30, CGRect(x: 0, y: 0, width: 1000, height: 30), layer: 25)
+    let shelf = window(99, CGRect(x: 0, y: 500, width: 1000, height: 300), layer: 25)
+    let dragImage = window(99, CGRect(x: 380, y: 380, width: 60, height: 60), layer: 500)
+    guard DragPasteRedirect.releaseApp(at: CGPoint(x: 400, y: 400), ownPID: 99, windows: [dragImage, overlay, notes, messages]) == 10,
+          DragPasteRedirect.releaseApp(at: CGPoint(x: 100, y: 100), ownPID: 99, windows: [overlay, notes, messages]) == 20,
+          DragPasteRedirect.releaseApp(at: CGPoint(x: 400, y: 550), ownPID: 99, windows: [shelf, messages]) == nil,
+          DragPasteRedirect.releaseApp(at: CGPoint(x: 900, y: 900), ownPID: 99, windows: [notes, messages]) == nil
+    else { print("FAIL: release target (the window under the pointer, skipping the drag image and overlays; none over OpenPaste)"); exit(1) }
+    let url = "https://maps.apple.com/?q=x"
+    guard DragPasteRedirect.insertedURL(before: "", after: url, url: url) == NSRange(location: 0, length: url.utf16.count),
+          DragPasteRedirect.insertedURL(before: "前面 后面", after: "前面 " + url + "后面", url: url) == NSRange(location: 3, length: url.utf16.count),
+          DragPasteRedirect.insertedURL(before: url + " ", after: url + " " + url, url: url) == NSRange(location: url.utf16.count + 1, length: url.utf16.count),
+          DragPasteRedirect.insertedURL(before: "\u{FFFC}", after: "\u{FFFC}" + url + "\n", url: url) == NSRange(location: 1, length: url.utf16.count),
+          DragPasteRedirect.insertedURL(before: "abc", after: "abc", url: url) == nil,
+          DragPasteRedirect.insertedURL(before: "abc", after: "abcdef", url: url) == nil
+    else { print("FAIL: the inserted URL must be found by comparing the field before and after the drop"); exit(1) }
+
+    let mapLink = Clip(source: "信息", sourceID: "com.apple.MobileSMS", kind: "链接", title: url, text: url, parts: [[ClipPart(type: "public.utf8-plain-text", data: Data(url.utf8))]])
+    let textClip = Clip(source: "备忘录", sourceID: "com.apple.Notes", kind: "文字", title: "note", text: "note", parts: [[ClipPart(type: "public.utf8-plain-text", data: Data("note".utf8))]])
+    var buttonDown = true, escape = false, under: pid_t? = 10, events: [String] = []
+    // The fake Messages field: which input is focused, its text and selection; `readable` false means accessibility returns nothing.
+    var input = "会话A", field = "草稿", selection = NSRange(location: 2, length: 0), readable = true
+    var selectSucceeds = true, selectionAfterSelect: NSRange?, startReadable = true, starting = false
+    var environment = DragPasteRedirect.Environment()
+    environment.isButtonDown = { buttonDown }; environment.isEscapeDown = { escape }
+    environment.pasteOnlyAppUnderPointer = { under }; environment.runningPasteOnlyApps = { [10] }
+    environment.field = { _ in
+        guard starting ? startReadable : readable else { return nil }
+        return DragPasteRedirect.Field(element: input as NSString, value: field, selection: selection)
+    }
+    environment.select = { target, range in
+        events.append("select \(range.location),\(range.length) in \(target.element)")
+        guard selectSucceeds else { return false }
+        selection = selectionAfterSelect ?? range; return true
+    }
+    // Between the paste request and ⌘V, Messages is activated and the user may act: `meanwhile` changes the fake field then.
+    var meanwhile: () -> Void = {}
+    environment.skipped = { _ in }; environment.note = { _ in }
+    environment.paste = { clip, app, readyToSend in
+        events.append("paste \(clip.kind) into \(app)"); meanwhile(); meanwhile = {}
+        events.append(readyToSend() ? "sent" : "skipped")
+    }
+    func settle(_ seconds: Double = 0.3) { let until = Date().addingTimeInterval(seconds); while Date() < until { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) } }
+    /// One drag: reset the fake field, begin, let go, then `drop` changes the field the way Messages would.
+    func drag(_ card: Clip? = nil, start: String = "草稿", startSelection: NSRange = NSRange(location: 2, length: 0), wait: Double = DragPasteRedirect.insertWait + 0.4, drop: () -> Void = {}) -> [String] {
+        events.removeAll(); buttonDown = true; input = "会话A"; field = start; selection = startSelection; readable = true
+        starting = true; DragPasteRedirect.begin(card ?? mapLink, environment: environment); starting = false
+        settle(); buttonDown = false; settle(0.1); drop(); settle(wait)
+        let result = events; selectSucceeds = true; selectionAfterSelect = nil; startReadable = true; under = 10
+        return result
+    }
+    let selectURL = "select 2,\(url.utf16.count) in 会话A", pasted = "paste 链接 into 10", sent = "sent", skipped = "skipped"
+    // Nothing happens while the button is down.
+    events.removeAll(); buttonDown = true; DragPasteRedirect.begin(mapLink, environment: environment); settle()
+    guard events.isEmpty else { print("FAIL: nothing may happen while the button is down"); exit(1) }
+    under = nil; buttonDown = false; settle(); under = 10
+    // Dropped on the field: the inserted URL is selected, the selection is read back, then the card is pasted over it, once.
+    var got = drag { field = "草稿" + url; selection = NSRange(location: field.utf16.count, length: 0) }
+    guard got == [selectURL, pasted, sent] else { print("FAIL: drop on Messages must select the inserted URL and paste once, got \(got)"); exit(1) }
+    // Activating Messages drops the selection: it is selected again before ⌘V. Typing meanwhile: nothing is sent.
+    meanwhile = { selection = NSRange(location: 0, length: 0) }
+    got = drag { field = "草稿" + url }
+    guard got == [selectURL, pasted, selectURL, sent], selection == NSRange(location: 2, length: url.utf16.count) else { print("FAIL: the URL must be selected again right before ⌘V, got \(got)"); exit(1) }
+    meanwhile = { field = "草稿" + url + "x" }
+    got = drag { field = "草稿" + url }
+    guard got == [selectURL, pasted, skipped] else { print("FAIL: the field changed before ⌘V: nothing may be sent, got \(got)"); exit(1) }
+    // Dropped where Messages inserts nothing (the conversation area), no selection: pasted at the cursor after the wait.
+    got = drag()
+    guard got == [pasted, sent] else { print("FAIL: no insertion: paste at the cursor once, got \(got)"); exit(1) }
+    // Activating Messages moves the caret to the start: it is put back where it was before ⌘V.
+    meanwhile = { selection = NSRange(location: 0, length: 0) }
+    got = drag()
+    guard got == [pasted, "select 2,0 in 会话A", sent], selection == NSRange(location: 2, length: 0) else { print("FAIL: the caret must be put back before ⌘V, got \(got)"); exit(1) }
+    // The user selects draft text, types, or the focus moves to another input before ⌘V: nothing is sent.
+    meanwhile = { selection = NSRange(location: 0, length: 2) }
+    got = drag()
+    guard got == [pasted, skipped] else { print("FAIL: text selected before ⌘V: nothing may be sent, got \(got)"); exit(1) }
+    meanwhile = { field = "草稿x" }
+    got = drag()
+    guard got == [pasted, skipped] else { print("FAIL: text typed before ⌘V: nothing may be sent, got \(got)"); exit(1) }
+    meanwhile = { input = "会话B" }
+    got = drag()
+    guard got == [pasted, skipped] else { print("FAIL: another input focused before ⌘V: nothing may be sent, got \(got)"); exit(1) }
+    // The caret cannot be put back: nothing is sent.
+    meanwhile = { selection = NSRange(location: 0, length: 0); selectSucceeds = false }
+    got = drag()
+    guard got == [pasted, "select 2,0 in 会话A", skipped] else { print("FAIL: caret not restored: nothing may be sent, got \(got)"); exit(1) }
+    // Never paste when it is not certain: each of these leaves the field as Messages made it.
+    selectSucceeds = false
+    got = drag { field = "草稿" + url }
+    guard got == [selectURL] else { print("FAIL: selecting the inserted URL failed: must not paste, got \(got)"); exit(1) }
+    selectionAfterSelect = NSRange(location: field.utf16.count, length: 0)
+    got = drag { field = "草稿" + url }
+    guard got == [selectURL] else { print("FAIL: the selection read back is not the URL: must not paste, got \(got)"); exit(1) }
+    startReadable = false
+    got = drag { field = "草稿" + url }
+    guard got.isEmpty else { print("FAIL: the field was not noted at the start: must not paste, got \(got)"); exit(1) }
+    got = drag { readable = false; field = "草稿" + url }
+    guard got.isEmpty else { print("FAIL: the field cannot be read after the drop: must not paste, got \(got)"); exit(1) }
+    got = drag { field = "草稿 something else" }
+    guard got.isEmpty else { print("FAIL: the field changed but not by the URL: must not paste, got \(got)"); exit(1) }
+    got = drag(start: "今晚去这家：老地方", startSelection: NSRange(location: 6, length: 3))
+    guard got.isEmpty else { print("FAIL: draft text is selected: a paste at the cursor would replace it, got \(got)"); exit(1) }
+    got = drag(start: "今晚去这家：老地方", startSelection: NSRange(location: 6, length: 3)) { selection = NSRange(location: 6, length: 0) }
+    guard got.isEmpty else { print("FAIL: draft text was selected at the start, then collapsed: must not paste, got \(got)"); exit(1) }
+    got = drag { input = "会话B"; field = url }
+    guard got.isEmpty else { print("FAIL: another input is focused at the release: must not paste, got \(got)"); exit(1) }
+    got = drag { input = "会话B"; field = "草稿" }
+    guard got.isEmpty else { print("FAIL: another input is focused and unchanged: must not paste at its cursor, got \(got)"); exit(1) }
+    // Escape during the drag, released over another app or over OpenPaste, or a text card: nothing.
+    events.removeAll(); buttonDown = true; field = "草稿"; selection = NSRange(location: 2, length: 0)
+    DragPasteRedirect.begin(mapLink, environment: environment); settle(); escape = true; settle(); escape = false; buttonDown = false; settle(DragPasteRedirect.insertWait + 0.4)
+    under = nil; got = events + drag(); events.removeAll()
+    got += drag(textClip)
+    guard got.isEmpty else { print("FAIL: Escape, other targets and text cards must not paste, got \(got)"); exit(1) }
+
+    // Boards take a card drag only when it is the latest drag (counter N at the start, N+1 at the drop), never reading data.
+    let boards = Store(ephemeral: true)
+    boards.beginCardDrag([mapLink.id, textClip.id], pasteboardCount: 10)
+    guard boards.takeOwnDrag(pasteboardCount: 11) == [mapLink.id, textClip.id], boards.takeOwnDrag(pasteboardCount: 11) == nil else { print("FAIL: own drag must be taken once"); exit(1) }
+    boards.beginCardDrag([mapLink.id], pasteboardCount: 20)
+    guard boards.takeOwnDrag(pasteboardCount: 22) == nil, boards.takeOwnDrag(pasteboardCount: 1) == nil else { print("FAIL: a later drag from elsewhere must not pin the earlier cards"); exit(1) }
+    print("PASS: a link card dropped on Messages has its inserted URL selected and replaced by a paste (or pasted at an untouched cursor); a failed or wrong selection, an unnoted, unreadable or switched field, an unexpected change, or selected draft text is never pasted over, checked again right before ⌘V with the caret put back; Escape, other targets and other cards are untouched; boards take only their own latest drag")
     let invalid = imageClip("public.png", Data("not an image".utf8), "Invalid fixture").dragProvider()
     guard invalid.suggestedName?.hasSuffix(".png") != true && !invalid.registeredTypeIdentifiers.contains("public.png") else { print("FAIL: invalid image advertised as PNG"); exit(1) }
     print("PASS: PNG, JPEG, and TIFF drag files preserve bytes, type, and extension; invalid bytes are not advertised as PNG")

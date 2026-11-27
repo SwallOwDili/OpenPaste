@@ -111,6 +111,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         return accessibility && eventPosting
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A link card dropped on Messages is pasted there, the same way Return pastes it.
+        DragPasteRedirect.paste = { [weak self] clip, pid, readyToSend in
+            guard let self, let app = NSRunningApplication(processIdentifier: pid) else { return }
+            self.target = app; self.lastExternalApp = app
+            AppDiagnostics.record("drag.paste-instead")
+            // As Return: the whole selection when the dragged card is part of it. The field is checked again once
+            // Messages is in front, right before ⌘V, since the user may have touched it meanwhile.
+            self.pasteSelection(fallback: clip, beforeSend: {
+                guard readyToSend() else { AppDiagnostics.record("drag.paste-skipped"); return false }
+                return true
+            })
+        }
         AcceptanceMetrics.start()
         AppDiagnostics.record("app.launch")
         Controller.shared = self
@@ -973,11 +985,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         guard store.restore(clip, plain: plain) else { store.message = "无法复制此内容"; return }
         pastePrepared()
     }
-    func pasteSelection(fallback clip: Clip, plain: Bool = false) {
+    func pasteSelection(fallback clip: Clip, plain: Bool = false, beforeSend: (() -> Bool)? = nil) {
         let selected = store.selectedClips
-        guard store.restoreMany(selected.contains(where: { $0.id == clip.id }) ? selected : [clip], plain: plain) else { showToast("无法合并所选内容"); return }; pastePrepared()
+        guard store.restoreMany(selected.contains(where: { $0.id == clip.id }) ? selected : [clip], plain: plain) else { showToast("无法合并所选内容"); return }; pastePrepared(beforeSend: beforeSend)
     }
-    func pastePrepared() {
+    /// `beforeSend` runs once the target is in front, right before ⌘V; returning false sends nothing.
+    func pastePrepared(beforeSend: (() -> Bool)? = nil) {
         closePreview()
         cancelTranslation()
         refreshPermission()
@@ -991,19 +1004,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         _ = target.activate(options: [])
         // The background permission state is for display only. It may still be
         // unknown at startup; finishPaste checks live permission before sending.
-        finishPaste(target: target, generation: generation, attempt: 0)
+        finishPaste(target: target, generation: generation, attempt: 0, beforeSend: beforeSend)
     }
-    private func finishPaste(target: NSRunningApplication, generation: Int, attempt: Int) {
+    private func finishPaste(target: NSRunningApplication, generation: Int, attempt: Int, beforeSend: (() -> Bool)? = nil) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) {
             guard generation == self.pasteGeneration else { return }
             let ready = NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier
             let modifiersReleased = NSEvent.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
             guard ready && modifiersReleased else {
-                if attempt < 60 { self.finishPaste(target: target, generation: generation, attempt: attempt + 1) }
+                if attempt < 60 { self.finishPaste(target: target, generation: generation, attempt: attempt + 1, beforeSend: beforeSend) }
                 else { self.showToast("已复制，自动粘贴未完成，请在输入框按 ⌘V") }
                 return
             }
             guard self.directPasteAllowed else { self.showToast("已复制，请按 ⌘V 粘贴"); return }
+            if let beforeSend, !beforeSend() { return }
             let source = CGEventSource(stateID: .privateState)
             let sent = PasteShortcut.send(
                 makeEvent: { CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: $0) },
@@ -1217,19 +1231,13 @@ struct ShelfView: View {
                             .background(store.board == board.id ? boardColor(board.color).opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
                             .foregroundStyle(Color.primary)
                     }.buttonStyle(.plain).help("右键更改收藏板颜色")
-                        .onDrop(of: ["io.github.SwallOwDili.OpenPaste.clip-id"], isTargeted: nil) { providers in
-                            if !store.draggingIDs.isEmpty, Date().timeIntervalSince(store.dragStartedAt) < 60 {
-                                let ids = store.draggingIDs; store.draggingIDs.removeAll()
-                                for id in ids { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
-                                if TestMode.featureUI { print("UI board pinned \(ids.count) items"); fflush(stdout) }
-                                return true
-                            }
-                            guard let provider = providers.first else { return false }
-                            provider.loadDataRepresentation(forTypeIdentifier: "io.github.SwallOwDili.OpenPaste.clip-id") { data, error in
-                                if TestMode.featureUI { print("UI drop data bytes=\(data?.count ?? -1) error=\(error?.localizedDescription ?? "none")"); fflush(stdout) }
-                                guard let data, let string = String(data: data, encoding: .utf8), let id = UUID(uuidString: string) else { return }
-                                DispatchQueue.main.async { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
-                            }; return true
+                        // The private type only marks card drags as acceptable; which cards come from the drag counter, so the
+                        // drop never reads data (a link card over Messages withholds it) and never takes a stale earlier drag.
+                        .onDrop(of: ["io.github.SwallOwDili.OpenPaste.clip-id"], isTargeted: nil) { _ in
+                            guard let ids = store.takeOwnDrag() else { return false }
+                            for id in ids { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
+                            if TestMode.featureUI { print("UI board pinned \(ids.count) items"); fflush(stdout) }
+                            return true
                         }
                         .overlay {
                             RightClickMenu {
@@ -1634,24 +1642,25 @@ struct DockStrip: View {
     let size: CGSize
     var body: some View {
         let clips = store.filtered
-        let cardWidth = CardMagnification.cardWidth(compact: store.compact)
-        let leading: CGFloat = store.translating ? cardWidth + CardMagnification.spacing : 0
-        let frame = driver.frame(count: clips.count, cardWidth: cardWidth, size: size, extraLeading: leading)
         let padding = CardMagnification.stripVerticalPadding
         let height = max(0, size.height - padding * 2)
+        // Square cards: the width follows the height the strip leaves for a card.
+        let cardWidth = CardMagnification.cardWidth(compact: store.compact, cardHeight: height)
+        let leading: CGFloat = store.translating ? cardWidth + CardMagnification.spacing : 0
+        let frame = driver.frame(count: clips.count, cardWidth: cardWidth, size: size, extraLeading: leading)
         let visible = frame.visible()
         let items = driver.keptRange(around: visible, count: clips.count).map { StripItem(index: $0, clip: clips[$0]) }
         let parked = -(cardWidth + 100)
         ZStack(alignment: .topLeading) {
             if store.translating {
                 VStack(spacing: 12) { ProgressView(); Text("正在翻译…"); Text("原文保持不变").font(.caption).foregroundStyle(.secondary) }
-                    .frame(width: cardWidth, height: height).background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                    .frame(width: cardWidth, height: height).background(.quaternary, in: CardChrome.shape())
                     .offset(x: frame.firstLeft - leading, y: padding)
             }
             ForEach(items) { item in
                 let onScreen = visible.contains(item.index)
                 let scale = onScreen ? frame.scale(item.index) : 1
-                ClipCard(clip: item.clip, index: item.index, selected: store.selection.contains(item.clip.id) || item.clip.id == store.selected, current: item.clip.id == store.currentClipID, renaming: store.renamingID == item.clip.id, compact: store.compact, networkPreviews: store.networkPreviews, boards: store.archive.boards, store: store).equatable()
+                ClipCard(clip: item.clip, index: item.index, selected: store.selection.contains(item.clip.id) || item.clip.id == store.selected, current: item.clip.id == store.currentClipID, renaming: store.renamingID == item.clip.id, compact: store.compact, networkPreviews: store.networkPreviews, boards: store.archive.boards, store: store, cardHeight: height, quickSymbol: store.shelfShortcuts.quickPaste.symbol).equatable()
                     .frame(width: cardWidth, height: height)
                     .scaleEffect(scale, anchor: .bottom)
                     .offset(x: onScreen ? frame.centre(item.index) - cardWidth / 2 : parked, y: padding)
@@ -1690,6 +1699,29 @@ struct ClipCard: View, Equatable {
     let networkPreviews: Bool
     let boards: [Board]
     let store: Store
+    /// Height the strip gives the card; it picks the header size class.
+    var cardHeight: CGFloat = 0
+    /// Symbol of the quick-paste modifier, shown before the index.
+    var quickSymbol = "⌘"
+    var compactHeader: Bool { CardChrome.compactHeader(cardHeight: cardHeight, compact: compact) }
+    /// A link preview with an image runs full bleed: under the header, which becomes a scrim,
+    /// and down to the card's bottom edge, with the index inside the caption bar.
+    @State private var linkCover = false
+    /// A link preview bubble is shown, with or without an image: it reaches the bottom edge and carries the index.
+    @State private var linkBubble = false
+    /// The file was read as audio: the header says “音频” instead of “文件”.
+    @State private var audioParsed = false
+    /// Page colour of a rich text card, picked from its text; nil until the text is parsed.
+    @State private var richPage: NSColor?
+    @Environment(\.colorScheme) private var colorScheme
+    var headerTitle: String { audioParsed && clip.showsAudioTitle ? "音频" : clip.cardTitle }
+    /// Header height for the card's size class.
+    var headerHeight: CGFloat { CardChrome.headerHeight(cardHeight: cardHeight, compact: compact) }
+    /// A click on an already selected card's title renames it; otherwise it selects the card.
+    func titleTapped() {
+        if selected && store.selection.count <= 1 { Controller.shared.rename(clip) }
+        else { store.searchFocused = false; store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) }
+    }
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.clip.id == rhs.clip.id
             && lhs.clip.cachedDigest == rhs.clip.cachedDigest
@@ -1698,6 +1730,8 @@ struct ClipCard: View, Equatable {
             && lhs.current == rhs.current
             && lhs.renaming == rhs.renaming
             && lhs.compact == rhs.compact
+            && lhs.cardHeight == rhs.cardHeight
+            && lhs.quickSymbol == rhs.quickSymbol
             && lhs.networkPreviews == rhs.networkPreviews
             && lhs.boards == rhs.boards
             && lhs.store === rhs.store
@@ -1722,79 +1756,156 @@ struct ClipCard: View, Equatable {
         return bytes > 200_000 ? "20 万+ 字符" : "\(clip.text.count) 个字符"
     }
     var icon: String { switch clip.kind { case "链接": return "link"; case "图片": return "photo"; case "文件": return "folder"; default: return "text.alignleft" } }
-    var body: some View {
-        let isCode = clip.kind == "文字" && CodeSyntax.language(clip.text) != nil
-        let capturedColor = clip.kind == "链接" ? nil : CapturedColor.parse(clip.text)
-        let richText = clip.kind == "文字" && capturedColor == nil && !isCode && RichTextCache.hasRichPart(clip)
-        VStack(alignment: .leading, spacing: 0) {
-            // Header: a larger source icon bleeds off the top-right corner.
-            ZStack(alignment: .topTrailing) {
-                Rectangle().fill(headerFill)
-                if let sourceIcon = PreviewCache.shared.sourceIcon(clip.sourceID) {
-                    Image(nsImage: sourceIcon).resizable().scaledToFit()
-                        .frame(width: compact ? 44 : 64, height: compact ? 44 : 64)
-                        .offset(x: compact ? 8 : 10, y: compact ? -4 : -3).help(clip.source)
-                } else {
-                    Image(systemName: icon).font(.system(size: compact ? 24 : 32)).opacity(0.6).padding(.top, compact ? 6 : 10).padding(.trailing, 14).help(clip.source)
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 5) {
-                        if renaming { RenameField(initial: clip.cardTitle) { text in Controller.shared.commitInlineRename(clip.id, text: text) } }
-                        else {
-                            Text(clip.cardTitle).font(.system(size: compact ? 13 : 15, weight: .semibold)).lineLimit(1).truncationMode(.tail).help(clip.cardTitle)
-                                .onTapGesture {
-                                    // A click on an already selected card's title renames it.
-                                    if selected && store.selection.count <= 1 { Controller.shared.rename(clip) }
-                                    else { store.searchFocused = false; store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) }
-                                }
-                        }
-                        if current { Text("当前").font(.system(size: 10)).opacity(0.75) }; if !clip.boards.isEmpty { Image(systemName: "pin.fill").font(.system(size: 10)) } }
-                    if !compact { TimelineView(.periodic(from: .now, by: 60)) { context in Text(ageLabel(clip.created, now: context.date)).font(.system(size: 12)).opacity(0.85) } }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                .padding(.leading, 14).padding(.trailing, compact ? 46 : 66)
-            }
-            .foregroundStyle(.white).frame(height: compact ? 38 : 60).clipped()
-            VStack(alignment: .leading, spacing: 9) {
-                if clip.kind == "链接" { RichLinkCard(clip: clip, enabled: networkPreviews, store: store).id(clip.text) }
-                else if let color = capturedColor {
-                    RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: color.nsColor)).frame(maxWidth: .infinity, maxHeight: .infinity)
-                    Text(color.hex).font(.system(size: 16, weight: .semibold, design: .monospaced)).textSelection(.enabled)
-                }
-                else if isCode { CodeCardBody(text: clip.text, compact: compact) }
-                else if richText { RichTextCardBody(clip: clip, compact: compact) }
-                else if clip.kind == "图片" { ClipThumbnail(clip: clip).allowsHitTesting(false) }
-                else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first, ["png", "jpg", "jpeg", "tiff", "tif", "heic", "gif", "webp"].contains(URL(fileURLWithPath: path).pathExtension.lowercased()) {
-                    ClipThumbnail(clip: clip)
-                    Text(clip.title).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle).onTapGesture { Controller.shared.rename(clip) }
-                }
-                else {
-                    if clip.kind == "文字" {
-                        Text(String(clip.text.prefix(1500))).font(.system(size: 13)).lineLimit(compact ? 3 : 8).frame(maxWidth: .infinity, alignment: .leading)
-                    } else {
-                        Text(clip.title).font(.system(size: 13)).lineLimit(2).onTapGesture { Controller.shared.rename(clip) }
-                        if clip.text != clip.title { Text(String(clip.text.prefix(1500))).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(3).frame(maxWidth: .infinity, alignment: .leading) }
-                    }
-                    Spacer(minLength: 0)
-                }
-            }.padding(12).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).background { Rectangle().fill(isCode ? Color(white: 0.14) : Color.clear) }
-            if !compact || index < 9 {
-                let footerColor = isCode ? Color.white.opacity(0.45) : (richText ? Color.black.opacity(0.45) : Color.secondary)
-                HStack {
-                    if !compact, let label = characterCountLabel { Text(label) }
-                    Spacer(minLength: 0)
-                    if index < 9 { Text("\(index + 1)") }
-                }.font(.system(size: 10)).foregroundStyle(footerColor).padding(.horizontal, 12).padding(.bottom, 7)
-            }
+    /// What a card shows, decided once from the clip; the layout rules below read it instead of re-testing the clip.
+    private enum BodyKind {
+        case link, color(CapturedColor), code, richText, image, audio, file, text, other
+        init(_ clip: Clip) {
+            let color = clip.kind == "链接" ? nil : CapturedColor.parse(clip.text)
+            let code = clip.kind == "文字" && CodeSyntax.language(clip.text) != nil
+            if clip.kind == "链接" { self = .link }
+            else if let color { self = .color(color) }
+            else if code { self = .code }
+            else if clip.kind == "文字" && RichTextCache.hasRichPart(clip) { self = .richText }
+            else if clip.kind == "图片" { self = .image }
+            else if clip.kind == "文件" { self = !clip.text.contains("\n") && AudioInfo.isAudio(URL(fileURLWithPath: clip.text)) ? .audio : .file }
+            else { self = clip.kind == "文字" ? .text : .other }
         }
-        .frame(width: CardMagnification.cardWidth(compact: compact)).frame(maxHeight: .infinity)
-        .background(isCode ? Color(white: 0.14) : (richText ? Color.white : Color(nsColor: .controlBackgroundColor)), in: RoundedRectangle(cornerRadius: 12))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? Color.blue : Color.primary.opacity(0.08), lineWidth: selected ? 3 : 1))
-        // The selected card is marked by its blue border only, without a glow behind it.
-        .shadow(color: .black.opacity(0.03), radius: 2, y: 1)
+        /// Text on a page colour: rich text or plain text (not code, not a colour).
+        var isTextPage: Bool { switch self { case .richText, .text: true; default: false } }
+        var isCode: Bool { if case .code = self { true } else { false } }
+        var capturedColor: CapturedColor? { if case .color(let color) = self { color } else { nil } }
+    }
+    /// Quick-paste label of the first nine cards, such as “⌘3”.
+    private var indexLabel: String? { index < 9 ? quickSymbol + "\(index + 1)" : nil }
+    private static let codeBackground = Color(white: 0.14)
+
+    // MARK: Layout rules
+    /// Text starts 10 below the header with 12 at the sides; link, image and file cards pad themselves.
+    private func bodyInsets(_ kind: BodyKind) -> EdgeInsets {
+        if clip.kind == "链接" || clip.kind == "图片" || clip.kind == "文件" { return EdgeInsets() }
+        return EdgeInsets(top: kind.isTextPage ? 10 : 12, leading: 12, bottom: 12, trailing: 12)
+    }
+    /// Link bubbles, full-bleed covers, audio and image cards carry the index themselves and leave out the footer.
+    private func showsFooter(_ kind: BodyKind) -> Bool {
+        if linkCover || (clip.kind == "链接" && linkBubble) || clip.kind == "图片" { return false }
+        if case .audio = kind { return false }
+        return !compact || index < 9
+    }
+    /// Whether the footer sits on a dark surface: a colour card by its colour, code always, text by its page, the rest by appearance.
+    private func footerIsOnDark(_ kind: BodyKind, textPage: NSColor) -> Bool {
+        if let color = kind.capturedColor { return RichTextRendering.isDark(color.nsColor) }
+        if kind.isCode { return true }
+        return kind.isTextPage ? RichTextRendering.isDark(textPage) : colorScheme == .dark
+    }
+    private func cardBackground(_ kind: BodyKind, textPage: NSColor) -> Color {
+        if let color = kind.capturedColor { return Color(nsColor: color.nsColor) }
+        if kind.isCode { return Self.codeBackground }
+        return kind.isTextPage ? Color(nsColor: textPage) : Color(nsColor: .controlBackgroundColor)
+    }
+
+    // MARK: Pieces
+    private var header: some View {
+        ZStack(alignment: .topTrailing) {
+            if !linkCover { Rectangle().fill(headerFill) }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 5) {
+                    if renaming { RenameField(initial: clip.cardTitle) { text in Controller.shared.commitInlineRename(clip.id, text: text) } }
+                    else {
+                        Text(headerTitle).font(.system(size: compactHeader ? 13 : 15, weight: compactHeader ? .semibold : .medium)).lineLimit(1).truncationMode(.tail).help(headerTitle)
+                            .opacity(compactHeader ? 0.85 : 1).onTapGesture(perform: titleTapped)
+                    }
+                    if current { Text("当前").font(.system(size: 10)).opacity(0.75) }; if !clip.boards.isEmpty { Image(systemName: "pin.fill").font(.system(size: 10)) }
+                    // The compact header keeps the time on the title's line.
+                    if compactHeader, !renaming { TimelineView(.periodic(from: .now, by: 60)) { context in Text(ageLabel(clip.created, now: context.date)).font(.system(size: 13)).opacity(0.55).lineLimit(1).fixedSize() } }
+                }
+                if !compactHeader { TimelineView(.periodic(from: .now, by: 60)) { context in Text(ageLabel(clip.created, now: context.date)).font(.system(size: 12)).opacity(0.8) } }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .padding(.leading, 12).padding(.trailing, CardChrome.titleTrailing(cardHeight: cardHeight, compact: compact))
+        }
+        .foregroundStyle(.white).shadow(color: linkCover ? .black.opacity(0.45) : .clear, radius: 3, y: 1)
+        .frame(height: headerHeight)
+        // The icon is an overlay so its size never feeds the header's layout: inside the ZStack its
+        // taller frame made the ZStack taller, and the fixed-height frame then centred it, lifting the
+        // icon by half the difference and leaving a strip of header below it.
+        .overlay(alignment: .trailing) { sourceIcon.opacity(linkCover ? CardChrome.coverIconOpacity : 1) }
+        .clipped()
+        .zIndex(1)
+    }
+    /// The source app's icon. Regular header: the artwork is 1.235 × the header height, centred vertically so it
+    /// overhangs top and bottom equally, overhangs the card's right edge by 0.115 ×, with a faint shadow on the left
+    /// (macOS app icons keep their artwork in the central 824/1024). Compact header: a 20 pt icon inside the header,
+    /// 8 pt from the right edge, at 90%.
+    @ViewBuilder private var sourceIcon: some View {
+        if let sourceIcon = PreviewCache.shared.sourceIcon(clip.sourceID) {
+            if compactHeader {
+                Image(nsImage: sourceIcon).resizable().scaledToFit().frame(width: 20, height: 20).opacity(0.9).padding(.trailing, 8).help(clip.source)
+            } else {
+                let artwork = headerHeight * 1.235, canvas = artwork * 1024 / 824, inset = (canvas - artwork) / 2
+                Image(nsImage: sourceIcon).resizable().scaledToFit()
+                    .frame(width: canvas, height: canvas)
+                    .shadow(color: .black.opacity(0.18), radius: 2, x: -1, y: 0)
+                    .offset(x: inset + headerHeight * 0.115).help(clip.source)
+            }
+        } else {
+            Image(systemName: icon).font(.system(size: compactHeader ? 16 : 32)).opacity(0.6).padding(.trailing, compactHeader ? 8 : 14).help(clip.source)
+        }
+    }
+    @ViewBuilder private func bodyContent(_ kind: BodyKind) -> some View {
+        switch kind {
+        case .link:
+            RichLinkCard(clip: clip, enabled: networkPreviews, store: store, indexLabel: indexLabel, titleTap: titleTapped, cover: $linkCover, bubble: $linkBubble, headerHeight: headerHeight).id(clip.text)
+        case .color(let color):
+            // The colour fills the card, its value centred in black or white by lightness.
+            Text(color.hex).font(Font(NSFont.userFixedPitchFont(ofSize: 18) ?? .monospacedSystemFont(ofSize: 18, weight: .regular))).textSelection(.enabled)
+                .foregroundStyle(Color(nsColor: RichTextRendering.labelColor(onDark: RichTextRendering.isDark(color.nsColor))))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .code:
+            CodeCardBody(text: clip.text, compact: compact)
+        case .richText:
+            RichTextCardBody(clip: clip, compact: compact, page: $richPage)
+        case .image:
+            ImageCardBody(clip: clip, compact: compact, indexLabel: indexLabel).allowsHitTesting(false)
+        case .audio:
+            AudioCardBody(path: clip.text, compact: compact, indexLabel: indexLabel, parsed: $audioParsed, rename: titleTapped).id(clip.text)
+        case .file:
+            FileCardBody(clip: clip, compact: compact, rename: titleTapped)
+        case .text, .other:
+            Text(String(clip.text.prefix(1500))).font(.system(size: 13)).frame(maxWidth: .infinity, alignment: .leading)
+            Spacer(minLength: 0)
+        }
+    }
+    /// Character count centred, quick-paste badge 8 pt from the right and bottom edges.
+    private func footer(onDark: Bool) -> some View {
+        let footerColor = Color(nsColor: RichTextRendering.footerColor(onDark: onDark))
+        return ZStack {
+            if !compact, let label = characterCountLabel { Text(label).font(.system(size: 12)).foregroundStyle(footerColor) }
+            if let indexLabel { ShortcutBadge(label: indexLabel, onDark: onDark).frame(maxWidth: .infinity, alignment: .trailing) }
+        }.frame(height: 18).padding(.horizontal, 8).padding(.bottom, 8)
+    }
+
+    var body: some View {
+        let kind = BodyKind(clip)
+        let plainPage = RichTextRendering.plainPage(dark: colorScheme == .dark)
+        let textPage: NSColor = { if case .richText = kind { return richPage ?? plainPage } else { return plainPage } }()
+        let footerOnDark = footerIsOnDark(kind, textPage: textPage)
+        let cardShape = CardChrome.shape()
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            VStack(alignment: .leading, spacing: 9) { bodyContent(kind) }
+                .padding(bodyInsets(kind)).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background { Rectangle().fill(kind.isCode ? Self.codeBackground : Color.clear) }
+                .padding(.top, linkCover ? -headerHeight : 0)
+            if showsFooter(kind) { footer(onDark: footerOnDark) }
+        }
+        .frame(width: CardMagnification.cardWidth(compact: compact, cardHeight: cardHeight)).frame(maxHeight: .infinity)
+        .background(cardBackground(kind, textPage: textPage), in: cardShape)
+        .clipShape(cardShape)
+        // The selected card is marked by a ring in the accent colour just outside it (inset by -4), without a glow.
+        .overlay { if selected { CardChrome.shape(radius: CardChrome.ringRadius).strokeBorder(Color.accentColor, lineWidth: CardChrome.ringInset).padding(-CardChrome.ringInset) } }
+        .shadow(color: .black.opacity(CardChrome.shadowOpacity), radius: CardChrome.shadowRadius, y: CardChrome.shadowOffsetY)
         .contentShape(Rectangle())
-        .onDrag { let selected = store.selectedClips; store.draggingIDs = selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]; store.dragStartedAt = Date(); if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
+        .onDrag { let selected = store.selectedClips; store.beginCardDrag(selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]); DragPasteRedirect.begin(clip); if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
         // One click handler for both: a separate double-click gesture would make SwiftUI hold every single click for the
         // double-click interval (about half a second) before selecting. The first click selects, the second pastes.
         .onTapGesture {

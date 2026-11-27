@@ -279,7 +279,7 @@ class AppEnvironmentWiringTests(unittest.TestCase):
         # Consumer behavior is exercised by StorageRecoveryTests and TranslationConfigTests.
         expected = {
             'DataDirectory.swift': 'AppEnvironment.current.defaultDataRoot',
-            'RichPreviews.swift': 'AppEnvironment.current.previewCacheRoot',
+            'LinkPreviewCache.swift': 'AppEnvironment.current.previewCacheRoot',
             'Translation.swift': 'AppEnvironment.current.defaults',
             'UsageAnalytics.swift': 'AppEnvironment.current.allowAnalytics',
             'PasteImport.swift': 'AppEnvironment.current.allowPasteDiscovery',
@@ -298,7 +298,7 @@ class AppEnvironmentWiringTests(unittest.TestCase):
         environment = SOURCE.read_text()
         model = (ROOT / 'Sources/Model.swift').read_text()
         data_directory = (ROOT / 'Sources/DataDirectory.swift').read_text()
-        rich_previews = (ROOT / 'Sources/RichPreviews.swift').read_text()
+        rich_previews = (ROOT / 'Sources/LinkPreviewCache.swift').read_text()
         self.assertIn(
             'resolved.validateDataRoot(resolved.defaultDataRoot', environment)
         self.assertIn(
