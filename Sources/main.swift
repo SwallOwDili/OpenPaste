@@ -112,12 +112,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         // A link card dropped on Messages is pasted there, the same way Return pastes it.
-        DragPasteRedirect.paste = { [weak self] clip, pid in
+        DragPasteRedirect.paste = { [weak self] clip, pid, readyToSend in
             guard let self, let app = NSRunningApplication(processIdentifier: pid) else { return }
             self.target = app; self.lastExternalApp = app
             AppDiagnostics.record("drag.paste-instead")
-            // As Return: the whole selection when the dragged card is part of it.
-            self.pasteSelection(fallback: clip)
+            // As Return: the whole selection when the dragged card is part of it. The field is checked again once
+            // Messages is in front, right before ⌘V, since the user may have touched it meanwhile.
+            self.pasteSelection(fallback: clip, beforeSend: {
+                guard readyToSend() else { AppDiagnostics.record("drag.paste-skipped"); return false }
+                return true
+            })
         }
         AcceptanceMetrics.start()
         AppDiagnostics.record("app.launch")
@@ -981,11 +985,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         guard store.restore(clip, plain: plain) else { store.message = "无法复制此内容"; return }
         pastePrepared()
     }
-    func pasteSelection(fallback clip: Clip, plain: Bool = false) {
+    func pasteSelection(fallback clip: Clip, plain: Bool = false, beforeSend: (() -> Bool)? = nil) {
         let selected = store.selectedClips
-        guard store.restoreMany(selected.contains(where: { $0.id == clip.id }) ? selected : [clip], plain: plain) else { showToast("无法合并所选内容"); return }; pastePrepared()
+        guard store.restoreMany(selected.contains(where: { $0.id == clip.id }) ? selected : [clip], plain: plain) else { showToast("无法合并所选内容"); return }; pastePrepared(beforeSend: beforeSend)
     }
-    func pastePrepared() {
+    /// `beforeSend` runs once the target is in front, right before ⌘V; returning false sends nothing.
+    func pastePrepared(beforeSend: (() -> Bool)? = nil) {
         closePreview()
         cancelTranslation()
         refreshPermission()
@@ -999,19 +1004,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         _ = target.activate(options: [])
         // The background permission state is for display only. It may still be
         // unknown at startup; finishPaste checks live permission before sending.
-        finishPaste(target: target, generation: generation, attempt: 0)
+        finishPaste(target: target, generation: generation, attempt: 0, beforeSend: beforeSend)
     }
-    private func finishPaste(target: NSRunningApplication, generation: Int, attempt: Int) {
+    private func finishPaste(target: NSRunningApplication, generation: Int, attempt: Int, beforeSend: (() -> Bool)? = nil) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) {
             guard generation == self.pasteGeneration else { return }
             let ready = NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier
             let modifiersReleased = NSEvent.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
             guard ready && modifiersReleased else {
-                if attempt < 60 { self.finishPaste(target: target, generation: generation, attempt: attempt + 1) }
+                if attempt < 60 { self.finishPaste(target: target, generation: generation, attempt: attempt + 1, beforeSend: beforeSend) }
                 else { self.showToast("已复制，自动粘贴未完成，请在输入框按 ⌘V") }
                 return
             }
             guard self.directPasteAllowed else { self.showToast("已复制，请按 ⌘V 粘贴"); return }
+            if let beforeSend, !beforeSend() { return }
             let source = CGEventSource(stateID: .privateState)
             let sent = PasteShortcut.send(
                 makeEvent: { CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: $0) },

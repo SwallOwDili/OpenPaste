@@ -795,31 +795,102 @@ func runDragProviderTests() {
 
     let mapLink = Clip(source: "信息", sourceID: "com.apple.MobileSMS", kind: "链接", title: url, text: url, parts: [[ClipPart(type: "public.utf8-plain-text", data: Data(url.utf8))]])
     let textClip = Clip(source: "备忘录", sourceID: "com.apple.Notes", kind: "文字", title: "note", text: "note", parts: [[ClipPart(type: "public.utf8-plain-text", data: Data("note".utf8))]])
-    var buttonDown = true, escape = false, under: pid_t? = 10, field = "草稿", events: [String] = []
+    var buttonDown = true, escape = false, under: pid_t? = 10, events: [String] = []
+    // The fake Messages field: which input is focused, its text and selection; `readable` false means accessibility returns nothing.
+    var input = "会话A", field = "草稿", selection = NSRange(location: 2, length: 0), readable = true
+    var selectSucceeds = true, selectionAfterSelect: NSRange?, startReadable = true, starting = false
     var environment = DragPasteRedirect.Environment()
     environment.isButtonDown = { buttonDown }; environment.isEscapeDown = { escape }
     environment.pasteOnlyAppUnderPointer = { under }; environment.runningPasteOnlyApps = { [10] }
-    environment.fieldValue = { _ in field }
-    environment.select = { _, range in events.append("select \(range.location),\(range.length)"); return true }
-    environment.paste = { clip, app in events.append("paste \(clip.kind) into \(app)") }
+    environment.field = { _ in
+        guard starting ? startReadable : readable else { return nil }
+        return DragPasteRedirect.Field(element: input as NSString, value: field, selection: selection)
+    }
+    environment.select = { target, range in
+        events.append("select \(range.location),\(range.length) in \(target.element)")
+        guard selectSucceeds else { return false }
+        selection = selectionAfterSelect ?? range; return true
+    }
+    // Between the paste request and ⌘V, Messages is activated and the user may act: `meanwhile` changes the fake field then.
+    var meanwhile: () -> Void = {}
+    environment.skipped = { _ in }; environment.note = { _ in }
+    environment.paste = { clip, app, readyToSend in
+        events.append("paste \(clip.kind) into \(app)"); meanwhile(); meanwhile = {}
+        events.append(readyToSend() ? "sent" : "skipped")
+    }
     func settle(_ seconds: Double = 0.3) { let until = Date().addingTimeInterval(seconds); while Date() < until { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) } }
-    // Dropped on the field: the inserted URL is selected, then the card is pasted over it, once.
-    DragPasteRedirect.begin(mapLink, environment: environment); settle()
+    /// One drag: reset the fake field, begin, let go, then `drop` changes the field the way Messages would.
+    func drag(_ card: Clip? = nil, start: String = "草稿", startSelection: NSRange = NSRange(location: 2, length: 0), wait: Double = DragPasteRedirect.insertWait + 0.4, drop: () -> Void = {}) -> [String] {
+        events.removeAll(); buttonDown = true; input = "会话A"; field = start; selection = startSelection; readable = true
+        starting = true; DragPasteRedirect.begin(card ?? mapLink, environment: environment); starting = false
+        settle(); buttonDown = false; settle(0.1); drop(); settle(wait)
+        let result = events; selectSucceeds = true; selectionAfterSelect = nil; startReadable = true; under = 10
+        return result
+    }
+    let selectURL = "select 2,\(url.utf16.count) in 会话A", pasted = "paste 链接 into 10", sent = "sent", skipped = "skipped"
+    // Nothing happens while the button is down.
+    events.removeAll(); buttonDown = true; DragPasteRedirect.begin(mapLink, environment: environment); settle()
     guard events.isEmpty else { print("FAIL: nothing may happen while the button is down"); exit(1) }
-    buttonDown = false; settle(0.1); field = "草稿" + url; settle()
-    guard events == ["select 2,\(url.utf16.count)", "paste 链接 into 10"] else { print("FAIL: drop on Messages must select the inserted URL and paste once, got \(events)"); exit(1) }
-    // Dropped where Messages inserts nothing (the conversation area): pasted at the cursor after the wait.
-    events.removeAll(); buttonDown = true; field = "草稿"
-    DragPasteRedirect.begin(mapLink, environment: environment); settle(); buttonDown = false; settle(DragPasteRedirect.insertWait + 0.4)
-    guard events == ["paste 链接 into 10"] else { print("FAIL: no insertion: paste at the cursor once, got \(events)"); exit(1) }
+    under = nil; buttonDown = false; settle(); under = 10
+    // Dropped on the field: the inserted URL is selected, the selection is read back, then the card is pasted over it, once.
+    var got = drag { field = "草稿" + url; selection = NSRange(location: field.utf16.count, length: 0) }
+    guard got == [selectURL, pasted, sent] else { print("FAIL: drop on Messages must select the inserted URL and paste once, got \(got)"); exit(1) }
+    // Activating Messages drops the selection: it is selected again before ⌘V. Typing meanwhile: nothing is sent.
+    meanwhile = { selection = NSRange(location: 0, length: 0) }
+    got = drag { field = "草稿" + url }
+    guard got == [selectURL, pasted, selectURL, sent], selection == NSRange(location: 2, length: url.utf16.count) else { print("FAIL: the URL must be selected again right before ⌘V, got \(got)"); exit(1) }
+    meanwhile = { field = "草稿" + url + "x" }
+    got = drag { field = "草稿" + url }
+    guard got == [selectURL, pasted, skipped] else { print("FAIL: the field changed before ⌘V: nothing may be sent, got \(got)"); exit(1) }
+    // Dropped where Messages inserts nothing (the conversation area), no selection: pasted at the cursor after the wait.
+    got = drag()
+    guard got == [pasted, sent] else { print("FAIL: no insertion: paste at the cursor once, got \(got)"); exit(1) }
+    // Activating Messages moves the caret to the start: it is put back where it was before ⌘V.
+    meanwhile = { selection = NSRange(location: 0, length: 0) }
+    got = drag()
+    guard got == [pasted, "select 2,0 in 会话A", sent], selection == NSRange(location: 2, length: 0) else { print("FAIL: the caret must be put back before ⌘V, got \(got)"); exit(1) }
+    // The user selects draft text, types, or the focus moves to another input before ⌘V: nothing is sent.
+    meanwhile = { selection = NSRange(location: 0, length: 2) }
+    got = drag()
+    guard got == [pasted, skipped] else { print("FAIL: text selected before ⌘V: nothing may be sent, got \(got)"); exit(1) }
+    meanwhile = { field = "草稿x" }
+    got = drag()
+    guard got == [pasted, skipped] else { print("FAIL: text typed before ⌘V: nothing may be sent, got \(got)"); exit(1) }
+    meanwhile = { input = "会话B" }
+    got = drag()
+    guard got == [pasted, skipped] else { print("FAIL: another input focused before ⌘V: nothing may be sent, got \(got)"); exit(1) }
+    // The caret cannot be put back: nothing is sent.
+    meanwhile = { selection = NSRange(location: 0, length: 0); selectSucceeds = false }
+    got = drag()
+    guard got == [pasted, "select 2,0 in 会话A", skipped] else { print("FAIL: caret not restored: nothing may be sent, got \(got)"); exit(1) }
+    // Never paste when it is not certain: each of these leaves the field as Messages made it.
+    selectSucceeds = false
+    got = drag { field = "草稿" + url }
+    guard got == [selectURL] else { print("FAIL: selecting the inserted URL failed: must not paste, got \(got)"); exit(1) }
+    selectionAfterSelect = NSRange(location: field.utf16.count, length: 0)
+    got = drag { field = "草稿" + url }
+    guard got == [selectURL] else { print("FAIL: the selection read back is not the URL: must not paste, got \(got)"); exit(1) }
+    startReadable = false
+    got = drag { field = "草稿" + url }
+    guard got.isEmpty else { print("FAIL: the field was not noted at the start: must not paste, got \(got)"); exit(1) }
+    got = drag { readable = false; field = "草稿" + url }
+    guard got.isEmpty else { print("FAIL: the field cannot be read after the drop: must not paste, got \(got)"); exit(1) }
+    got = drag { field = "草稿 something else" }
+    guard got.isEmpty else { print("FAIL: the field changed but not by the URL: must not paste, got \(got)"); exit(1) }
+    got = drag(start: "今晚去这家：老地方", startSelection: NSRange(location: 6, length: 3))
+    guard got.isEmpty else { print("FAIL: draft text is selected: a paste at the cursor would replace it, got \(got)"); exit(1) }
+    got = drag(start: "今晚去这家：老地方", startSelection: NSRange(location: 6, length: 3)) { selection = NSRange(location: 6, length: 0) }
+    guard got.isEmpty else { print("FAIL: draft text was selected at the start, then collapsed: must not paste, got \(got)"); exit(1) }
+    got = drag { input = "会话B"; field = url }
+    guard got.isEmpty else { print("FAIL: another input is focused at the release: must not paste, got \(got)"); exit(1) }
+    got = drag { input = "会话B"; field = "草稿" }
+    guard got.isEmpty else { print("FAIL: another input is focused and unchanged: must not paste at its cursor, got \(got)"); exit(1) }
     // Escape during the drag, released over another app or over OpenPaste, or a text card: nothing.
-    events.removeAll(); buttonDown = true
-    DragPasteRedirect.begin(mapLink, environment: environment); settle(); escape = true; settle(); escape = false; buttonDown = false; settle()
-    buttonDown = true; under = nil
-    DragPasteRedirect.begin(mapLink, environment: environment); settle(); buttonDown = false; settle()
-    buttonDown = true; under = 10
-    DragPasteRedirect.begin(textClip, environment: environment); settle(); buttonDown = false; settle()
-    guard events.isEmpty else { print("FAIL: Escape, other targets and text cards must not paste, got \(events)"); exit(1) }
+    events.removeAll(); buttonDown = true; field = "草稿"; selection = NSRange(location: 2, length: 0)
+    DragPasteRedirect.begin(mapLink, environment: environment); settle(); escape = true; settle(); escape = false; buttonDown = false; settle(DragPasteRedirect.insertWait + 0.4)
+    under = nil; got = events + drag(); events.removeAll()
+    got += drag(textClip)
+    guard got.isEmpty else { print("FAIL: Escape, other targets and text cards must not paste, got \(got)"); exit(1) }
 
     // Boards take a card drag only when it is the latest drag (counter N at the start, N+1 at the drop), never reading data.
     let boards = Store(ephemeral: true)
@@ -827,7 +898,7 @@ func runDragProviderTests() {
     guard boards.takeOwnDrag(pasteboardCount: 11) == [mapLink.id, textClip.id], boards.takeOwnDrag(pasteboardCount: 11) == nil else { print("FAIL: own drag must be taken once"); exit(1) }
     boards.beginCardDrag([mapLink.id], pasteboardCount: 20)
     guard boards.takeOwnDrag(pasteboardCount: 22) == nil, boards.takeOwnDrag(pasteboardCount: 1) == nil else { print("FAIL: a later drag from elsewhere must not pin the earlier cards"); exit(1) }
-    print("PASS: a link card dropped on Messages has its inserted URL selected and replaced by a paste (or pasted at the cursor); Escape, other targets and other cards are untouched; boards take only their own latest drag")
+    print("PASS: a link card dropped on Messages has its inserted URL selected and replaced by a paste (or pasted at an untouched cursor); a failed or wrong selection, an unnoted, unreadable or switched field, an unexpected change, or selected draft text is never pasted over, checked again right before ⌘V with the caret put back; Escape, other targets and other cards are untouched; boards take only their own latest drag")
     let invalid = imageClip("public.png", Data("not an image".utf8), "Invalid fixture").dragProvider()
     guard invalid.suggestedName?.hasSuffix(".png") != true && !invalid.registeredTypeIdentifiers.contains("public.png") else { print("FAIL: invalid image advertised as PNG"); exit(1) }
     print("PASS: PNG, JPEG, and TIFF drag files preserve bytes, type, and extension; invalid bytes are not advertised as PNG")
